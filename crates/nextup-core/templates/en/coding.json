@@ -1,0 +1,70 @@
+{
+  "id": "coding-v1",
+  "name": "Software Development",
+  "description": "Spec → Implement → Verify → Release → Retrospect, with built-in quality gates.",
+  "domainHint": "coding",
+  "phases": [
+    {
+      "id": "spec",
+      "title": "Spec",
+      "description": "Define requirements, acceptance criteria and key technical decisions.",
+      "aiInstructions": [
+        "Read the handoff and context.json, then shape the requirements into a verifiable spec.",
+        "Break the implementation into atomic tasks (with acceptance criteria) under tasks/.",
+        "Record key technical choices (framework, data structures, boundaries) as decisions."
+      ],
+      "exitGates": [
+        { "kind": "min_tasks", "count": 1 },
+        { "kind": "min_decisions", "count": 1 }
+      ]
+    },
+    {
+      "id": "implement",
+      "title": "Implement",
+      "description": "Complete the tasks one by one against the spec.",
+      "aiInstructions": [
+        "Implement by priority and follow the execution guidelines in rules.json.",
+        "Logic before interface: core logic first, with tests.",
+        "If validate_task_specs is in your tool list, a task that changes behaviour writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+        "Mark done and commit after each atomic task."
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "verify",
+      "title": "Verify",
+      "description": "Tests, checks and a real run.",
+      "aiInstructions": [
+        "Run the full test suite and actually exercise the main flows.",
+        "Record the verification results and known limitations as decisions."
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "All tests pass and the main flows work in a real run" }
+      ]
+    },
+    {
+      "id": "release",
+      "title": "Release",
+      "description": "Assemble the deliverables and release notes.",
+      "aiInstructions": [
+        "Put the deliverables and usage instructions into artifacts/.",
+        "Write artifacts/release-notes.md: what changed, known limitations, follow-up suggestions."
+      ],
+      "exitGates": [
+        { "kind": "artifact_exists", "path": "artifacts/release-notes.md" },
+        { "kind": "manual_confirm", "prompt": "Deliverables confirmed" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "Retrospect",
+      "description": "Turn friction points into rule improvements.",
+      "aiInstructions": [
+        "Answer flywheel.postMortemPrompts in rules.json.",
+        "Write the improvements back into executionGuidelines and leave a revisionHistory entry."
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "Retrospective done and rules.json updated" }]
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "life-v1",
+  "name": "生活規劃",
+  "description": "釐清 → 計畫 → 行動 → 回顧，輕量循環。",
+  "domainHint": "life",
+  "phases": [
+    {
+      "id": "clarify",
+      "title": "釐清",
+      "description": "想清楚要什麼、為什麼。",
+      "aiInstructions": [
+        "把動機與理想結果寫進 context.json 的 goals。",
+        "以「決策」記錄最重要的一件事（本循環的主軸）。"
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "plan",
+      "title": "計畫",
+      "description": "拆成做得完的小步驟。",
+      "aiInstructions": [
+        "把主軸拆成一週內可完成的小任務，寧小勿大。"
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "act",
+      "title": "行動",
+      "description": "專注執行。",
+      "aiInstructions": [
+        "一次推進一個任務；卡住就標 blocked 並寫下卡點，不硬撐。"
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }]
+    },
+    {
+      "id": "reflect",
+      "title": "回顧",
+      "description": "留下紀錄，決定下一循環。",
+      "aiInstructions": [
+        "回顧哪些做法有效、哪些沒有，寫成「決策」。",
+        "決定下一循環的主軸，回到釐清階段（可另開新專案或調整 goals）。"
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成回顧" }]
+    }
+  ]
+}

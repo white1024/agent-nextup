@@ -1,0 +1,60 @@
+{
+  "id": "business-v1",
+  "name": "Business Planning",
+  "description": "Discover → Strategy → Execute → Measure → Retrospect.",
+  "domainHint": "business",
+  "phases": [
+    {
+      "id": "discover",
+      "title": "Discover",
+      "description": "Clarify the problem, the market and the constraints.",
+      "aiInstructions": [
+        "Lay out the current situation, target audience, competitors and constraints.",
+        "Record the key insights as decisions (what problem to solve, and for whom)."
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "strategy",
+      "title": "Strategy",
+      "description": "Set the direction and break it into executable actions.",
+      "aiInstructions": [
+        "Break the strategy into verifiable action tasks (scope of ownership, definition of done).",
+        "Record the trade-offs as decisions (what to do, what not to do, and why)."
+      ],
+      "exitGates": [
+        { "kind": "min_tasks", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "Strategic direction confirmed" }
+      ]
+    },
+    {
+      "id": "execute",
+      "title": "Execute",
+      "description": "Drive the action items forward.",
+      "aiInstructions": [
+        "Execute tasks by priority; outputs (decks, documents, spreadsheets) go into artifacts/.",
+        "If validate_task_specs is in your tool list, a task that changes how something operates writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+        "Mark blockers immediately and record who or what they depend on."
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "measure",
+      "title": "Measure",
+      "description": "Review outcomes against the goals.",
+      "aiInstructions": [
+        "Compare results and gaps against the goals; record the next move (double down, adjust, cut losses) as a decision."
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "post_mortem",
+      "title": "Retrospect",
+      "description": "Distill reusable methods.",
+      "aiInstructions": [
+        "Answer the flywheel prompts and write the reusable methods back into rules.json."
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "Retrospective done and rules.json updated" }]
+    }
+  ]
+}

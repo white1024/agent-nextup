@@ -1,0 +1,21 @@
+# pnpm v10+ does not run dependency build scripts by default; each one has to
+# be listed in the allowlist below. From v11 an unlisted script fails outright
+# with ERR_PNPM_IGNORED_BUILDS, and a non-interactive install writes an invalid
+# placeholder value that corrupts this file (pnpm#11574) — which is why the
+# file is committed rather than generated.
+# `packages` points at the repo itself: pnpm 9 requires a non-empty packages
+# field here (v10+ allows it to be omitted).
+#
+# `site` is deliberately NOT a member. It is export-ignored from the public
+# mirror (D113), and a workspace member leaves an `importers:` entry in the
+# lockfile that the mirror cannot satisfy — `pnpm install --frozen-lockfile`
+# there would fail on a package whose directory is not in the export, taking
+# release.yml down with it. site/ carries its own lockfile instead; the two
+# projects share no dependencies (Astro vs Tauri/React), so nothing is lost to
+# the missing dedup.
+packages:
+  - '.'
+
+allowBuilds:
+  esbuild: true
+  sharp: true

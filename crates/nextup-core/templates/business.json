@@ -1,0 +1,60 @@
+{
+  "id": "business-v1",
+  "name": "商業企劃",
+  "description": "洞察 → 策略 → 執行 → 衡量 → 復盤。",
+  "domainHint": "business",
+  "phases": [
+    {
+      "id": "discover",
+      "title": "洞察",
+      "description": "釐清問題、市場與限制。",
+      "aiInstructions": [
+        "整理現況、目標客群、競品與限制條件。",
+        "以「決策」記錄關鍵洞察（要解什麼問題、為誰解）。"
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "strategy",
+      "title": "策略",
+      "description": "定方向並拆成可執行動作。",
+      "aiInstructions": [
+        "把策略拆成可驗收的行動任務（負責範圍、完成定義）。",
+        "以「決策」記錄取捨（做什麼、不做什麼、為什麼）。"
+      ],
+      "exitGates": [
+        { "kind": "min_tasks", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "策略方向已確認" }
+      ]
+    },
+    {
+      "id": "execute",
+      "title": "執行",
+      "description": "推進行動項目。",
+      "aiInstructions": [
+        "依優先級執行任務，產出（簡報、文件、試算）放 artifacts/。",
+        "若工具清單裡有 validate_task_specs，會改變運作方式的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
+        "受阻立即標記並記錄依賴對象。"
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "measure",
+      "title": "衡量",
+      "description": "對照目標檢視成效。",
+      "aiInstructions": [
+        "對照 goals 檢視結果與差距，以「決策」記錄下一步（加碼、調整、停損）。"
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "post_mortem",
+      "title": "復盤",
+      "description": "沉澱可複用的方法。",
+      "aiInstructions": [
+        "回答 flywheel 提問並把可複用的方法寫回 rules.json。"
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
+    }
+  ]
+}

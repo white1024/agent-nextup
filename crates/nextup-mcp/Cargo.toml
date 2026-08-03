@@ -1,0 +1,20 @@
+[package]
+name = "nextup-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent NextUp hub MCP server: exposes workspace tasks, gates, ledger, milestones and search to external coding agents over stdio."
+
+[dependencies]
+nextup-core = { path = "../nextup-core" }
+# Default features already include `server` + `macros`; `transport-io`
+# provides stdio(). Keep the version in lockstep with nextup-core.
+rmcp = { version = "2.1.0", features = ["transport-io"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+[dev-dependencies]
+tempfile = "3"

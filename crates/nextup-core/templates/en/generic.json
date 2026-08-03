@@ -1,0 +1,56 @@
+{
+  "id": "generic-v1",
+  "name": "Generic Workflow",
+  "description": "A basic loop for any domain: Plan → Execute → Review → Retrospect.",
+  "domainHint": "general",
+  "phases": [
+    {
+      "id": "plan",
+      "title": "Plan",
+      "description": "Break the goal into atomic tasks completable within a single session.",
+      "aiInstructions": [
+        "Read .nextup/snapshots/latest_handoff.md and context.json first to calibrate goals and boundaries.",
+        "Break the work into atomic tasks under tasks/; each task title must be independently verifiable.",
+        "Write acceptance criteria and priority into each task description."
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "execute",
+      "title": "Execute",
+      "description": "Complete tasks by priority; deliverables go into artifacts/.",
+      "aiInstructions": [
+        "Claim tasks by priority and mark them in_progress — focus on one thing at a time.",
+        "If validate_task_specs is in your tool list, a task that changes behaviour writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+        "Mark done as soon as a task completes (the handoff refreshes automatically); mark blocked immediately with the reason when stuck.",
+        "All deliverables go into artifacts/ — never scatter them elsewhere."
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "review",
+      "title": "Review",
+      "description": "Verify the output against the project goals.",
+      "aiInstructions": [
+        "Check artifacts/ against each goal in context.json; when goals are empty, verify against milestones and direction decisions in the ledger instead.",
+        "If anything is missing, go back and add tasks — never force a gate through.",
+        "Record the review conclusion and its rationale as a decision."
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "Confirmed the output meets the project goals" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "Retrospect",
+      "description": "The self-improvement flywheel: write what this cycle taught you back into the rules.",
+      "aiInstructions": [
+        "Answer each question in flywheel.postMortemPrompts of rules.json.",
+        "Write actionable improvements back into executionGuidelines of rules.json and leave a revisionHistory entry.",
+        "Refresh the handoff snapshot once via the generate_handoff tool (or ask the user to click it in the GUI) so the next cycle starts from a clean snapshot."
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "Retrospective done and rules.json updated" }]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Agent NextUp app icon source. Regenerate the whole set with
+       `pnpm tauri icon src-tauri/icon-source.svg`.
+     Same visual language as the sidebar brand-mark: an accent gradient rounded
+     square with a white cube (IconLogo in icons.tsx). -->
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#6b63e8"/>
+      <stop offset="1" stop-color="#4a42c0"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.3" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="228" fill="url(#sheen)"/>
+  <g transform="translate(152 152) scale(30)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 7l8-4 8 4v10l-8 4-8-4z"/>
+    <path d="M4 7l8 4 8-4M12 11v10"/>
+  </g>
+</svg>

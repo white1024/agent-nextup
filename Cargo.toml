@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/nextup-core", "crates/nextup-mcp", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/white1024/agent-nextup"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

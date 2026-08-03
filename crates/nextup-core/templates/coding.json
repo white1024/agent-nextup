@@ -1,0 +1,70 @@
+{
+  "id": "coding-v1",
+  "name": "軟體開發",
+  "description": "規格 → 實作 → 驗證 → 交付 → 復盤，內建品質關卡。",
+  "domainHint": "coding",
+  "phases": [
+    {
+      "id": "spec",
+      "title": "規格",
+      "description": "定義需求、驗收條件與關鍵技術決策。",
+      "aiInstructions": [
+        "讀 handoff 與 context.json，把需求整理成可驗收的規格。",
+        "把實作工作拆成原子任務（含驗收條件）建立於 tasks/。",
+        "用「決策」記錄關鍵技術選型（框架、資料結構、邊界）。"
+      ],
+      "exitGates": [
+        { "kind": "min_tasks", "count": 1 },
+        { "kind": "min_decisions", "count": 1 }
+      ]
+    },
+    {
+      "id": "implement",
+      "title": "實作",
+      "description": "依規格逐一完成任務。",
+      "aiInstructions": [
+        "依優先級實作，遵守 rules.json 的執行守則。",
+        "邏輯先於介面：核心邏輯先行並附測試。",
+        "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
+        "每完成一個原子任務就標 done 並 commit。"
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "verify",
+      "title": "驗證",
+      "description": "測試、檢查與實際運行。",
+      "aiInstructions": [
+        "跑完整測試套件並實際運行主要流程。",
+        "以「決策」記錄驗證結果與已知限制。"
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "測試全數通過且主要流程實測正常" }
+      ]
+    },
+    {
+      "id": "release",
+      "title": "交付",
+      "description": "整理交付物與發佈說明。",
+      "aiInstructions": [
+        "把交付物與使用說明放進 artifacts/。",
+        "撰寫 artifacts/release-notes.md：變更內容、已知限制、後續建議。"
+      ],
+      "exitGates": [
+        { "kind": "artifact_exists", "path": "artifacts/release-notes.md" },
+        { "kind": "manual_confirm", "prompt": "交付內容已確認" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "復盤",
+      "description": "把摩擦點轉成規則改進。",
+      "aiInstructions": [
+        "回答 rules.json flywheel.postMortemPrompts。",
+        "把改進寫回 executionGuidelines 並留下 revisionHistory 紀錄。"
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "id": "generic-v1",
+  "name": "通用流程",
+  "description": "適用任何領域的基本循環：規劃 → 執行 → 檢視 → 復盤。",
+  "domainHint": "general",
+  "phases": [
+    {
+      "id": "plan",
+      "title": "規劃",
+      "description": "把目標拆解成可在單一 session 完成的原子任務。",
+      "aiInstructions": [
+        "先讀 .nextup/snapshots/latest_handoff.md 與 context.json，校準目標與邊界。",
+        "把工作拆成原子任務建立於 tasks/，每個任務標題要能獨立驗收。",
+        "為每個任務在描述中寫明驗收條件與優先級。"
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "execute",
+      "title": "執行",
+      "description": "依優先級完成任務，產出交付到 artifacts/。",
+      "aiInstructions": [
+        "依優先級認領任務並標記 in_progress，一次專注一件事。",
+        "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
+        "完成即標 done（handoff 會自動刷新）；受阻立即標 blocked 並寫明原因。",
+        "所有交付物一律放進 artifacts/，不要散落各處。"
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
+    },
+    {
+      "id": "review",
+      "title": "檢視",
+      "description": "對照專案目標驗收產出。",
+      "aiInstructions": [
+        "逐一對照 context.json 的 goals，檢查 artifacts/ 是否達標；goals 為空時，改以里程碑與帳本中的方向決策為驗收基準。",
+        "有缺漏就回頭補任務，不要硬過關卡。",
+        "以「決策」記錄驗收結論與理由。"
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "已確認產出符合專案目標" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "復盤",
+      "description": "自我改進飛輪：把這輪學到的寫回規則。",
+      "aiInstructions": [
+        "逐題回答 rules.json 中 flywheel.postMortemPrompts 的提問。",
+        "把可執行的改進寫回 rules.json 的 executionGuidelines，並在 revisionHistory 留下紀錄。",
+        "以 generate_handoff 工具（或請使用者按 GUI）刷新一次交接快照，讓下一個循環從乾淨的快照開始。"
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
+    }
+  ]
+}

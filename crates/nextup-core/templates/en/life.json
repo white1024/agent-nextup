@@ -1,0 +1,46 @@
+{
+  "id": "life-v1",
+  "name": "Life Planning",
+  "description": "Clarify → Plan → Act → Reflect, a lightweight loop.",
+  "domainHint": "life",
+  "phases": [
+    {
+      "id": "clarify",
+      "title": "Clarify",
+      "description": "Get clear on what you want and why.",
+      "aiInstructions": [
+        "Write the motivation and the ideal outcome into goals of context.json.",
+        "Record the one thing that matters most (this cycle's focus) as a decision."
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "plan",
+      "title": "Plan",
+      "description": "Break it into steps small enough to finish.",
+      "aiInstructions": [
+        "Break the focus into small tasks finishable within a week — smaller is better."
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "act",
+      "title": "Act",
+      "description": "Execute with focus.",
+      "aiInstructions": [
+        "Advance one task at a time; when stuck, mark it blocked and write down the sticking point — never grind through."
+      ],
+      "exitGates": [{ "kind": "all_tasks_done" }]
+    },
+    {
+      "id": "reflect",
+      "title": "Reflect",
+      "description": "Keep a record and decide the next cycle.",
+      "aiInstructions": [
+        "Review what worked and what did not, and write it up as a decision.",
+        "Decide the next cycle's focus and return to Clarify (start a new project or adjust the goals)."
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "Reflection done" }]
+    }
+  ]
+}

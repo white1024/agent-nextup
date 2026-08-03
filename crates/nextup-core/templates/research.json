@@ -1,0 +1,72 @@
+{
+  "id": "research-v1",
+  "name": "研究",
+  "description": "界定 → 蒐集 → 統整 → 產出 → 審閱，適合文獻與調查型工作。",
+  "domainHint": "research",
+  "phases": [
+    {
+      "id": "scope",
+      "title": "界定",
+      "description": "把研究問題收斂成可回答的範圍。",
+      "aiInstructions": [
+        "把研究問題、子問題與排除範圍寫進 context.json 的 goals/boundaries。",
+        "為每個子問題建立蒐集任務（來源類型、關鍵字）。"
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "gather",
+      "title": "蒐集",
+      "description": "系統性蒐集並記錄來源。",
+      "aiInstructions": [
+        "逐任務蒐集資料，來源與摘錄存入 artifacts/（附出處）。",
+        "品質優先於數量；不可考來源直接捨棄並記錄原因。"
+      ],
+      "exitGates": [
+        { "kind": "all_tasks_done" },
+        { "kind": "manual_confirm", "prompt": "資料涵蓋度已足夠回答研究問題" }
+      ]
+    },
+    {
+      "id": "synthesize",
+      "title": "統整",
+      "description": "從資料中提出立場與結論。",
+      "aiInstructions": [
+        "交叉比對來源，衝突處標明並評估可信度。",
+        "以「決策」記錄核心結論與立場依據。"
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "draft",
+      "title": "產出",
+      "description": "寫出完整初稿。",
+      "aiInstructions": [
+        "在 artifacts/draft.md 產出結構完整的初稿（引言、方法、發現、結論、引用）。"
+      ],
+      "exitGates": [{ "kind": "artifact_exists", "path": "artifacts/draft.md" }]
+    },
+    {
+      "id": "review",
+      "title": "審閱",
+      "description": "查證與定稿。",
+      "aiInstructions": [
+        "逐段查證引用與數字，修正後定稿。",
+        "以「決策」記錄定稿結論。"
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "已查證引用並確認定稿" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "復盤",
+      "description": "改進研究流程本身。",
+      "aiInstructions": [
+        "回答 flywheel 提問並把改進寫回 rules.json。"
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
+    }
+  ]
+}

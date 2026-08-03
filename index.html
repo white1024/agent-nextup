@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent NextUp</title>
+
+    <!-- Boot splash. The app bundle is a single ~1.2MB chunk (every view is a
+         static import), so nothing at all painted between the window opening
+         and React mounting — a blank window for as long as the webview needed
+         to fetch, parse and run it. App.tsx has a loading state already, but
+         it lives on the far side of that gap and so never covered it.
+
+         The markup is inside #root on purpose: createRoot() clears the
+         container on its first render, so the handoff to App's own `.splash`
+         needs no cleanup code and cannot leave an orphan overlay behind if
+         React throws on the way up.
+
+         Everything here is inline and re-states four token values, because
+         styles.css arrives with that same bundle. Keep them in sync with the
+         Colour block of src/styles.css — src/boot.test.ts fails if they
+         drift. -->
+    <script>
+      window.__boot = { html: Date.now() };
+      // Pin the theme before first paint. theme.ts does this too, but only
+      // once the bundle has parsed — which is the very window this splash
+      // exists to cover, so a dark-mode user would get a white flash first.
+      // Same storage key and same semantics as getThemeMode().
+      try {
+        var mode = localStorage.getItem("nextup-theme");
+        if (mode === "light" || mode === "dark") {
+          document.documentElement.dataset.theme = mode;
+          // The native title bar follows the same choice (D74) — and it had
+          // the same problem one layer out: applyThemeMode() reaches it via
+          // getCurrentWindow().setTheme(), which is in the bundle, so on a
+          // machine whose OS theme differs from the pinned one the title bar
+          // stayed light until the whole chunk had parsed.
+          //
+          // Tauri injects __TAURI_INTERNALS__ ahead of any page script, so the
+          // command setTheme() ends up calling is already reachable here. That
+          // is an internal rather than the public API on purpose: the public
+          // one lives in the bundle we are trying to get ahead of. Reading the
+          // label from metadata rather than hard-coding "main" keeps pop-out
+          // terminal windows — same index.html, different window — correct.
+          //
+          // Best-effort by design: if the internal shape ever changes this
+          // silently does nothing and applyThemeMode() still puts it right on
+          // mount, which is exactly today's behaviour.
+          var internals = window.__TAURI_INTERNALS__;
+          if (internals && internals.metadata) {
+            var pending = internals.invoke("plugin:window|set_theme", {
+              label: internals.metadata.currentWindow.label,
+              value: mode,
+            });
+            if (pending && pending.catch) pending.catch(function () {});
+          }
+        }
+      } catch (err) {
+        /* storage or the bridge can be unavailable; the app still corrects
+           itself on mount, so there is nothing to report here */
+      }
+    </script>
+
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      :root[data-theme="light"] {
+        color-scheme: light;
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+      }
+      html,
+      body,
+      #root {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: light-dark(#f6f5f3, #0d0d0f); /* --bg-app */
+        color: light-dark(#6e6b64, #918f89); /* --text-3 */
+        font-family: system-ui, "Segoe UI", "Noto Sans TC", sans-serif; /* --font */
+      }
+      .boot {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        /* Late enough that a fast boot never flashes it, early enough that a
+           slow one stops looking broken. */
+        animation: boot-in 200ms ease-out 260ms both;
+      }
+      .boot svg {
+        color: light-dark(#5b53d1, #837bf0); /* --accent */
+        animation: boot-pulse 1.8s ease-in-out infinite;
+      }
+      .boot span {
+        font-size: 13px;
+        letter-spacing: 0.04em;
+      }
+      @keyframes boot-in {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+      @keyframes boot-pulse {
+        0%,
+        100% {
+          opacity: 0.45;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        /* Drop the motion, keep the delay. `animation: none` on .boot would
+           also drop the 260ms hold, so a fast boot would flash the mark at
+           full opacity — the one thing the hold exists to prevent. */
+        .boot {
+          animation-duration: 1ms;
+        }
+        .boot svg {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root">
+      <div class="boot" role="status" aria-live="polite" aria-label="Starting Agent NextUp">
+        <!-- Brand mark, identical to IconLogo in src/components/icons.tsx -->
+        <svg
+          width="34"
+          height="34"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M4 7l8-4 8 4v10l-8 4-8-4z" />
+          <path d="M4 7l8 4 8-4M12 11v10" />
+        </svg>
+        <span>Agent NextUp</span>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

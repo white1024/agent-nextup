@@ -1,0 +1,72 @@
+{
+  "id": "research-v1",
+  "name": "Research",
+  "description": "Scope → Gather → Synthesize → Draft → Review, for literature and investigative work.",
+  "domainHint": "research",
+  "phases": [
+    {
+      "id": "scope",
+      "title": "Scope",
+      "description": "Narrow the research question into an answerable scope.",
+      "aiInstructions": [
+        "Write the research question, sub-questions and exclusions into goals/boundaries of context.json.",
+        "Create a gathering task for each sub-question (source types, keywords)."
+      ],
+      "exitGates": [{ "kind": "min_tasks", "count": 1 }]
+    },
+    {
+      "id": "gather",
+      "title": "Gather",
+      "description": "Collect sources systematically and keep records.",
+      "aiInstructions": [
+        "Gather material task by task; store sources and excerpts in artifacts/ (with citations).",
+        "Quality over quantity; discard unverifiable sources outright and record why."
+      ],
+      "exitGates": [
+        { "kind": "all_tasks_done" },
+        { "kind": "manual_confirm", "prompt": "Coverage is sufficient to answer the research question" }
+      ]
+    },
+    {
+      "id": "synthesize",
+      "title": "Synthesize",
+      "description": "Derive positions and conclusions from the material.",
+      "aiInstructions": [
+        "Cross-check sources; flag conflicts and assess credibility.",
+        "Record the core conclusions and their supporting grounds as decisions."
+      ],
+      "exitGates": [{ "kind": "min_decisions", "count": 1 }]
+    },
+    {
+      "id": "draft",
+      "title": "Draft",
+      "description": "Write a complete first draft.",
+      "aiInstructions": [
+        "Produce a fully structured first draft in artifacts/draft.md (introduction, method, findings, conclusion, references)."
+      ],
+      "exitGates": [{ "kind": "artifact_exists", "path": "artifacts/draft.md" }]
+    },
+    {
+      "id": "review",
+      "title": "Review",
+      "description": "Fact-check and finalize.",
+      "aiInstructions": [
+        "Verify citations and figures section by section, fix and finalize.",
+        "Record the final conclusions as decisions."
+      ],
+      "exitGates": [
+        { "kind": "min_decisions", "count": 1 },
+        { "kind": "manual_confirm", "prompt": "Citations verified and final draft confirmed" }
+      ]
+    },
+    {
+      "id": "post_mortem",
+      "title": "Retrospect",
+      "description": "Improve the research process itself.",
+      "aiInstructions": [
+        "Answer the flywheel prompts and write the improvements back into rules.json."
+      ],
+      "exitGates": [{ "kind": "manual_confirm", "prompt": "Retrospective done and rules.json updated" }]
+    }
+  ]
+}
