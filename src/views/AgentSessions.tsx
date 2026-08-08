@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 
 import EmptyState from "../components/EmptyState";
 import { IconTerminal } from "../components/icons";
+import { workspaceName } from "../lib/format";
 import type { TerminalSessionMeta, WorkspaceOverview } from "../types";
 import TimeAgo from "../components/TimeAgo";
 import PathLabel from "../components/PathLabel";
@@ -33,11 +34,7 @@ export default function AgentSessions({ sessions, overview, onOpen }: Props) {
     return [...byRoot.entries()];
   }, [sessions]);
 
-  const nameOf = (root: string) =>
-    overview?.find((ws) => ws.root === root)?.name ??
-    root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ??
-    root;
-
+  const nameOf = (root: string) => workspaceName(overview, root);
 
   return (
     <div className="view">

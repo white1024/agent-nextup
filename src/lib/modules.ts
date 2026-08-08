@@ -12,6 +12,10 @@ export const MODULE_CATALOG = [
   { id: "collab", view: "collab" },
   { id: "specs", view: "specs" },
   { id: "team", view: "inbox" },
+  // Prime contributes no workspace view (D116, 21 §7): what it adds is
+  // app-level tools, and the coordination itself shows up as this project's
+  // own tasks and ledger — a prime is a normal workspace, which is the point.
+  { id: "prime", view: null },
 ] as const;
 
 export type ModuleId = (typeof MODULE_CATALOG)[number]["id"];

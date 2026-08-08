@@ -35,9 +35,18 @@ pub const MODULE_TEAM: &str = "team";
 /// scaffolded `specs/` directory (nextup_docs/15).
 pub const MODULE_SPECS: &str = "specs";
 
+/// Prime orchestrator module (D116): app-level team tools — edit the graph,
+/// route other members' deliveries, read member summaries (nextup_docs/21).
+///
+/// ⚠️ Unlike every other module, enabling this one grants nothing on its own.
+/// Authority is per team and comes from the *other* key: `Team.prime` naming
+/// this workspace (21 §4.2). The switch says "this workspace wants to
+/// coordinate"; the team says which teams it may coordinate.
+pub const MODULE_PRIME: &str = "prime";
+
 /// Every module this build knows about. Enabling an unknown id is refused so
 /// a typo cannot pretend to enable a capability that does not exist.
-pub const KNOWN_MODULES: [&str; 3] = [MODULE_COLLAB, MODULE_SPECS, MODULE_TEAM];
+pub const KNOWN_MODULES: [&str; 4] = [MODULE_COLLAB, MODULE_PRIME, MODULE_SPECS, MODULE_TEAM];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

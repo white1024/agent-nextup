@@ -17,6 +17,7 @@ import {
   IconFolder,
   IconMinus,
   IconPlus,
+  IconStar,
   IconX,
 } from "../../components/icons";
 import Canvas from "./Canvas";
@@ -111,6 +112,9 @@ export default function TeamDetail({
   // Member surfaces.
   const [adding, setAdding] = useState(false);
   const [filter, setFilter] = useState("");
+  // Coordinator surface — team-level, so it is not tied to the selected node.
+  const [primePicking, setPrimePicking] = useState(false);
+  const [primeFilter, setPrimeFilter] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<TeamMember | null>(null);
   /** Node selected on the canvas → right inspector. */
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -264,14 +268,28 @@ export default function TeamDetail({
     [teams],
   );
 
+  /**
+   * Registry workspaces holding no seat in this team yet — the candidates for
+   * *either* seat, because one workspace cannot hold both (D117). Both pickers
+   * read this one list; splitting it would be two names for one rule, and the
+   * two copies would drift the first time the rule changed.
+   */
   const joinable = registry.filter(
-    (row) => row.exists && !team.members.some((m) => sameRoot(m.root, row.root)),
+    (row) =>
+      row.exists &&
+      !team.members.some((m) => sameRoot(m.root, row.root)) &&
+      !(team.prime && sameRoot(team.prime.root, row.root)),
   );
-  const filtered = joinable.filter((row) => {
-    const q = filter.trim().toLowerCase();
-    if (q === "") return true;
-    return row.name.toLowerCase().includes(q) || row.root.toLowerCase().includes(q);
-  });
+  const search = (q: string) => {
+    const needle = q.trim().toLowerCase();
+    if (needle === "") return joinable;
+    return joinable.filter(
+      (row) =>
+        row.name.toLowerCase().includes(needle) || row.root.toLowerCase().includes(needle),
+    );
+  };
+  const filtered = search(filter);
+  const primeFiltered = search(primeFilter);
 
   const edgesOf = useCallback(
     (workspaceId: string) =>
@@ -337,6 +355,22 @@ export default function TeamDetail({
     setRenaming(false);
     if (name === "" || name === team.name) return;
     await run(() => api.teamRename(team.id, name));
+  }
+
+  /**
+   * Hand this team's coordination to a workspace's agent, or take it back
+   * (D116/D117). Takes a root — the prime is not a member, so there is no
+   * member row to have resolved a workspaceId already.
+   *
+   * Deliberately no confirmation: it grants nothing on its own. That project
+   * also needs its `prime` module on and the app_scope tools granted in its
+   * own catalog, and clearing is instant and lossless — a reversible action,
+   * so the third tier of D102 applies (no red, no modal).
+   */
+  async function setPrime(root: string | null) {
+    setPrimePicking(false);
+    setPrimeFilter("");
+    await run(() => api.teamSetPrime(team.id, root));
   }
 
   /** Re-link a moved member: pick its new folder, core matches the stable id. */
@@ -458,7 +492,16 @@ export default function TeamDetail({
           ) : (
             <h1>{team.name}</h1>
           )}
-          <p className="view-sub">{t("teams.detailSub")}</p>
+          <p className="view-sub">
+            {t("teams.detailSub")}
+            {/* Who runs the team is a team-level fact, so it reads next to the
+                team's own subtitle rather than on any node (D117). */}
+            {team.prime && (
+              <span className="chip team-prime-chip">
+                <IconStar size={11} /> {t("teams.primeChip", { name: team.prime.name })}
+              </span>
+            )}
+          </p>
         </div>
         <div className="header-actions">
           <button className="btn" onClick={onBack}>
@@ -505,6 +548,9 @@ export default function TeamDetail({
                 {t("teams.autoRoutePartial", { n: autoCount, total: edgeTotal })}
               </span>
             )}
+          </button>
+          <button className="btn" disabled={busy} onClick={() => setPrimePicking(true)}>
+            <IconStar size={14} /> {t("teams.primeAction")}
           </button>
           <button className="btn btn-primary" onClick={() => setAdding(true)}>
             <IconPlus size={14} /> {t("teams.addMember")}
@@ -730,6 +776,11 @@ export default function TeamDetail({
                   </button>
                 </div>
               )}
+
+              {/* The coordinator control used to live here, on the node panel
+                  — which is exactly what made the prime read as a member
+                  (D117). It is a team-level fact now, so it lives in the
+                  header with the other team-level ones. */}
 
               <div className="ci-section">
                 <div className="ci-section-title">
@@ -1013,6 +1064,80 @@ export default function TeamDetail({
             <p className="section-hint">{t("teams.addMemberHint")}</p>
             <div className="form-actions">
               <button className="btn" onClick={() => setAdding(false)}>
+                {t("common.cancel")}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {primePicking && (
+        <Modal
+          label={t("teams.primeTitle")}
+          onClose={() => {
+            setPrimePicking(false);
+            setPrimeFilter("");
+          }}
+        >
+          <div className="form">
+            <h2 className="form-heading">{t("teams.primeTitle")}</h2>
+            <p className="muted">{team.prime ? t("teams.primeOn") : t("teams.primeOff")}</p>
+
+            {team.prime && (
+              <div className="settings-row">
+                <div className="sr-body">
+                  <div className="sr-title">{team.prime.name}</div>
+                  <PathLabel className="team-member-path" path={team.prime.root} copyable={false} />
+                </div>
+                {/* Clearing takes authority away and deletes nothing — the
+                    reversible tier of D102, so no red and no confirmation. */}
+                <button className="btn" disabled={busy} onClick={() => void setPrime(null)}>
+                  {t("teams.primeClear")}
+                </button>
+              </div>
+            )}
+
+            <label className="field">
+              <span>{team.prime ? t("teams.primeReplace") : t("teams.pickWorkspace")}</span>
+              <input
+                autoFocus
+                value={primeFilter}
+                placeholder={t("teams.filterPlaceholder")}
+                onChange={(e) => setPrimeFilter(e.target.value)}
+              />
+            </label>
+            <div className="team-pick-list">
+              {primeFiltered.length === 0 &&
+                (joinable.length === 0 ? (
+                  <EmptyState title={t("teams.noPrimeable")} hint={t("teams.noPrimeableHint")} />
+                ) : (
+                  <EmptyState
+                    title={t("teams.noJoinableMatch")}
+                    hint={t("teams.noJoinableMatchHint")}
+                    action={{ label: t("teams.clearFilter"), onClick: () => setPrimeFilter("") }}
+                  />
+                ))}
+              {primeFiltered.map((row) => (
+                <button
+                  key={row.root}
+                  className="team-pick-row"
+                  disabled={busy}
+                  onClick={() => void setPrime(row.root)}
+                >
+                  <span className="team-member-name">{row.name}</span>
+                  <PathLabel className="team-member-path" path={row.root} copyable={false} />
+                </button>
+              ))}
+            </div>
+            <p className="section-hint">{t("teams.primeHint")}</p>
+            <div className="form-actions">
+              <button
+                className="btn"
+                onClick={() => {
+                  setPrimePicking(false);
+                  setPrimeFilter("");
+                }}
+              >
                 {t("common.cancel")}
               </button>
             </div>

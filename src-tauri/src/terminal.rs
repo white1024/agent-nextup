@@ -976,7 +976,11 @@ fn push_scrollback(buffer: &mut String, data: &str, cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    // Only the `#[cfg(windows)]` PTY tests below construct one, so importing it
+    // unconditionally warns on every other platform.
+    #[cfg(windows)]
+    use std::path::PathBuf;
     use std::sync::mpsc::{channel, Sender};
     use std::time::Duration;
 

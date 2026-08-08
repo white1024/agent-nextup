@@ -384,7 +384,9 @@ try {
   console.log(`\n  committed to ${dest} as ${AUTHOR.name} <${AUTHOR.email}>`);
 
   if (doPush) {
-    git(["push"], dest);
+    // See publish-site.mjs: a bare push aborts on a branch with no upstream,
+    // which is the state of every branch in a freshly created target repo.
+    git(["push", "--set-upstream", "origin", "HEAD"], dest);
     console.log("  pushed.\n");
   } else {
     console.log("  not pushed — inspect it, then `git push` from there (or re-run with --push).\n");

@@ -28,7 +28,9 @@ use crate::error::{NextUpError, Result};
 use crate::workspace::atomic::atomic_write_json;
 use crate::workspace::layout::WorkspacePaths;
 use crate::workspace::lock::with_mutation_lock;
-use crate::workspace::modules::{WorkspaceModules, MODULE_COLLAB, MODULE_SPECS, MODULE_TEAM};
+use crate::workspace::modules::{
+    WorkspaceModules, MODULE_COLLAB, MODULE_PRIME, MODULE_SPECS, MODULE_TEAM,
+};
 
 pub const AGENT_ACCESS_SCHEMA_VERSION: u32 = 1;
 
@@ -116,6 +118,9 @@ pub const TOOLS: &[ToolMeta] = &[
     read("post_mortem_candidates", None),
     read("list_deliveries", Some(MODULE_TEAM)),
     read("get_delivery", Some(MODULE_TEAM)),
+    read("team_overview", Some(MODULE_PRIME)),
+    read("team_member_status", Some(MODULE_PRIME)),
+    read("team_list_deliveries", Some(MODULE_PRIME)),
     read("list_specs", Some(MODULE_SPECS)),
     read("get_spec", Some(MODULE_SPECS)),
     read("validate_task_specs", Some(MODULE_SPECS)),
@@ -139,6 +144,22 @@ pub const TOOLS: &[ToolMeta] = &[
     granted("generate_handoff", None, "maintenance"),
     guarded("upgrade_workspace_assets", None, "maintenance", "asset_rewrite"),
     guarded("publish_delivery", Some(MODULE_TEAM), "team", "cross_workspace"),
+    // Prime orchestrator (D116, nextup_docs/21).
+    guarded("team_set_edge", Some(MODULE_PRIME), "prime", "app_scope"),
+    guarded("team_set_edge_auto_route", Some(MODULE_PRIME), "prime", "app_scope"),
+    guarded("team_route", Some(MODULE_PRIME), "prime", "app_scope"),
+    guarded("team_add_member", Some(MODULE_PRIME), "prime", "app_scope"),
+    guarded("team_create_member", Some(MODULE_PRIME), "prime", "app_scope"),
+    guarded("team_remove_member", Some(MODULE_PRIME), "prime", "app_scope"),
+    // Detail reads and the sign-off (D120) carry their own reasons, not
+    // `app_scope`: reading inside another project and rearranging the graph
+    // between projects are different powers, and a user who wants a
+    // coordinator that can see everything may well not want one that can
+    // fold specs on their behalf.
+    guarded("team_member_tasks", Some(MODULE_PRIME), "prime", "member_contents"),
+    guarded("team_member_ledger", Some(MODULE_PRIME), "prime", "member_contents"),
+    guarded("team_member_specs", Some(MODULE_PRIME), "prime", "member_contents"),
+    guarded("team_archive_task", Some(MODULE_PRIME), "prime", "member_signoff"),
 ];
 
 /// Display order of the write-tier semantic groups (D39). Presentation
@@ -146,7 +167,8 @@ pub const TOOLS: &[ToolMeta] = &[
 /// GUI catalog offers capability-level switches (a non-engineer grants a
 /// human-readable label rather than `record_lesson_fired`). Not folded into
 /// [`TOOLS`] because it orders the *groups*, which no single tool row owns.
-pub const TOOL_GROUPS: &[&str] = &["tasks", "collab", "team", "knowledge", "flow", "maintenance"];
+pub const TOOL_GROUPS: &[&str] =
+    &["tasks", "collab", "team", "prime", "knowledge", "flow", "maintenance"];
 
 /// Display order of the guard reasons, and the sort key for [`GUARDED_TOOLS`].
 ///
@@ -157,8 +179,24 @@ pub const TOOL_GROUPS: &[&str] = &["tasks", "collab", "team", "knowledge", "flow
 /// rewriting the workspace's own assets") with nothing enforcing it. Deriving
 /// the list in plain table order would therefore have silently reordered the
 /// shipped guide, so the rule is written down here instead of left in prose.
-pub const GUARD_REASONS: &[&str] =
-    &["self_verify", "gate_bypass", "cross_workspace", "asset_rewrite"];
+/// `app_scope` is deliberately not folded into `cross_workspace` (D116): that
+/// one means "publishes outside this workspace", while these change the
+/// relationships *between other workspaces* — the catalog must list them
+/// apart so granting one is never mistaken for the other.
+///
+/// `member_contents` and `member_signoff` split off the same way (D120).
+/// Seeing inside another project, rearranging the graph between projects, and
+/// signing off work inside one are three different things to hand over, and a
+/// user granting the first should not silently be granting the third.
+pub const GUARD_REASONS: &[&str] = &[
+    "self_verify",
+    "gate_bypass",
+    "cross_workspace",
+    "app_scope",
+    "member_contents",
+    "member_signoff",
+    "asset_rewrite",
+];
 
 fn names_where(pred: impl Fn(&ToolMeta) -> bool) -> Vec<&'static str> {
     TOOLS.iter().filter(|t| pred(t)).map(|t| t.name).collect()
@@ -531,8 +569,8 @@ mod tests {
         assert_eq!(
             READ_TOOLS.join(" "),
             "workspace_status list_tasks get_task workflow_status search_workspace build_index \
-             workspace_doctor post_mortem_candidates list_deliveries get_delivery list_specs \
-             get_spec validate_task_specs"
+             workspace_doctor post_mortem_candidates list_deliveries get_delivery team_overview \
+             team_member_status team_list_deliveries list_specs get_spec validate_task_specs"
         );
         assert_eq!(
             WRITE_TOOLS.join(" "),
@@ -540,7 +578,9 @@ mod tests {
              record_decision record_note record_progress record_rejected advance_phase \
              add_milestone set_milestone_done set_milestone_verified record_lesson \
              record_lesson_fired archive_stale_lessons generate_handoff \
-             upgrade_workspace_assets publish_delivery"
+             upgrade_workspace_assets publish_delivery team_set_edge team_set_edge_auto_route \
+             team_route team_add_member team_create_member team_remove_member \
+             team_member_tasks team_member_ledger team_member_specs team_archive_task"
         );
         assert_eq!(
             DEFAULT_GRANTED_TOOLS.join(" "),
@@ -552,7 +592,9 @@ mod tests {
         assert_eq!(
             GUARDED_TOOLS.join(" "),
             "set_task_verification set_milestone_verified advance_phase publish_delivery \
-             upgrade_workspace_assets"
+             team_set_edge team_set_edge_auto_route team_route team_add_member \
+             team_create_member team_remove_member team_member_tasks team_member_ledger \
+             team_member_specs team_archive_task upgrade_workspace_assets"
         );
     }
 
@@ -728,6 +770,7 @@ mod tests {
         let all = WorkspaceModules {
             enabled: vec![
                 crate::workspace::modules::MODULE_COLLAB.into(),
+                crate::workspace::modules::MODULE_PRIME.into(),
                 crate::workspace::modules::MODULE_SPECS.into(),
                 crate::workspace::modules::MODULE_TEAM.into(),
             ],

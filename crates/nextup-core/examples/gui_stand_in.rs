@@ -28,6 +28,9 @@
 //!   gui_stand_in team-create <teams.json> <name>
 //!   gui_stand_in team-add    <teams.json> <team-id> <workspace-root>
 //!   gui_stand_in team-edge   <teams.json> <team-id> <from-ws-id> <to-ws-id> [auto]
+//!   gui_stand_in set-prime   <teams.json> <team-id> [workspace-root]
+//!   gui_stand_in module      <workspace-root> <module-id> <on|off>
+//!   gui_stand_in register    <registry.json> <workspace-root>
 //!   gui_stand_in route       <teams.json> <team-id> <upstream-root> <envelope-id> [--auto] [--keep-pending]
 //!   gui_stand_in verify      <workspace-root> <task-id> <evidence-note>
 //!   gui_stand_in archive     <workspace-root> <task-id>
@@ -39,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use nextup_core::error::Result;
 use nextup_core::workspace::layout::WorkspacePaths;
-use nextup_core::workspace::{exchange, init, modules, ops, teams, workflow};
+use nextup_core::workspace::{exchange, init, modules, ops, registry, teams, workflow};
 
 /// Matches `init_blank`, so a workspace built by one and driven by the other
 /// carries a single app version through its fingerprints and handoff stamps.
@@ -57,6 +60,9 @@ fn main() {
         "team-create" => team_create(rest),
         "team-add" => team_add(rest),
         "team-edge" => team_edge(rest),
+        "set-prime" => set_prime(rest),
+        "module" => module(rest),
+        "register" => register(rest),
         "route" => route(rest),
         "verify" => verify(rest),
         "archive" => archive(rest),
@@ -76,7 +82,7 @@ fn main() {
     }
 }
 
-const USAGE: &str = "usage: gui_stand_in <team-create|team-add|team-edge|route|verify|archive|confirm> ...";
+const USAGE: &str = "usage: gui_stand_in <team-create|team-add|team-edge|set-prime|module|register|route|verify|archive|confirm> ...";
 
 /// Bail with the same shape as a core error so callers see one error channel.
 fn need(args: &[String], n: usize, what: &str) -> Vec<String> {
@@ -140,6 +146,61 @@ fn team_edge(args: &[String]) -> Result<String> {
     Ok(format!("{{\"from\":{},\"to\":{},\"autoRoute\":{auto}}}", json_escape(&a[2]), json_escape(&a[3])))
 }
 
+/// The user designating a team's prime from the team view header (D117).
+/// This is the half of the two-key grant the prime cannot give itself
+/// (21 §4.2), so a run that let an agent do it would be testing nothing.
+/// Mirrors `team_set_prime` including its D119 side effect — the designation
+/// switches the `prime` module on (synced variant, D82), because a prime whose
+/// module is off is the same silent black hole a member without `team` is.
+/// **Enabling grants nothing**: every prime tool stays `guarded`.
+/// Omit the root to clear the designation.
+fn set_prime(args: &[String]) -> Result<String> {
+    let a = need(args, 2, "<teams.json> <team-id> [workspace-root]");
+    match a.get(2).map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        Some(root) => {
+            let p = teams::designate_prime(Path::new(&a[0]), &a[1], root, APP_VERSION)?;
+            Ok(format!(
+                "{{\"workspaceId\":{},\"name\":{}}}",
+                json_escape(&p.workspace_id),
+                json_escape(&p.name)
+            ))
+        }
+        None => {
+            teams::set_prime(Path::new(&a[0]), &a[1], None)?;
+            Ok("{\"cleared\":true}".to_string())
+        }
+    }
+}
+
+/// The user flipping a switch on the workspace's Modules page. Synced variant
+/// (D82) because that is what the app does: a module switch changes the
+/// takeover surface — the module-guide line in the STATE block and the guide
+/// file itself.
+fn module(args: &[String]) -> Result<String> {
+    let a = need(args, 3, "<workspace-root> <module-id> <on|off>");
+    let on = matches!(a[2].as_str(), "on" | "true" | "1");
+    let paths = WorkspacePaths::new(a[0].trim());
+    modules::set_module_enabled_synced(&paths, &a[1], on, APP_VERSION)?;
+    Ok(format!("{{\"module\":{},\"enabled\":{on}}}", json_escape(&a[1])))
+}
+
+/// The registry pointer the app writes every time it opens or initializes a
+/// workspace (`record_recent` in commands.rs). A headless `init_blank` never
+/// takes that path, so without this the fixture exists on disk but not in the
+/// project list — and `team_add_member`, whose contract is "a workspace the
+/// registry already knows", has nothing to find.
+fn register(args: &[String]) -> Result<String> {
+    let a = need(args, 2, "<registry.json> <workspace-root>");
+    let root = a[1].trim();
+    let context = init::open_workspace(WorkspacePaths::new(root).root())?;
+    registry::record_workspace(Path::new(&a[0]), root, &context.name, &context.domain)?;
+    Ok(format!(
+        "{{\"root\":{},\"name\":{}}}",
+        json_escape(root),
+        json_escape(&context.name)
+    ))
+}
+
 // ── Sending (the team view's send step) ─────────────────────────────────────
 
 /// Route one outbox envelope along **the graph**, not along a hand-written
@@ -152,6 +213,8 @@ fn route(args: &[String]) -> Result<String> {
     let opts = exchange::RouteOptions {
         auto: flags.contains(&"--auto"),
         keep_pending: flags.contains(&"--keep-pending"),
+        // This binary stands in for the human pressing send (D86).
+        actor: None,
     };
 
     let upstream_root = a[2].trim();

@@ -1090,6 +1090,45 @@ pub async fn team_add_member(team_id: String, root: String) -> CmdResult<Vec<Tea
     .await
 }
 
+/// Designate (or clear, by passing no root) a team's prime workspace
+/// (D116/D117): the workspace whose agent may edit this team's graph and route
+/// its deliveries. A human does this — it is the half of the two-key grant
+/// that the prime cannot give itself (21 §4.2).
+///
+/// Takes a root rather than a workspaceId because the prime is not a member
+/// (D117) — there is no member row to have resolved one already. Minting the
+/// id is the same explicit write moment joining a team is: `Team.prime`
+/// records an id, so a workspace that predates D48 gets one now.
+///
+/// Like [`team_add_member`], the designation switches the matching module on
+/// (D119): a prime whose `prime` module is off is the same silent black hole a
+/// member without the team module is — the badge shows in the team view while
+/// the tools it names do not exist. **This grants nothing**: every prime tool
+/// is `guarded` and stays off until a human authorises it on that project's
+/// Tools page, which is where the real permission gate has always been.
+///
+/// Both of those writes land on the target workspace, so the ordering matters
+/// and lives in [`teams::designate_prime`] rather than here — the refusal case
+/// must leave nothing behind, and the test stand-in has to take the same path.
+///
+/// The two-key argument (21 §4.2) is untouched, because it was never about a
+/// manual switch: `Team.prime` is what scopes authority to *this* team rather
+/// than every team on the machine, and it still does.
+///
+/// Clearing does *not* switch the module back off — same asymmetry as leaving
+/// a team, and for the same reason: turning a capability off is a decision
+/// about that workspace, not a side effect of a change made over here.
+#[tauri::command]
+pub async fn team_set_prime(team_id: String, root: Option<String>) -> CmdResult<Vec<Team>> {
+    blocking(move || {
+        teams::mutate(|path| match root.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            Some(root) => teams::designate_prime(path, &team_id, root, APP_VERSION).map(|_| ()),
+            None => teams::set_prime(path, &team_id, None),
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn team_remove_member(team_id: String, workspace_id: String) -> CmdResult<Vec<Team>> {
     blocking(move || teams::mutate(|path| teams::remove_member(path, &team_id, &workspace_id)))
@@ -1181,6 +1220,9 @@ pub async fn team_route_delivery(
         let opts = exchange::RouteOptions {
             auto: auto.unwrap_or(false),
             keep_pending: keep_pending.unwrap_or(false),
+            // This command is the human pressing send (or the app's own sweep
+            // when `auto`); a prime route comes through the hub instead.
+            actor: None,
         };
         exchange::route_delivery(&upstream, APP_VERSION, &id, &dests, opts)
     })

@@ -6,6 +6,7 @@ use crate::error::Result;
 use crate::workspace::atomic::atomic_write_json;
 use crate::workspace::context::{load_context, now_rfc3339};
 use crate::workspace::layout::WorkspacePaths;
+use crate::workspace::lock::with_app_lock;
 use crate::workspace::tasks::{counts_for_dir, TaskCounts};
 use crate::workspace::workflow::load_workflow;
 
@@ -63,7 +64,7 @@ pub struct WorkspaceOverview {
 }
 
 pub fn default_registry_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".nextup").join("registry.json"))
+    crate::workspace::layout::app_dir().map(|dir| dir.join("registry.json"))
 }
 
 pub fn load_registry(path: &Path) -> Result<WorkspaceRegistry> {
@@ -79,36 +80,44 @@ pub fn load_registry(path: &Path) -> Result<WorkspaceRegistry> {
 /// Upsert `root` at the front (dedupe by case-insensitive path — Windows).
 /// The registry is the project catalog (D45): once opened, a workspace stays
 /// listed until explicitly removed — no size cap, no silent eviction.
+///
+/// Load → edit → save, so it runs under the app-level lock (D116): opening two
+/// workspaces at once, or the hub minting one while the GUI records another,
+/// would otherwise drop whichever write landed first.
 pub fn record_workspace(path: &Path, root: &str, name: &str, domain: &str) -> Result<()> {
-    let mut registry = load_registry(path)?;
-    let key = normalize(root);
-    registry.workspaces.retain(|w| normalize(&w.root) != key);
-    registry.workspaces.insert(
-        0,
-        RegistryEntry {
-            root: root.to_string(),
-            name: name.to_string(),
-            domain: domain.to_string(),
-            last_opened: now_rfc3339(),
-        },
-    );
-    registry.schema_version = REGISTRY_SCHEMA_VERSION;
-    atomic_write_json(path, &registry)
+    with_app_lock(path, || {
+        let mut registry = load_registry(path)?;
+        let key = normalize(root);
+        registry.workspaces.retain(|w| normalize(&w.root) != key);
+        registry.workspaces.insert(
+            0,
+            RegistryEntry {
+                root: root.to_string(),
+                name: name.to_string(),
+                domain: domain.to_string(),
+                last_opened: now_rfc3339(),
+            },
+        );
+        registry.schema_version = REGISTRY_SCHEMA_VERSION;
+        atomic_write_json(path, &registry)
+    })
 }
 
 /// Drop `root` from the registry (case-insensitive match, same rule as
 /// `record_workspace`). Pointer removal only — the workspace's files are
 /// never touched. Removing an absent root is a quiet no-op.
 pub fn remove_workspace(path: &Path, root: &str) -> Result<()> {
-    let mut registry = load_registry(path)?;
-    let key = normalize(root);
-    let before = registry.workspaces.len();
-    registry.workspaces.retain(|w| normalize(&w.root) != key);
-    if registry.workspaces.len() == before {
-        return Ok(());
-    }
-    registry.schema_version = REGISTRY_SCHEMA_VERSION;
-    atomic_write_json(path, &registry)
+    with_app_lock(path, || {
+        let mut registry = load_registry(path)?;
+        let key = normalize(root);
+        let before = registry.workspaces.len();
+        registry.workspaces.retain(|w| normalize(&w.root) != key);
+        if registry.workspaces.len() == before {
+            return Ok(());
+        }
+        registry.schema_version = REGISTRY_SCHEMA_VERSION;
+        atomic_write_json(path, &registry)
+    })
 }
 
 /// Fresh state for every registry entry. Missing/unreadable workspaces are
@@ -173,6 +182,27 @@ mod tests {
         assert_eq!(registry.workspaces.len(), 2);
         assert_eq!(registry.workspaces[0].name, "Alpha v2");
         assert_eq!(registry.workspaces[1].name, "Beta");
+    }
+
+    /// Until D116 this function had no lock at all — not even a process-local
+    /// one — so concurrent load→edit→save cycles silently lost entries. The
+    /// *cross-process* half of the guarantee is proven in `lock.rs`; this pins
+    /// the read-modify-write sequence itself.
+    #[test]
+    fn concurrent_records_do_not_lose_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("registry.json");
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let reg = reg.clone();
+                scope.spawn(move || {
+                    record_workspace(&reg, &format!(r"C:\ws\p{i}"), &format!("p{i}"), "coding")
+                        .unwrap();
+                });
+            }
+        });
+        let registry = load_registry(&reg).unwrap();
+        assert_eq!(registry.workspaces.len(), 8, "every concurrent write must survive");
     }
 
     #[test]

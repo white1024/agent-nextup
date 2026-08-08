@@ -137,7 +137,7 @@ jobs:
           # Point at a page that exists: the README has no "packaging" section,
           # and reference/building is where the per-OS dialogs are actually
           # written down.
-          releaseBody: "Unsigned trial build: Windows and macOS warn about an unknown publisher on first launch, and nothing here updates itself. https://white1024.github.io/agent-nextup/reference/building/ has the way past each prompt, and the Linux notes. Windows also gets a portable zip that needs no installer at all."
+          releaseBody: "Unsigned trial build: no publisher certificate, no notarization, and nothing here updates itself. Windows and macOS both stop the first launch — SmartScreen needs \"More info\" then \"Run anyway\"; macOS needs System Settings → Privacy & Security → \"Open Anyway\". https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds has both click paths and the Linux notes. Windows also gets a portable zip that needs no installer at all."
           releaseDraft: false
           prerelease: true
 

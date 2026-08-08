@@ -205,8 +205,9 @@ pub const WORKSPACE_SKILLS: [(&str, &str); 4] = [
 /// Keyed by the module ids in [`crate::workspace::modules`]; the pairing is
 /// asserted by `every_known_module_has_a_guide` so adding a module without its
 /// guide cannot compile past the test suite.
-pub const MODULE_GUIDES: [(&str, &str); 3] = [
+pub const MODULE_GUIDES: [(&str, &str); 4] = [
     (crate::workspace::modules::MODULE_COLLAB, include_str!("../../guide/modules/collab.md")),
+    (crate::workspace::modules::MODULE_PRIME, include_str!("../../guide/modules/prime.md")),
     (crate::workspace::modules::MODULE_SPECS, include_str!("../../guide/modules/specs.md")),
     (crate::workspace::modules::MODULE_TEAM, include_str!("../../guide/modules/team.md")),
 ];

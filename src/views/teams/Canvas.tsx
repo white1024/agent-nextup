@@ -402,6 +402,9 @@ function MemberNodeComp({ data, selected }: NodeProps<MemberNode>) {
           )}
         />
         <span className="canvas-node-name">{data.label}</span>
+        {/* No coordinator marker here (D117): the prime is never a member, so
+            this canvas draws the flow and nothing above it. Who runs the team
+            is a team-level fact and lives in the header. */}
         {data.missing && <span className="chip team-missing-chip">{t("teams.missing")}</span>}
       </div>
       <PathLabel className="cn-path" path={data.root} copyable={false} />

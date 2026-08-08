@@ -537,7 +537,7 @@ pub struct RouteFailure {
 }
 
 /// How a routing run behaves beyond its destination list (D71).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteOptions {
     /// Marks the ledger lines on both sides — policy-triggered routing must
     /// stay distinguishable from a human send in the audit trail.
@@ -547,6 +547,27 @@ pub struct RouteOptions {
     /// clearing on that partial fan-out would orphan the manual edges'
     /// deliveries — nobody decided to skip them.
     pub keep_pending: bool,
+    /// Self-declared identity of the agent that asked for this route (D116
+    /// Q3), stamped into both sides' ledger lines. A prime moving another
+    /// member's envelope must not read as a human pressing send: the three
+    /// origins — human, policy (`auto`), prime — stay distinguishable in the
+    /// audit trail. Never an authorization input (D31: names are claimed).
+    pub actor: Option<String>,
+}
+
+impl RouteOptions {
+    /// Ledger-line tail naming how this route came about. Empty for a human
+    /// press, which is the case the existing lines were written for.
+    fn origin_suffix(&self) -> String {
+        let mut tail = String::new();
+        if self.auto {
+            tail.push_str(" (auto)");
+        }
+        if let Some(actor) = self.actor.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            tail.push_str(&format!(" (by prime {actor})"));
+        }
+        tail
+    }
 }
 
 /// Route one outbox envelope to the selected destinations (app layer only —
@@ -575,7 +596,7 @@ pub fn route_delivery(
     let envelope: DeliveryEnvelope = read_json_file(&out_path)?;
     check_schema(&envelope)?;
 
-    let auto_suffix = if opts.auto { " (auto)" } else { "" };
+    let auto_suffix = opts.origin_suffix();
     let mut outcome = RouteOutcome::default();
     for dest in destinations {
         let down = WorkspacePaths::new(&dest.root);
@@ -1176,7 +1197,7 @@ mod tests {
             "0.1.0",
             &envelope.id,
             &[dest(&down, "t")],
-            RouteOptions { auto: true, keep_pending: false },
+            RouteOptions { auto: true, keep_pending: false, actor: None },
         )
         .unwrap();
         let up_log =
@@ -1201,7 +1222,7 @@ mod tests {
             "0.1.0",
             &envelope.id,
             &[dest(&down, "t")],
-            RouteOptions { auto: true, keep_pending: true },
+            RouteOptions { auto: true, keep_pending: true, actor: None },
         )
         .unwrap();
         assert_eq!(outcome.delivered, vec!["beta".to_string()]);
@@ -1376,7 +1397,7 @@ mod tests {
             "0.1.0",
             &envelope.id,
             &[dest(&down, "t")],
-            RouteOptions { auto: true, keep_pending: true },
+            RouteOptions { auto: true, keep_pending: true, actor: None },
         )
         .unwrap();
         let inbox_file = down.inbox_dir().join(&envelope.id).join("x.bin");

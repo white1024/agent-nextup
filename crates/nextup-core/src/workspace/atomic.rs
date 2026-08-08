@@ -42,16 +42,16 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     // another writer is replacing the same destination, and Defender opens a
     // freshly written file to scan it. Both clear on their own in milliseconds
     // (reproduced under load as `Os { code: 5, PermissionDenied }`).
-    // Retry briefly rather than surfacing a scary error the user can do
-    // nothing about. ENOENT is deliberately NOT retried — with a per-write
-    // temp name it would mean a real bug, and masking it would hide it.
+    // Retry rather than surfacing a scary error the user can do nothing about.
+    // ENOENT is deliberately NOT retried — with a per-write temp name it would
+    // mean a real bug, and masking it would hide it.
     let mut attempt = 0u32;
     loop {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
             Err(e) if attempt + 1 < RENAME_ATTEMPTS && is_transient_rename_error(&e) => {
+                std::thread::sleep(retry_backoff(attempt, seq));
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2 * u64::from(attempt)));
             }
             Err(e) => {
                 // Leave no temp litter behind on failure.
@@ -62,8 +62,27 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// Rename attempts before giving up (~130ms of linear backoff in total).
+/// Rename attempts before giving up.
 const RENAME_ATTEMPTS: u32 = 12;
+
+/// How long to wait before rename attempt `attempt + 1`.
+///
+/// **Exponential and jittered, and both halves are load-bearing** (G046). The
+/// contention this backs off from is other writers doing exactly the same
+/// thing, so a fixed schedule makes every loser sleep the same length and
+/// collide again in lockstep — a thundering herd that gets worse with more
+/// writers, not better. The old linear `2ms * attempt` failed that way: it
+/// looked like ~130ms of patience, but eight threads renaming onto one path
+/// spent it re-colliding, and the suite went red roughly five runs in eight
+/// on a loaded machine while the same test alone never failed once.
+///
+/// Jitter comes from the write sequence rather than a RNG: it is already
+/// unique per write and therefore differs between the very writers that need
+/// decorrelating, with no dependency and no global state of its own.
+fn retry_backoff(attempt: u32, seq: u64) -> std::time::Duration {
+    let base = 1u64 << attempt.min(6); // 1, 2, 4, … 64ms, then flat
+    std::time::Duration::from_millis(base + seq % base)
+}
 
 /// Windows sharing/scanner contention that resolves itself. `PermissionDenied`
 /// covers ERROR_ACCESS_DENIED; the raw codes catch SHARING_VIOLATION (32) and

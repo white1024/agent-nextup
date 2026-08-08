@@ -6,32 +6,33 @@
 //! `workspaceId` — root/name are display caches, so a moved folder breaks
 //! nothing a re-link cannot fix. Edges must stay a DAG: on a cycle, "who is
 //! downstream" has no answer, and routing expands deliveries along edges.
-//! Only the GUI process writes this file (same single-writer contract as the
-//! registry); the nextup-mcp hub never knows app-level files exist.
+//!
+//! Every mutation below reads the whole file, edits it and writes it back, so
+//! each one runs inside [`with_app_lock`] — `atomic_write` keeps each *file*
+//! valid, the lock keeps the *sequence* correct. Two writers really do overlap:
+//! the GUI runs each `team_*` IPC on a blocking thread pool (a drag persisting
+//! layout while an edge add lands), and since D116 the nextup-mcp hub writes
+//! this file too. Without the lock both load the same snapshot and the second
+//! save silently drops the first's change — the edge comes back on reload
+//! because it was never written, not because the UI glitched.
+//!
+//! ⚠️ **Every mutating fn in this module must take it**, and must take it
+//! itself rather than relying on a caller: `mutate` deliberately runs its
+//! closure unlocked because callers touch workspace files first (see the
+//! nesting warning in `lock.rs`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NextUpError, Result};
 use crate::workspace::atomic::atomic_write_json;
 use crate::workspace::context::now_rfc3339;
 use crate::workspace::ids::uuid_v4;
+use crate::workspace::lock::with_app_lock;
 
 pub const TEAMS_SCHEMA_VERSION: u32 = 1;
-
-/// Serializes the load → mutate → save cycle over `teams.json`.
-///
-/// Every mutation below reads the whole file, edits it and writes it back. The
-/// GUI runs each `team_*` IPC on a blocking thread pool, so two of them really
-/// do overlap (a drag persisting layout while an edge add lands). Without this
-/// both load the same snapshot and the second save silently drops the first's
-/// change — the edge comes back on reload because it was never written, not
-/// because the UI glitched. `atomic_write` keeps each *file* valid; this keeps
-/// the *sequence* correct. **Every mutating fn in this module must take it.**
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,22 @@ pub struct Team {
     /// opening a team never writes this (only drags / auto-tidy do).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub layout: HashMap<String, NodePos>,
+    /// This team's prime workspace (D116, 21 §4.1): the workspace whose agent
+    /// may edit *this* team's graph and route *this* team's deliveries.
+    /// Authority is scoped per team, not per workspace — a workspace can be
+    /// prime here and an ordinary member elsewhere.
+    ///
+    /// ⚠️ **The prime is deliberately not a member** (D117): it sits above the
+    /// flow this team describes, so it has no node on the canvas and no edges.
+    /// It carries the same display caches a member does because it is not in
+    /// `members` to look them up from — and the registry cannot answer, being
+    /// keyed by root with no workspaceId at all.
+    ///
+    /// `None` is the default and what every pre-D116 file loads as: no prime,
+    /// humans drive the graph. Enabling the `prime` module is the other half —
+    /// neither key alone grants anything (21 §4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prime: Option<TeamMember>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -92,7 +109,7 @@ pub struct TeamEdge {
 }
 
 pub fn default_teams_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".nextup").join("teams.json"))
+    crate::workspace::layout::app_dir().map(|dir| dir.join("teams.json"))
 }
 
 /// The app-level store's path, or the one reason it cannot be resolved.
@@ -143,21 +160,23 @@ pub fn create_team(path: &Path, name: &str) -> Result<Team> {
     if name.is_empty() {
         return Err(NextUpError::InvalidInput("team name cannot be empty".into()));
     }
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let now = now_rfc3339();
-    let team = Team {
-        id: uuid_v4(),
-        name: name.to_string(),
-        members: Vec::new(),
-        edges: Vec::new(),
-        layout: HashMap::new(),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    file.teams.push(team.clone());
-    save(path, file)?;
-    Ok(team)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let now = now_rfc3339();
+        let team = Team {
+            id: uuid_v4(),
+            name: name.to_string(),
+            members: Vec::new(),
+            edges: Vec::new(),
+            layout: HashMap::new(),
+            prime: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        file.teams.push(team.clone());
+        save(path, file)?;
+        Ok(team)
+    })
 }
 
 pub fn rename_team(path: &Path, team_id: &str, name: &str) -> Result<()> {
@@ -165,23 +184,25 @@ pub fn rename_team(path: &Path, team_id: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(NextUpError::InvalidInput("team name cannot be empty".into()));
     }
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    team.name = name.to_string();
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        team.name = name.to_string();
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 pub fn delete_team(path: &Path, team_id: &str) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let before = file.teams.len();
-    file.teams.retain(|t| t.id != team_id);
-    if file.teams.len() == before {
-        return Err(NextUpError::NotFound(format!("no team with id {team_id}")));
-    }
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let before = file.teams.len();
+        file.teams.retain(|t| t.id != team_id);
+        if file.teams.len() == before {
+            return Err(NextUpError::NotFound(format!("no team with id {team_id}")));
+        }
+        save(path, file)
+    })
 }
 
 /// Add a member. The caller passes a workspace with a minted stable id
@@ -191,99 +212,149 @@ pub fn add_member(path: &Path, team_id: &str, member: TeamMember) -> Result<()> 
     if member.workspace_id.trim().is_empty() {
         return Err(NextUpError::InvalidInput("member workspaceId cannot be empty".into()));
     }
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    if team.members.iter().any(|m| m.workspace_id == member.workspace_id) {
-        return Err(NextUpError::InvalidInput(format!(
-            "workspace {} is already a member of team \"{}\"",
-            member.workspace_id, team.name
-        )));
-    }
-    team.members.push(member);
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        if team.members.iter().any(|m| m.workspace_id == member.workspace_id) {
+            return Err(NextUpError::InvalidInput(format!(
+                "workspace {} is already a member of team \"{}\"",
+                member.workspace_id, team.name
+            )));
+        }
+        // The other half of the rule `set_prime` enforces (D117): a workspace
+        // holds one seat per team, above the flow or in it, never both.
+        if team.prime.as_ref().is_some_and(|p| p.workspace_id == member.workspace_id) {
+            return Err(NextUpError::InvalidInput(format!(
+                "workspace {} is the prime of team \"{}\" — it coordinates the team from above and cannot also be a member; clear the prime designation first",
+                member.workspace_id, team.name
+            )));
+        }
+        team.members.push(member);
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 /// Remove a member and every edge touching it — a dangling edge would point
 /// at a workspace the team no longer knows.
 pub fn remove_member(path: &Path, team_id: &str, workspace_id: &str) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    let before = team.members.len();
-    team.members.retain(|m| m.workspace_id != workspace_id);
-    if team.members.len() == before {
-        return Err(NextUpError::NotFound(format!(
-            "workspace {workspace_id} is not a member of this team"
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        let before = team.members.len();
+        team.members.retain(|m| m.workspace_id != workspace_id);
+        if team.members.len() == before {
+            return Err(NextUpError::NotFound(format!(
+                "workspace {workspace_id} is not a member of this team"
+            )));
+        }
+        team.edges.retain(|e| e.from != workspace_id && e.to != workspace_id);
+        team.layout.remove(workspace_id);
+        // The prime is never a member (D117), so leaving a team cannot strip a
+        // designation — that is `set_prime(None)`, a separate deliberate act.
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
+}
+
+/// Designate (or clear, with `None`) this team's prime workspace (D116/D117).
+///
+/// The prime must *not* be a member. It coordinates the flow this team
+/// describes rather than taking part in it, so holding both seats would put it
+/// back on the canvas as an ordinary node — the shape D117 exists to undo.
+/// Identity is resolved by the caller exactly as [`add_member`] requires it:
+/// this module answers membership questions, it never reads workspace files.
+pub fn set_prime(path: &Path, team_id: &str, prime: Option<TeamMember>) -> Result<()> {
+    if prime.as_ref().is_some_and(|p| p.workspace_id.trim().is_empty()) {
+        return Err(NextUpError::InvalidInput("prime workspaceId cannot be empty".into()));
+    }
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        if let Some(p) = &prime {
+            reject_member_as_prime(team, &p.workspace_id)?;
+        }
+        team.prime = prime;
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
+}
+
+/// The one rule [`set_prime`] enforces, shared with [`designate_prime`] so the
+/// pre-flight question and the authoritative answer can never drift apart.
+fn reject_member_as_prime(team: &Team, workspace_id: &str) -> Result<()> {
+    if team.members.iter().any(|m| m.workspace_id == workspace_id) {
+        return Err(NextUpError::InvalidInput(format!(
+            "workspace {} is a member of team \"{}\" — a prime coordinates a team from above it and has no node in its flow, so it cannot also be a member; remove it as a member first",
+            workspace_id, team.name
         )));
     }
-    team.edges.retain(|e| e.from != workspace_id && e.to != workspace_id);
-    team.layout.remove(workspace_id);
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    Ok(())
 }
 
 /// Persist the team-canvas node positions (D53). The GUI sends the full map;
 /// ids that are not current members are dropped silently (tidies up after
 /// departed members). Presentation state only — no ledger, no workspace I/O.
 pub fn set_layout(path: &Path, team_id: &str, positions: HashMap<String, NodePos>) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    let kept: HashMap<String, NodePos> = positions
-        .into_iter()
-        .filter(|(id, _)| team.members.iter().any(|m| &m.workspace_id == id))
-        .collect();
-    team.layout = kept;
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        let kept: HashMap<String, NodePos> = positions
+            .into_iter()
+            .filter(|(id, _)| team.members.iter().any(|m| &m.workspace_id == id))
+            .collect();
+        team.layout = kept;
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 /// Add a directed edge `from → to`. Both endpoints must be members; self
 /// loops, duplicates and anything that would close a cycle are refused — the
 /// graph stays a DAG so "who is downstream" always has an answer (09 §3).
 pub fn add_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    if from == to {
-        return Err(NextUpError::InvalidInput(
-            "an edge cannot point a workspace at itself".into(),
-        ));
-    }
-    for endpoint in [from, to] {
-        if !team.members.iter().any(|m| m.workspace_id == endpoint) {
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        if from == to {
+            return Err(NextUpError::InvalidInput(
+                "an edge cannot point a workspace at itself".into(),
+            ));
+        }
+        for endpoint in [from, to] {
+            if !team.members.iter().any(|m| m.workspace_id == endpoint) {
+                return Err(NextUpError::InvalidInput(format!(
+                    "workspace {endpoint} is not a member of team \"{}\"",
+                    team.name
+                )));
+            }
+        }
+        if team.edges.iter().any(|e| e.from == from && e.to == to) {
+            return Err(NextUpError::InvalidInput("this edge already exists".into()));
+        }
+        if reaches(&team.edges, to, from) {
             return Err(NextUpError::InvalidInput(format!(
-                "workspace {endpoint} is not a member of team \"{}\"",
-                team.name
+                "adding {from} → {to} would create a cycle — team flows must stay a DAG"
             )));
         }
-    }
-    if team.edges.iter().any(|e| e.from == from && e.to == to) {
-        return Err(NextUpError::InvalidInput("this edge already exists".into()));
-    }
-    if reaches(&team.edges, to, from) {
-        return Err(NextUpError::InvalidInput(format!(
-            "adding {from} → {to} would create a cycle — team flows must stay a DAG"
-        )));
-    }
-    team.edges.push(TeamEdge { from: from.to_string(), to: to.to_string(), auto_route: false });
-    team.updated_at = now_rfc3339();
-    save(path, file)
+        team.edges.push(TeamEdge { from: from.to_string(), to: to.to_string(), auto_route: false });
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 pub fn remove_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    let before = team.edges.len();
-    team.edges.retain(|e| !(e.from == from && e.to == to));
-    if team.edges.len() == before {
-        return Err(NextUpError::NotFound(format!("no edge {from} → {to} in this team")));
-    }
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        let before = team.edges.len();
+        team.edges.retain(|e| !(e.from == from && e.to == to));
+        if team.edges.len() == before {
+            return Err(NextUpError::NotFound(format!("no edge {from} → {to} in this team")));
+        }
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 /// Set the auto-route policy on an existing edge (D71). Edges carry no id of
@@ -295,17 +366,18 @@ pub fn set_edge_auto_route(
     to: &str,
     auto_route: bool,
 ) -> Result<()> {
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let team = team_mut(&mut file, team_id)?;
-    let edge = team
-        .edges
-        .iter_mut()
-        .find(|e| e.from == from && e.to == to)
-        .ok_or_else(|| NextUpError::NotFound(format!("no edge {from} → {to} in this team")))?;
-    edge.auto_route = auto_route;
-    team.updated_at = now_rfc3339();
-    save(path, file)
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        let edge = team
+            .edges
+            .iter_mut()
+            .find(|e| e.from == from && e.to == to)
+            .ok_or_else(|| NextUpError::NotFound(format!("no edge {from} → {to} in this team")))?;
+        edge.auto_route = auto_route;
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
 }
 
 /// Identity gate for re-linking a moved member (D52, 09 §2): a folder is only
@@ -340,29 +412,140 @@ pub fn rebind_workspace(
     if new_root.is_empty() {
         return Err(NextUpError::InvalidInput("new root cannot be empty".into()));
     }
-    let _guard = WRITE_LOCK.lock();
-    let mut file = load_teams(path)?;
-    let now = now_rfc3339();
-    let mut touched = 0usize;
-    for team in file.teams.iter_mut() {
-        let mut hit = false;
-        for member in team.members.iter_mut().filter(|m| m.workspace_id == workspace_id) {
-            member.root = new_root.to_string();
-            member.name = new_name.to_string();
-            hit = true;
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let now = now_rfc3339();
+        let mut touched = 0usize;
+        for team in file.teams.iter_mut() {
+            let mut hit = false;
+            for member in team.members.iter_mut().filter(|m| m.workspace_id == workspace_id) {
+                member.root = new_root.to_string();
+                member.name = new_name.to_string();
+                hit = true;
+            }
+            if hit {
+                team.updated_at = now.clone();
+                touched += 1;
+            }
         }
-        if hit {
-            team.updated_at = now.clone();
-            touched += 1;
+        if touched == 0 {
+            return Err(NextUpError::NotFound(format!(
+                "workspace {workspace_id} is not a member of any team"
+            )));
         }
+        save(path, file)?;
+        Ok(touched)
+    })
+}
+
+/// Initialize a brand-new workspace and join it to `team_id` in one call
+/// (D116 Q2, 21 §6) — the "spin up a project for this need and put it in the
+/// flow" step, which until now only a human could perform across three
+/// screens.
+///
+/// Composes three layers deliberately and **in this order**:
+///
+/// 1. the team is checked *before* anything touches the disk — a mistyped
+///    team id must not leave an orphan workspace behind;
+/// 2. `initialize_project` creates the folder (its own `create_root` contract
+///    refuses a pre-existing one, D44) and mints the stable workspace id;
+/// 3. the registry pointer, then the membership.
+///
+/// The `team` module is forced on regardless of `params.modules`: a member
+/// without the inbox surface is the silent black hole that `team_add_member`
+/// already guards against (09 landing delta ②).
+///
+/// ⚠️ Not atomic across the three, and deliberately so — each step takes its
+/// own lock and they must never nest (`lock.rs`). If the last step fails the
+/// workspace exists and is registered, just not joined: visible, and fixable
+/// with a plain "add member". The reverse order would strand a folder nobody
+/// listed.
+pub fn create_member(
+    teams_path: &Path,
+    registry_path: &Path,
+    team_id: &str,
+    params: &crate::workspace::init::InitProjectParams,
+    keys: &dyn crate::security::keystore::KeyProvider,
+    app_version: &str,
+) -> Result<TeamMember> {
+    let known = load_teams(teams_path)?;
+    if !known.teams.iter().any(|t| t.id == team_id) {
+        return Err(NextUpError::NotFound(format!("no team with id {team_id}")));
     }
-    if touched == 0 {
-        return Err(NextUpError::NotFound(format!(
-            "workspace {workspace_id} is not a member of any team"
-        )));
+
+    let mut params = params.clone();
+    if !params.modules.iter().any(|m| m == crate::workspace::modules::MODULE_TEAM) {
+        params.modules.push(crate::workspace::modules::MODULE_TEAM.to_string());
     }
-    save(path, file)?;
-    Ok(touched)
+    params.create_root = true;
+
+    let context = crate::workspace::init::initialize_project(&params, keys, app_version)?;
+    let root = params.root.trim().to_string();
+    let workspace_id = context.workspace_id.clone().ok_or_else(|| {
+        NextUpError::Workspace("the new workspace was created without a stable id".into())
+    })?;
+
+    crate::workspace::registry::record_workspace(
+        registry_path,
+        &root,
+        &context.name,
+        &context.domain,
+    )?;
+
+    let member = TeamMember { workspace_id, root, name: context.name };
+    add_member(teams_path, team_id, member.clone())?;
+    Ok(member)
+}
+
+/// Designate `root` as this team's prime the way the app does (D116/D117):
+/// resolve who it is, switch its `prime` module on (D119), then record it.
+/// One function so the Tauri command and the test stand-in cannot diverge.
+///
+/// **The membership check runs before either side effect** — the same lesson
+/// as [`create_member`]'s team check, learned again. [`set_prime`] refuses a
+/// workspace that is already a member; a refusal that arrived *after* the
+/// module flip would leave that member carrying a coordinator's surface it was
+/// never granted — thirteen prime tools in its `tools/list`, plus the STATE
+/// block line and the shipped guide the synced switch writes.
+///
+/// Membership is keyed by the stable id, so the check asks with the id the
+/// workspace already has. One without an id cannot be a member — joining is
+/// what mints it — so answering the question mints nothing either.
+pub fn designate_prime(
+    teams_path: &Path,
+    team_id: &str,
+    root: &str,
+    app_version: &str,
+) -> Result<TeamMember> {
+    let root = root.trim();
+    let paths = crate::workspace::layout::WorkspacePaths::new(root);
+    let context = crate::workspace::init::open_workspace(paths.root())?;
+
+    let known = load_teams(teams_path)?;
+    let team = known
+        .teams
+        .iter()
+        .find(|t| t.id == team_id)
+        .ok_or_else(|| NextUpError::NotFound(format!("no team with id {team_id}")))?;
+    if let Some(id) = &context.workspace_id {
+        reject_member_as_prime(team, id)?;
+    }
+
+    let workspace_id = crate::workspace::ops::ensure_workspace_id(&paths, app_version)?;
+    let modules = crate::workspace::modules::get_modules(&paths)?;
+    if !modules.is_enabled(crate::workspace::modules::MODULE_PRIME) {
+        // Synced variant (D82): a module switch changes the takeover surface.
+        crate::workspace::modules::set_module_enabled_synced(
+            &paths,
+            crate::workspace::modules::MODULE_PRIME,
+            true,
+            app_version,
+        )?;
+    }
+
+    let member = TeamMember { workspace_id, root: root.to_string(), name: context.name };
+    set_prime(teams_path, team_id, Some(member.clone()))?;
+    Ok(member)
 }
 
 /// Is `goal` reachable from `start` along the directed edges?
@@ -386,6 +569,18 @@ fn reaches(edges: &[TeamEdge], start: &str, goal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::keystore::StaticKeyProvider;
+    use crate::workspace::init::InitProjectParams;
+
+    /// Params for a new workspace at `root`, which must not exist yet.
+    fn new_params(root: &Path) -> InitProjectParams {
+        InitProjectParams {
+            root: root.to_string_lossy().into_owned(),
+            name: "spun up".into(),
+            domain: "research".into(),
+            ..Default::default()
+        }
+    }
 
     fn member(id: &str) -> TeamMember {
         TeamMember {
@@ -404,6 +599,243 @@ mod tests {
             add_member(&path, &team.id, member(id)).unwrap();
         }
         (dir, path, team)
+    }
+
+    /// The process-local `Mutex` this replaced (D116) already covered threads;
+    /// what it could not cover is a second *process*, proven in `lock.rs`.
+    /// Keeping a same-process case here pins the sequence for both.
+    #[test]
+    fn concurrent_member_adds_do_not_lose_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        let team = create_team(&path, "research to dev").unwrap();
+        std::thread::scope(|scope| {
+            for id in ["a", "b", "c", "d", "e", "f"] {
+                let (path, team_id) = (path.clone(), team.id.clone());
+                scope.spawn(move || add_member(&path, &team_id, member(id)).unwrap());
+            }
+        });
+        let teams = load_teams(&path).unwrap().teams;
+        assert_eq!(teams[0].members.len(), 6, "every concurrent write must survive");
+    }
+
+    #[test]
+    fn create_member_initializes_registers_and_joins_in_one_call() {
+        let (dir, path, team) = seeded();
+        let reg = dir.path().join("registry.json");
+        let root = dir.path().join("spun-up");
+
+        let made = create_member(
+            &path,
+            &reg,
+            &team.id,
+            &new_params(&root),
+            &StaticKeyProvider([7u8; 32]),
+            "0.1.0",
+        )
+        .unwrap();
+
+        assert!(root.join(".nextup").is_dir(), "the workspace is on disk");
+        assert_eq!(
+            crate::workspace::registry::load_registry(&reg).unwrap().workspaces.len(),
+            1,
+            "and listed in the registry"
+        );
+        let team = &load_teams(&path).unwrap().teams[0];
+        assert!(team.members.iter().any(|m| m.workspace_id == made.workspace_id), "and joined");
+
+        // Without the team module the new member would have no inbox surface.
+        let modules =
+            crate::workspace::modules::get_modules(&crate::workspace::layout::WorkspacePaths::new(
+                &root,
+            ))
+            .unwrap();
+        assert!(modules.is_enabled(crate::workspace::modules::MODULE_TEAM));
+    }
+
+    /// The refusal is not the point — leaving the target untouched is. An
+    /// earlier ordering flipped the module first, so a designation the graph
+    /// then refused still left that member with the prime surface switched on.
+    #[test]
+    fn designating_a_member_leaves_its_workspace_untouched() {
+        let (dir, path, team) = seeded();
+        let reg = dir.path().join("registry.json");
+        let root = dir.path().join("joined");
+        create_member(
+            &path,
+            &reg,
+            &team.id,
+            &new_params(&root),
+            &StaticKeyProvider([7u8; 32]),
+            "0.1.0",
+        )
+        .unwrap();
+
+        let err = designate_prime(&path, &team.id, &root.to_string_lossy(), "0.1.0").unwrap_err();
+
+        assert!(err.to_string().contains("cannot also be a member"), "got: {err}");
+        let paths = crate::workspace::layout::WorkspacePaths::new(root.to_string_lossy().as_ref());
+        assert!(
+            !crate::workspace::modules::get_modules(&paths)
+                .unwrap()
+                .is_enabled(crate::workspace::modules::MODULE_PRIME),
+            "a refused designation must not leave the prime module on"
+        );
+        let after = load_teams(&path).unwrap();
+        assert!(after.teams.iter().all(|t| t.prime.is_none()), "and no prime is recorded");
+    }
+
+    #[test]
+    fn designate_prime_switches_the_module_on_and_records_it() {
+        let (dir, path, team) = seeded();
+        let root = dir.path().join("coordinator");
+        let mut params = new_params(&root);
+        params.create_root = true;
+        crate::workspace::init::initialize_project(
+            &params,
+            &StaticKeyProvider([7u8; 32]),
+            "0.1.0",
+        )
+        .unwrap();
+
+        let made = designate_prime(&path, &team.id, &root.to_string_lossy(), "0.1.0").unwrap();
+
+        let paths = crate::workspace::layout::WorkspacePaths::new(root.to_string_lossy().as_ref());
+        assert!(
+            crate::workspace::modules::get_modules(&paths)
+                .unwrap()
+                .is_enabled(crate::workspace::modules::MODULE_PRIME),
+            "D119: designating switches the prime module on"
+        );
+        let after = load_teams(&path).unwrap();
+        let recorded = after.teams.iter().find(|t| t.id == team.id).unwrap().prime.clone();
+        assert_eq!(recorded.unwrap().workspace_id, made.workspace_id);
+    }
+
+    /// A mistyped team id must not leave an orphan workspace on disk — the
+    /// team is checked before anything is created.
+    #[test]
+    fn create_member_checks_the_team_before_touching_the_disk() {
+        let (dir, path, _team) = seeded();
+        let reg = dir.path().join("registry.json");
+        let root = dir.path().join("never-made");
+
+        let err = create_member(
+            &path,
+            &reg,
+            "no-such-team",
+            &new_params(&root),
+            &StaticKeyProvider([7u8; 32]),
+            "0.1.0",
+        );
+
+        assert!(err.is_err());
+        assert!(!root.exists(), "no orphan folder left behind");
+    }
+
+    #[test]
+    fn prime_defaults_to_none_and_pre_d116_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":1,"teams":[{"id":"t1","name":"old","members":[],
+               "edges":[],"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+        assert_eq!(teams[0].prime, None, "a file written before D116 must load unchanged");
+    }
+
+    /// D117 inverted D116's rule: a prime sits *above* the flow, so a
+    /// non-member is exactly who may hold the seat.
+    #[test]
+    fn prime_is_a_non_member_and_can_be_cleared() {
+        let (_dir, path, team) = seeded();
+
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+        assert_eq!(
+            load_teams(&path).unwrap().teams[0].prime.as_ref().unwrap().workspace_id,
+            "boss",
+            "a workspace outside the team is who coordinates it"
+        );
+
+        set_prime(&path, &team.id, None).unwrap();
+        assert_eq!(load_teams(&path).unwrap().teams[0].prime, None);
+    }
+
+    /// The display caches are the point of storing a whole `TeamMember`: the
+    /// prime is in no member row and the registry has no workspaceId at all,
+    /// so nothing else on disk could answer "what is this prime called?".
+    #[test]
+    fn prime_carries_its_own_root_and_name() {
+        let (_dir, path, team) = seeded();
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+
+        let stored = load_teams(&path).unwrap().teams[0].prime.clone().unwrap();
+        assert_eq!(stored.root, "C:/ws/boss");
+        assert_eq!(stored.name, "boss");
+    }
+
+    /// One seat per team, above the flow or in it — enforced from both sides,
+    /// because either alone leaves the other order of operations open.
+    #[test]
+    fn a_workspace_cannot_be_both_prime_and_member() {
+        let (_dir, path, team) = seeded();
+
+        assert!(
+            set_prime(&path, &team.id, Some(member("a"))).is_err(),
+            "a member cannot be promoted in place — that is the shape D117 undid"
+        );
+
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+        assert!(
+            add_member(&path, &team.id, member("boss")).is_err(),
+            "and the prime cannot join the team it coordinates"
+        );
+    }
+
+    /// The prime is never a member (D117), so leaving cannot strip authority.
+    /// Clearing a designation is `set_prime(None)` and nothing else.
+    #[test]
+    fn removing_a_member_leaves_the_prime_designation_alone() {
+        let (_dir, path, team) = seeded();
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+
+        remove_member(&path, &team.id, "b").unwrap();
+
+        let prime = load_teams(&path).unwrap().teams[0].prime.clone();
+        assert_eq!(prime.unwrap().workspace_id, "boss");
+    }
+
+    #[test]
+    fn prime_is_scoped_per_team_not_per_workspace() {
+        let (_dir, path, first) = seeded();
+        let second = create_team(&path, "other").unwrap();
+        add_member(&path, &second.id, member("a")).unwrap();
+
+        set_prime(&path, &first.id, Some(member("boss"))).unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+        let other = teams.iter().find(|t| t.id == second.id).unwrap();
+        assert_eq!(other.prime, None, "being prime of one team grants nothing in another");
+    }
+
+    /// The canvas draws `members`, so a prime that never lands there is the
+    /// whole of "not a node in the flow" as far as core can express it.
+    #[test]
+    fn the_prime_gets_no_node_and_no_edges() {
+        let (_dir, path, team) = seeded();
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+
+        let stored = load_teams(&path).unwrap().teams.remove(0);
+        assert!(
+            !stored.members.iter().any(|m| m.workspace_id == "boss"),
+            "the prime is not drawn as a team node"
+        );
+        assert!(
+            add_edge(&path, &team.id, "boss", "a").is_err(),
+            "and edges refuse a non-member endpoint, so it cannot acquire one"
+        );
     }
 
     #[test]

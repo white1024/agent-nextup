@@ -33,6 +33,7 @@ pub mod lock;
 pub mod manifest;
 pub mod modules;
 pub mod ops;
+pub mod prime;
 pub mod registry;
 pub mod rules;
 pub mod settings;

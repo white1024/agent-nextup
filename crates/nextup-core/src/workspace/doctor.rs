@@ -415,17 +415,42 @@ fn check_modules(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) {
     if !file.is_file() {
         return; // absent = nothing enabled, the documented default
     }
-    if let Err(err) = crate::workspace::modules::get_modules(paths) {
-        findings.push(finding(
-            "modules",
-            DoctorSeverity::Error,
-            ".nextup/modules.json",
-            format!(
-                "cannot be read ({err}) — module tools, the STATE module-guide line and \
-                 module-guide upgrades all silently fall back to 'nothing enabled' until \
-                 this parses"
-            ),
-        ));
+    let modules = match crate::workspace::modules::get_modules(paths) {
+        Ok(m) => m,
+        Err(err) => {
+            findings.push(finding(
+                "modules",
+                DoctorSeverity::Error,
+                ".nextup/modules.json",
+                format!(
+                    "cannot be read ({err}) — module tools, the STATE module-guide line and \
+                     module-guide upgrades all silently fall back to 'nothing enabled' until \
+                     this parses"
+                ),
+            ));
+            return;
+        }
+    };
+
+    // Prime is keyed on the workspace's stable id (D116): `Team.prime` names
+    // an id, so a workspace without one cannot be designated and every prime
+    // tool fails with "never joined a team" — while the switch sits visibly
+    // on. Only pre-D48 workspaces reach this (init has minted ids since), and
+    // joining any team backfills it.
+    if modules.is_enabled(crate::workspace::modules::MODULE_PRIME) {
+        let missing_id = crate::workspace::context::load_context(&paths.context_file())
+            .map(|ctx| ctx.workspace_id.is_none())
+            .unwrap_or(false);
+        if missing_id {
+            findings.push(finding(
+                "prime_without_identity",
+                DoctorSeverity::Warning,
+                ".nextup/context.json",
+                "the prime module is on but this workspace has no stable id, so it cannot be \
+                 named as any team's coordinator — join a team once from the team view and the \
+                 id is minted",
+            ));
+        }
     }
 }
 
@@ -812,6 +837,29 @@ mod tests {
 
     fn checks_of(report: &DoctorReport) -> Vec<&str> {
         report.findings.iter().map(|f| f.check.as_str()).collect()
+    }
+
+    /// A prime workspace is keyed on its stable id, so one without an id has a
+    /// switch that is visibly on and does nothing (D116).
+    #[test]
+    fn prime_without_a_stable_id_is_named() {
+        let (_guard, paths) = managed_workspace();
+        crate::workspace::modules::set_module_enabled(
+            &paths,
+            crate::workspace::modules::MODULE_PRIME,
+            true,
+        )
+        .unwrap();
+
+        // Init has minted ids since D48 — a healthy workspace stays silent.
+        assert!(!checks_of(&run_doctor(paths.root()).unwrap()).contains(&"prime_without_identity"));
+
+        // Strip it back to the pre-D48 shape.
+        let mut ctx = crate::workspace::context::load_context(&paths.context_file()).unwrap();
+        ctx.workspace_id = None;
+        crate::workspace::context::save_context(&paths.context_file(), &ctx).unwrap();
+
+        assert!(checks_of(&run_doctor(paths.root()).unwrap()).contains(&"prime_without_identity"));
     }
 
     #[test]

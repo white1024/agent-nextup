@@ -980,6 +980,7 @@ export default function App() {
                   // D69 path B) never carries across roots (adversarial-review).
                   key={status.workspace?.root ?? ""}
                   root={status.workspace?.root ?? ""}
+                  projectName={status.workspace?.name ?? ""}
                   onSessionsChanged={reloadTerminals}
                 />
               )}

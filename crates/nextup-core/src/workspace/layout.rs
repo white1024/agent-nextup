@@ -1,5 +1,23 @@
 use std::path::{Path, PathBuf};
 
+/// The app-level directory holding structures that span workspaces:
+/// `registry.json` (D45) and `teams.json` (D48), plus their shared `.mutex`.
+///
+/// `NEXTUP_APP_DIR` overrides the default `~/.nextup`. That exists because
+/// D116 gave the hub app-level write access: anything exercising those tools
+/// for real — the cross-project regression run, a scratch install — must be
+/// able to point at its own store instead of the developer's live one.
+///
+/// ⚠️ Env vars are process-global, so **do not** set this from a unit test:
+/// Rust runs them in parallel and one test's override would leak into
+/// another's. Test seams take the directory as an argument instead.
+pub fn app_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("NEXTUP_APP_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::home_dir().map(|home| home.join(".nextup"))
+}
+
 /// Canonical on-disk layout of an Agent NextUp workspace. All path knowledge lives
 /// here so no other module hardcodes file names.
 ///

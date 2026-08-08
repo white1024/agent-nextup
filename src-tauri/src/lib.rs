@@ -128,6 +128,7 @@ pub fn run() {
             commands::team_delete,
             commands::team_add_member,
             commands::team_remove_member,
+            commands::team_set_prime,
             commands::team_rebind_workspace,
             commands::team_set_layout,
             commands::team_add_edge,

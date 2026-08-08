@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -8,6 +10,7 @@ import "@xterm/xterm/css/xterm.css";
 
 import { api, errorMessage } from "../api";
 import { useGuardedMutation } from "../hooks";
+import { baseName } from "../lib/format";
 import EmptyState from "../components/EmptyState";
 import TeachingHint from "../components/TeachingHint";
 import { IconPopout, IconStopSquare, IconX } from "../components/icons";
@@ -40,6 +43,12 @@ const SESSIONS_EVENT = "terminal://sessions";
  */
 const CLOSE_ARM_MS = 4000;
 
+/** How long after the last window move/resize event to treat the drag as over
+ *  (see the IME re-focus effect in TerminalPane). Long enough that a gesture's
+ *  own stream of events never reaches it, short enough that the terminal is
+ *  usable again before the user can finish reaching for the keyboard. */
+const DRAG_SETTLE_MS = 150;
+
 /** Fixed dark scheme: a terminal is a terminal in both app themes. Values
  *  mirror the app's dark surface/step tokens (design source claude-design). */
 const TERM_THEME = {
@@ -69,9 +78,13 @@ const attemptedRevive = new Set<number>();
  */
 export default function TerminalView({
   root,
+  projectName,
   onSessionsChanged,
 }: {
   root: string;
+  /** Display name of the open workspace — goes into a pop-out's OS window
+   *  title, which is the only label the taskbar and alt-tab ever show. */
+  projectName: string;
   /** Launch/close changed the app-level session set — App refreshes the
    *  sidebar/card running markers from it. */
   onSessionsChanged?: () => void;
@@ -264,9 +277,14 @@ export default function TerminalView({
       // Pin the native title bar from birth when the app theme is explicit —
       // boot-time applyThemeMode repaints it anyway, this only avoids a flash.
       const mode = getThemeMode();
+      // Project first: the taskbar and alt-tab truncate from the *end*, and
+      // every other part of this string is shared by every pop-out of the same
+      // agent — a title that starts with "Claude Code" tells the user which
+      // app the window belongs to and nothing they didn't already know.
+      const project = projectName || baseName(root);
       const win = new WebviewWindow(label, {
         url: `index.html?popout=${s.id}`,
-        title: `${s.title} — Agent NextUp`,
+        title: `${project} · ${s.title} — Agent NextUp`,
         width: 900,
         height: 640,
         ...(mode === "system" ? {} : { theme: mode }),
@@ -588,6 +606,11 @@ export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; acti
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    // Whatever node this is, it must have no padding: FitAddon derives the row
+    // count from its *border box* and only ever subtracts the terminal
+    // element's own padding, so padding here silently becomes extra rows
+    // (G060). `.term-pane` insets itself with `inset:` for that reason, and
+    // src/styles.test.ts keeps it that way.
     term.open(node);
     termRef.current = term;
     fitRef.current = fit;
@@ -654,20 +677,87 @@ export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; acti
   useEffect(() => {
     const node = containerRef.current;
     if (!active || !node) return;
-    let timer: number | undefined;
-    const doFit = () => {
+    let frame: number | undefined;
+    const fitNow = () => {
+      frame = undefined;
+      // Laid out but collapsed (a window dragged to nothing, a pane mid-swap):
+      // fitting that box pins the terminal to FitAddon's 2x1 minimum, and
+      // growing back does not undo what the PTY was already told.
+      if (node.clientHeight === 0 || node.clientWidth === 0) return;
       fitRef.current?.fit();
-      termRef.current?.focus();
     };
-    doFit();
+    fitNow();
+    // Focus belongs to *activation*, not to fitting. The observer below runs
+    // on every frame of a window drag, and grabbing focus at that rate is its
+    // own bug.
+    termRef.current?.focus();
     const ro = new ResizeObserver(() => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(doFit, 120);
+      // Refit on the next frame, NOT on a trailing debounce. The observer
+      // fires continuously while the user drags a window edge, so a debounce
+      // that waits for the resizing to *stop* pushes its own timer back every
+      // tick and never runs for the whole gesture. Meanwhile xterm keeps
+      // drawing the old `rows * cellHeight`, and .term-pane-host's
+      // overflow:hidden slices the surplus row through the middle of the
+      // glyphs (reported 2026-08-05: "the bottom line is cut in half").
+      // rAF coalesces to at most one fit per painted frame, and FitAddon
+      // itself no-ops unless the proposed cols/rows changed — so the PTY still
+      // only hears from us when a whole row or column appears or disappears.
+      if (frame !== undefined) return;
+      frame = requestAnimationFrame(fitNow);
     });
     ro.observe(node);
     return () => {
       ro.disconnect();
-      window.clearTimeout(timer);
+      if (frame !== undefined) cancelAnimationFrame(frame);
+    };
+  }, [active]);
+
+  // Hand the IME its binding back after a window drag (reported 2026-08-05:
+  // typing Chinese put the candidate window in the top-left corner of the
+  // *screen*).
+  //
+  // Dragging the title bar or a window edge runs Windows' modal move/size
+  // loop, and the webview comes out of it with its native input focus dropped:
+  // not one `compositionstart` reaches the document afterwards, so this sits
+  // upstream of anything xterm does with its helper textarea. Maximise/restore
+  // is a click rather than a drag loop, and never breaks it.
+  //
+  // The repair has to be made at the same level the damage was. The DOM's own
+  // idea of focus never changed — `document.activeElement` is still the
+  // textarea throughout, and blurring and refocusing it was measured to do
+  // nothing at all. `setFocus()` here is the *webview's*, not an element's:
+  // on Windows it reaches ICoreWebView2Controller::MoveFocus, which is what a
+  // real mouse click into the window does and a DOM focus() does not.
+  //
+  // Nothing about this is specific to the terminal — after a drag every input
+  // in the window is in the same state. It only ever gets *reported* here
+  // because every other input is reached by clicking it, and that click is the
+  // repair; the terminal is the one surface whose focus is given
+  // programmatically (see the fit effect above), so it is the one with nothing
+  // left to click. For the same reason there is no `activeElement` guard: this
+  // restores the window's focus, not any element's, so it cannot pull the caret
+  // out of the identity field above.
+  //
+  // Trailing debounce, unlike the refit above: `tauri://move` fires for every
+  // WM_MOVE of the gesture, and there is nothing to repair until it ends.
+  useEffect(() => {
+    if (!active) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settle = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void getCurrentWebview()
+          .setFocus()
+          .catch(() => {});
+      }, DRAG_SETTLE_MS);
+    };
+    // The current window, so the pop-out (which renders this same component)
+    // listens to its own drags rather than the main window's.
+    const win = getCurrentWindow();
+    const unlisten = Promise.all([win.onMoved(settle), win.onResized(settle)]);
+    return () => {
+      if (timer !== undefined) clearTimeout(timer);
+      void unlisten.then((fns) => fns.forEach((f) => f()));
     };
   }, [active]);
 

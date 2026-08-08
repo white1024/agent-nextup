@@ -315,6 +315,16 @@ export function IconMinus(p: IconProps) {
   );
 }
 
+/** The team's prime (D116). A shape, not a colour: the canvas already spends
+ *  its accent on auto-route edges, and D64 keeps state off colour alone. */
+export function IconStar(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.2 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.2 5.9-.9z" />
+    </Base>
+  );
+}
+
 /** Attachments (a paperclip) — replaces the 📎 the inbox used to print, whose
  *  weight and colour were the platform emoji font's call rather than ours. */
 export function IconPaperclip(p: IconProps) {

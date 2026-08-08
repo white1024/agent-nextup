@@ -23,7 +23,7 @@ An AI session is short and forgetful; a real project is long and full of context
 Agent NextUp keeps that context in files the engine keeps fresh. You make the decisions, your agent does the work, and a handoff stays possible at every moment.
 
 > [!IMPORTANT]
-> Installers are on the [releases page](https://github.com/white1024/agent-nextup/releases/latest), for Windows x64, Linux x64 and macOS arm64. They are unsigned pre-release builds — Windows and macOS warn about an unknown publisher on first launch — and nothing updates itself yet. Development is Windows-first. [Quick start](#quick-start) covers both downloading and building from source.
+> Installers are on the [releases page](https://github.com/white1024/agent-nextup/releases), for Windows x64, Linux x64 and macOS arm64. They are unsigned pre-release builds — Windows and macOS both stop the first launch, and [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each — and nothing updates itself yet. Development is Windows-first. [Quick start](#quick-start) covers both downloading and building from source.
 
 ## What it organises
 
@@ -46,12 +46,13 @@ Any body of work — software, research, a side business, life planning — into
 - **Agent reach is an allowlist.** One master switch decides whether agents reach the hub at all; with it on, read-only tools need no further setup, and writes are authorised per tool, with the gatekeeping ones off by default. Every call — including denied ones — lands in the ledger.
 - **Parallel agents can't jump the queue.** Give tasks an assignee and prerequisites and the engine refuses out-of-order starts and finishes. Claims cannot be stolen.
 - **A terminal that runs the real CLIs.** A genuine PTY process per agent CLI, rooted at the workspace. Sessions belong to the app, so switching projects doesn't interrupt them, and a running terminal can pop out into its own window.
-- **Projects can feed each other.** Wire workspaces into a directed graph and one project delivers to another's inbox, with attachments. An agent can publish but never route — routing is a human action, or a per-edge automation a human switches on. Inbox content is defined as data, not instructions.
-- **A spec layer that stays current.** `specs/<capability>/spec.md` records what the system does *now*; task bundles hold the deltas, and archiving a verified task folds its delta into the main spec. The folding is enforced; writing the delta is prompted by the agent's operating protocol.
+- **Projects can feed each other.** Wire workspaces into a directed graph and one project delivers to another's inbox, with attachments. A member's agent can publish but never route — routing is a human action, a per-edge automation a human switches on, or a coordinator project a human puts in charge. Inbox content is defined as data, not instructions.
+- **One project can run the team.** Name a project as a team's *coordinator* and its agent gets the app-level view: the flow graph, routing on a member's behalf, the roster — it can bring a project in, take one out, even create a new project to bring in — and, member by member, a read of the task text, ledger and specs you would get by opening it. Naming a detail read leaves a line in that member's own ledger, so being read is not invisible; the cheap per-member summaries do not. A coordinator is not a member of the team it runs; it sits above the flow, with no node on the canvas. What it does not do is the work: no creating tasks, advancing phases, or marking anyone's result verified. The one write it has inside a member is the sign-off — archiving a finished task, which folds that task's spec delta and is refused until the task is verified — and that is a separate grant from reading. Authority is per team, granted tool by tool, and the coordinator cannot grant it to itself.
+- **A spec layer that stays current.** `specs/<capability>/spec.md` records what the system does *now*; task bundles hold the deltas, and archiving a verified task folds its delta into the main spec — a task carrying deltas is refused archival until it is verified, because folding turns a claim into truth. The folding is enforced; writing the delta is prompted by the agent's operating protocol.
 - **Search and portable backups.** Full-text search over the workspace (language-agnostic chunking into an SQLite FTS5 index), and export/import of the management layer — tasks, specs, ledger and handoff material — as a zip you can carry to another machine. Your own source files are not in it: they travel with the folder, or with git.
 
 > [!NOTE]
-> Collaboration (assignees and prerequisites), teams, and the spec layer are **capability modules**: you tick them on when you create the workspace, and a fresh project ships with none of them enabled. Everything above them in the list is always on.
+> Four of the bullets above are **capability modules**, not always-on features: collaboration (assignees and prerequisites), teams, team coordination, and the spec layer. You tick them on when you create the workspace, and a fresh project ships with none of them enabled. Every other bullet is always on.
 
 ## How it works
 
@@ -101,7 +102,7 @@ The entry point is `AGENTS.md` — the filename agent hosts look for; Claude Cod
 <!-- NEXTUP:STATE:END -->
 ```
 
-That block is real output, not a mock-up: `cargo run -p nextup-core --example gen_demo -- <dir> en` produces it.
+That block is real output rather than a mock-up — `cargo run -p nextup-core --example gen_demo -- <dir> en` produces it — abridged here by one trailing line that points at the full snapshot.
 
 Delete the markers and the engine stops touching the file entirely. Continuity is a guarantee you can revoke.
 
@@ -109,7 +110,7 @@ Both listings above are abridged. The authoritative account of what lands on dis
 
 ## Quick start
 
-**Download** an installer from the [latest release](https://github.com/white1024/agent-nextup/releases/latest):
+**Download** an installer from the [releases page](https://github.com/white1024/agent-nextup/releases):
 
 | Platform | What to take |
 |---|---|
@@ -117,7 +118,7 @@ Both listings above are abridged. The authoritative account of what lands on dis
 | macOS arm64 | `.dmg` |
 | Linux x64 | `.deb`, `.AppImage`, or `.rpm` |
 
-Nothing is code-signed, so the first launch raises an unknown-publisher warning: SmartScreen on Windows, Gatekeeper on macOS. Nothing updates itself either — a newer version means coming back here for it.
+Nothing carries a publisher certificate and nothing is notarized, so the first launch is stopped: SmartScreen on Windows, Gatekeeper on macOS. [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each. Nothing updates itself either — a newer version means coming back here for it.
 
 <details>
 <summary><strong>Or build from source</strong></summary>
@@ -137,7 +138,7 @@ The installer lands under `target/release/bundle/`. If you are developing, `pnpm
 
 Then:
 
-1. **Create a project** — launch the app, choose *Initialize new project*, pick a folder, name it, pick a workflow template, and tick any capability modules you want (collaboration, teams, specs — all off unless you tick them). Templates ship built in for software, research, business, life planning, and anything else; drop a JSON file into `~/.nextup/templates/` to add your own, with no recompilation.
+1. **Create a project** — launch the app, choose *Initialize new project*, pick a folder, name it, pick a workflow template, and tick any capability modules you want (collaboration, teams, team coordination, specs — all off unless you tick them). Templates ship built in for software, research, business, life planning, and anything else; drop a JSON file into `~/.nextup/templates/` to add your own, with no recompilation.
 2. **Connect an agent** *(optional)* — authorise the write tools you want on the Tools page, then open your agent CLI in the project folder.
 
 > [!TIP]
@@ -193,9 +194,9 @@ See [reference/building](https://white1024.github.io/agent-nextup/reference/buil
 
 ## Status
 
-In active development. [v0.1.0](https://github.com/white1024/agent-nextup/releases/latest) is the first pre-release: unsigned trial builds for three platforms, with no auto-update yet.
+In active development. The [releases page](https://github.com/white1024/agent-nextup/releases) carries unsigned pre-release builds for three platforms, with no auto-update yet — take the newest. On macOS, do not take `v0.1.0`: that build predates the ad-hoc signature and will not open at all.
 
-**Working** — the workspace engine and disk contract; the phase/gate harness and its built-in templates; the handoff layer; the hub MCP server with per-tool authorisation; the embedded agent terminal, including custom CLI entries carrying environment variables, which is how you point one at a local model; adopting an existing project through a wizard that analyses read-only and never overwrites; milestones; full-text search; portable backups. As opt-in modules: collaboration, teams and cross-project delivery, and the spec layer.
+**Working** — the workspace engine and disk contract; the phase/gate harness and its built-in templates; the handoff layer; the hub MCP server with per-tool authorisation; the embedded agent terminal, including custom CLI entries carrying environment variables, which is how you point one at a local model; adopting an existing project through a wizard that analyses read-only and never overwrites; milestones; full-text search; portable backups. As opt-in modules: collaboration, teams and cross-project delivery, team coordination, and the spec layer.
 
 **Not there yet** — signed installers and auto-update; in the teams module, automatic "a delivery arrives → a task is created" (turning one into a task manually is one click today), and scheduling.
 

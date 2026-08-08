@@ -397,6 +397,16 @@ export interface Team {
   edges: TeamEdge[];
   /** Saved canvas positions by workspaceId (D53); absent = auto-placed. */
   layout?: Record<string, NodePos>;
+  /**
+   * The workspace whose agent may edit this team's graph and route its
+   * deliveries (D116). Absent = no prime, humans drive it. Scoped per team:
+   * the same workspace can be prime here and an ordinary member elsewhere.
+   *
+   * Never one of `members` (D117) — it coordinates from above the flow, so it
+   * has no node on the canvas and no edges. It carries its own name and root
+   * because there is no member row to read them from.
+   */
+  prime?: TeamMember;
   createdAt: string;
   updatedAt: string;
 }

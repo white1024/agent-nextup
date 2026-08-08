@@ -271,6 +271,15 @@ export const api = {
     invoke<Team[]>("team_add_member", { teamId, root }),
   teamRemoveMember: (teamId: string, workspaceId: string) =>
     invoke<Team[]>("team_remove_member", { teamId, workspaceId }),
+  /**
+   * Designate the team's prime, or clear it with null (D116/D117).
+   *
+   * Takes a root, not a workspaceId: the prime is not a member, so there is no
+   * member row that already resolved one — the backend mints it, the same
+   * explicit write moment joining a team is.
+   */
+  teamSetPrime: (teamId: string, root: string | null) =>
+    invoke<Team[]>("team_set_prime", { teamId, root }),
   teamRebindWorkspace: (workspaceId: string, newRoot: string) =>
     invoke<Team[]>("team_rebind_workspace", { workspaceId, newRoot }),
   teamSetLayout: (teamId: string, positions: Record<string, { x: number; y: number }>) =>
