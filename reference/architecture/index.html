@@ -86,11 +86,12 @@
 <p>App-level views: All projects, Teams, Agent sessions, Templates, Settings.</p>
 <p>Workspace-level views: Dashboard, Tasks, Collaboration, Inbox, Specs, Ledger, Search, Tools, Terminal, Project settings.</p>
 <p>The folders under <code dir="auto">src/</code> are a layering rule rather than a filing preference, and a test enforces the machine-checkable part of it. <code dir="auto">CONTRIBUTING.md</code> in the repository root has the table.</p>
-<p>It talks to the layer below over <strong>Tauri IPC</strong>, which carries lightweight DTOs and state diffs only. Three event families come back the other way:</p>
+<p>It talks to the layer below over <strong>Tauri IPC</strong>, which carries lightweight DTOs and state diffs only. Four event families come back the other way:</p>
 <ul>
 <li><code dir="auto">workspace://changed</code>: reload state from disk</li>
 <li><code dir="auto">ledger://appended</code>: read the new tail only</li>
 <li><code dir="auto">terminal://output</code>, <code dir="auto">terminal://exit</code>, <code dir="auto">terminal://sessions</code></li>
+<li><code dir="auto">index://progress</code>: how far a full-text index rebuild has got, streamed while it runs</li>
 </ul>
 <div class="sl-heading-wrapper level-h3"><h3 id="the-delivery-layer-src-tauri">The delivery layer (<code dir="auto">src-tauri</code>)</h3><a class="sl-anchor-link" href="#the-delivery-layer-src-tauri"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The delivery layer (src-tauri)”</span></a></div>
 <p>Thin on purpose.</p>
