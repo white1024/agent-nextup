@@ -29,6 +29,14 @@ serde_json = "1"
 notify = "8"
 portable-pty = "0.9"
 
+# macOS quit path only (G065). Already in the tree via tao, so this pulls in
+# nothing new — it just lets us name `NSApplication terminate:` directly,
+# which is the one shutdown sequence AppKit does not crash on.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+objc2-foundation = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 

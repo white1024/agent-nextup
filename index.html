@@ -12,9 +12,13 @@
          it lives on the far side of that gap and so never covered it.
 
          The markup is inside #root on purpose: createRoot() clears the
-         container on its first render, so the handoff to App's own `.splash`
-         needs no cleanup code and cannot leave an orphan overlay behind if
-         React throws on the way up.
+         container on its first render, so the handoff needs no cleanup code
+         and cannot leave an orphan overlay behind if React throws on the way
+         up. App re-renders this same markup under this same class while it
+         waits for its first IPC round trip — these rules are in <head> and so
+         outlive #root — which is why the mark stays put instead of being
+         swapped for a differently-shaped second loading screen. It carries an
+         offset animation-delay to stay on one timeline; see lib/boot.ts.
 
          Everything here is inline and re-states four token values, because
          styles.css arrives with that same bundle. Keep them in sync with the
@@ -95,7 +99,19 @@
       }
       .boot svg {
         color: light-dark(#5b53d1, #837bf0); /* --accent */
-        animation: boot-pulse 1.8s ease-in-out infinite;
+        /* One second, not the 1.8s this started at, and the reason is the
+           showing rather than the rhythm: a pulse is only legible if the
+           screen is up for at least one full cycle, and BOOT_MIN_VISIBLE_MS
+           is what decides that. At 1.8s a packaged boot showed 38% of a cycle
+           — all of it inside the rising half — which reads as a fade-in with
+           no pulse in it at all. Change one of these two and check the other. */
+        animation: boot-pulse 1s ease-in-out infinite;
+        /* Shifted rather than restarted when App re-renders this markup after
+           the handoff: 0% is the dimmest frame, so a restart reads as a step
+           in brightness. Zero for the copy index.html paints, which starts at
+           the origin by definition; App passes the elapsed time as a negative
+           offset and the cycle carries on. See lib/boot.ts. */
+        animation-delay: var(--boot-shift, 0s);
       }
       .boot span {
         font-size: 13px;

@@ -1,11 +1,24 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type CSSProperties,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 
 import { api, errorMessage } from "./api";
-import { logBootBreakdown, markBoot } from "./lib/boot";
+import {
+  bootSlowDelay,
+  bootSplashDelays,
+  bootSplashRemaining,
+  logBootBreakdown,
+  markBoot,
+} from "./lib/boot";
 import type {
   SystemStatus,
   Task,
@@ -262,12 +275,43 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Marked here rather than beside the splash on purpose: these measure the
+    // work, and holding the splash is not work. Keeping them out of that path
+    // is what stops BOOT_MIN_VISIBLE_MS from quietly inflating every number
+    // the breakdown reports.
     markBoot("paint");
     void refresh().then(() => {
       markBoot("data");
       logBootBreakdown();
     });
   }, [refresh]);
+
+  // The splash keeps the screen until its minimum showing is up, even once the
+  // data is in. Read once on mount (`useState` initialiser, not on every
+  // render) so the deadline is fixed at the origin and cannot drift forward.
+  const [bootHeld, setBootHeld] = useState(() => bootSplashRemaining() > 0);
+  useEffect(() => {
+    if (!bootHeld) return;
+    const id = window.setTimeout(() => setBootHeld(false), bootSplashRemaining());
+    return () => window.clearTimeout(id);
+  }, [bootHeld]);
+
+  // A boot that never settles has nothing to click and says nothing. Armed
+  // only while `status` is still missing, so it cannot fire during the minimum
+  // showing, and cleared the moment the data lands.
+  const [bootSlow, setBootSlow] = useState(false);
+  useEffect(() => {
+    if (status !== null) return;
+    const id = window.setTimeout(() => setBootSlow(true), bootSlowDelay());
+    return () => window.clearTimeout(id);
+  }, [status]);
+
+  // Fixed at mount, and it has to be: these offsets place the animations
+  // relative to the document origin, so recomputing them on a later render
+  // would move that origin and jump the pulse forward mid-showing. The splash
+  // now outlives `status` arriving — which is itself a re-render — so this is
+  // a live path, not a hypothetical one.
+  const [bootAnim] = useState(bootSplashDelays);
 
   // Debounced filesystem deltas from the Rust watcher.
   useEffect(() => {
@@ -325,10 +369,12 @@ export default function App() {
   }, [runningTerms]);
   useEffect(() => {
     const unlisten = getCurrentWindow().onCloseRequested((event) => {
-      if (runningCountRef.current > 0) {
-        event.preventDefault();
-        setQuitPrompt(true);
-      }
+      // Always take over: letting the close proceed destroys the window, and
+      // on macOS that path segfaults inside WebKit every time (G065). Both
+      // branches end at api.quitApp(), which quits the way the OS expects.
+      event.preventDefault();
+      if (runningCountRef.current > 0) setQuitPrompt(true);
+      else void confirmQuit();
     });
     return () => {
       void unlisten.then((f) => f());
@@ -340,15 +386,12 @@ export default function App() {
     // the children. Unlike closing tabs one by one, shutdown keeps the files so
     // the next launch restores the tabs (which resume on view, not read-only).
     await api.terminalShutdown().catch(() => {});
-    // Tear down every window, not just this one — a pop-out terminal (B16-C)
-    // would otherwise keep the app alive after the main window is gone. Close
-    // the pop-outs first, then this window last.
-    const current = getCurrentWindow();
-    const windows = await getAllWebviewWindows().catch(() => []);
-    await Promise.allSettled(
-      windows.filter((w) => w.label !== current.label).map((w) => w.destroy()),
-    );
-    await current.destroy();
+    // Quitting is the OS's job, not ours: `quit_app` sends the platform's own
+    // shutdown, which takes every window with it — including a pop-out
+    // terminal (B16-C), the reason this used to destroy windows by hand.
+    // Destroying them one by one is exactly the path that segfaults on macOS
+    // (G065), so there is nothing left here to do first.
+    await api.quitApp();
   }
 
   // Agent overview → the workspace's terminal view, opening it on the way
@@ -688,9 +731,11 @@ export default function App() {
     setView("projects");
   }
 
-  if (status === null) {
-    // True boot failure: nothing to show yet, so block with a retry.
-    if (loadError !== null) {
+  if (status === null || bootHeld) {
+    // True boot failure: nothing to show yet, so block with a retry. Checked
+    // ahead of the hold — a splash that keeps running over a known failure is
+    // just a delay before bad news.
+    if (status === null && loadError !== null) {
       return (
         <div className="splash" style={{ flexDirection: "column", gap: "var(--s-3)" }}>
           <div className="alert alert-error">{loadError}</div>
@@ -700,7 +745,43 @@ export default function App() {
         </div>
       );
     }
-    return <div className="splash muted">{t("common.loading")}</div>;
+    // Not a second loading screen: the same mark, under the same class, that
+    // index.html painted and createRoot() has just cleared. Two gaps sit back
+    // to back at startup — the bundle download and then the first IPC round
+    // trip — and showing a brand mark for one and the word "loading" for the
+    // other made the boot look like two events. It is one wait.
+    //
+    // Reached with `status` already loaded whenever the minimum showing has
+    // not run out; that is the intended case, not a leftover. See
+    // BOOT_MIN_VISIBLE_MS for what it costs and how to turn it off.
+    //
+    // No styles here on purpose. index.html's inline <style> is in <head> and
+    // outlives #root, so `.boot` is still fully styled; a copy in styles.css
+    // would be a second source for a screen nobody looks at twice. Only the
+    // animation needs help across the handoff — see bootSplashDelays().
+    return (
+      <div
+        className="boot"
+        role="status"
+        aria-live="polite"
+        aria-label={t("common.loading")}
+        style={{ animationDelay: bootAnim.hold, "--boot-shift": bootAnim.shift } as CSSProperties}
+      >
+        <IconLogo size={34} />
+        <span>Agent NextUp</span>
+        {bootSlow && status === null && (
+          // Appended rather than swapped in: the wait has not ended and the
+          // app has learned nothing about why, so the screen should not change
+          // its mind about what it is. This adds a way out, not a verdict.
+          <div className="boot-slow">
+            <span>{t("common.bootSlow")}</span>
+            <button className="btn" onClick={() => void refresh()}>
+              {t("common.retry")}
+            </button>
+          </div>
+        )}
+      </div>
+    );
   }
 
   const blocked = status.taskCounts?.blocked ?? 0;

@@ -131,13 +131,16 @@ accident:
 
 Rust carries most of the suite, inline with the code it covers. On the frontend,
 vitest runs in the node environment with no jsdom, so unit tests cover the pure
-modules in `lib/` plus three cross-cutting guards:
+modules in `lib/` plus four cross-cutting guards:
 
 - `layering.test.ts` — the folder rules above
 - `styles.test.ts` — every `var(--x)` resolves
 - `boot.test.ts` — `index.html` is the one file that runs before the bundle
   loads, so it has to restate a few token values and command names; this test
   checks each restatement against its real source
+- `i18n.test.ts` — every static `t("…")` call site names a key that exists. A
+  missing key does not throw at runtime, it renders the key itself, so nothing
+  else would catch it
 
 React components are deliberately not unit-tested — that would mean adopting
 jsdom, which has not been judged worth it. If you add a guard of your own, make

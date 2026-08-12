@@ -1452,3 +1452,46 @@ pub async fn agent_catalog_delete(id: String) -> CmdResult<Vec<AgentInfo>> {
     })
     .await
 }
+
+/// Quit the app the way the OS expects, rather than by tearing the window down.
+///
+/// # Why this exists
+///
+/// On macOS, pressing the window's close button crashes the packaged app:
+/// `SIGSEGV` on the main thread inside WebKit's run loop, every time
+/// (G065). Closing the last window there means "destroy the WKWebView, then
+/// immediately tear the process down" — an ordering AppKit never produces on
+/// its own, because on macOS closing the last window does not normally end an
+/// app at all. `Cmd+Q` goes through `NSApplication terminate:`, AppKit's own
+/// shutdown sequence, and is clean; that difference was established by running
+/// both paths with and without a workspace open, so it is the *path*, not our
+/// background threads or the watcher.
+///
+/// So the close button routes here instead, and here calls `terminate:`. The
+/// frontend keeps its own guard for running terminals — that runs first and
+/// only reaches this once the user has confirmed.
+///
+/// Windows and Linux have no such split: closing the last window *is* how an
+/// app quits, it is the path every app exercises constantly, and no crash was
+/// ever observed there. They take `exit(0)`, which is what the close button
+/// already did.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) -> CmdResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // `terminate:` must be sent from the main thread; `run_on_main_thread`
+        // is the only reason `MainThreadMarker::new()` can succeed below.
+        app.run_on_main_thread(|| {
+            use objc2_app_kit::NSApplication;
+            use objc2_foundation::MainThreadMarker;
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            NSApplication::sharedApplication(mtm).terminate(None);
+        })
+        .map_err(|e| NextUpError::Ipc(format!("could not reach the main thread to quit: {e}")))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.exit(0);
+    }
+    Ok(())
+}

@@ -438,6 +438,28 @@ code {
   justify-content: center;
 }
 
+/* The boot splash's escape hatch (D124). The splash itself is styled inline in
+   index.html — it has to be, it paints before this sheet exists — but this part
+   only ever renders from App, on the near side of the bundle, so it lives here
+   rather than as a second inline copy with nothing holding it to the first.
+   `viewIn` rather than index.html's `boot-in`: reaching across for a keyframe
+   defined over there would fail silently if it were ever renamed. */
+.boot-slow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-3);
+  margin-top: var(--s-4);
+  animation: viewIn var(--dur-state) ease-out both;
+}
+
+/* index.html's `.boot span` reaches these too — same specificity, and this
+   sheet loads after that block, so these win. */
+.boot-slow span {
+  font-size: 12px;
+  letter-spacing: normal;
+}
+
 /* ── Shell ────────────────────────────────────────────────────────────────── */
 .shell {
   display: grid;

@@ -12,6 +12,7 @@ import tauriWindowSource from "@tauri-apps/api/window?raw";
 // Not `./styles.css?raw` — vitest stubs .css imports to "" whatever the query.
 // The virtual module is defined in vitest.config.ts; see the note there.
 import css from "virtual:styles-source";
+import { BOOT_HOLD_MS, BOOT_MIN_VISIBLE_MS, BOOT_SLOW_MS } from "./lib/boot";
 
 /** The boot splash in index.html must be self-contained — styles.css only
  *  arrives with the bundle it exists to cover — so a handful of token values
@@ -85,6 +86,49 @@ describe("boot splash", () => {
     // Tauri internals change.
     expect(html).toContain("window.__TAURI_INTERNALS__");
     expect(html.slice(html.indexOf("__TAURI_INTERNALS__"))).toContain(".catch(");
+  });
+
+  it("states the hold that bootSplashDelays() offsets against", () => {
+    // App re-renders this markup after createRoot() clears it, and shifts the
+    // animation-delay by the elapsed time so one hold spans both startup gaps
+    // rather than restarting and blinking the mark out. That arithmetic is
+    // done in TS, against a copy of the number — so the copy is held here.
+    // Drift and a slow boot fades the mark in twice: visible, and nowhere near
+    // the code that caused it.
+    const delay = /animation:\s*boot-in\s+\S+\s+\S+\s+(\d+)ms/.exec(html)?.[1];
+    expect(delay, "the boot-in animation no longer states a delay").toBeDefined();
+    expect(Number(delay), "index.html's hold drifted from BOOT_HOLD_MS").toBe(BOOT_HOLD_MS);
+  });
+
+  it("shows the splash for at least one full pulse", () => {
+    // A pulse nobody sees turn around is not a pulse, it is a fade-in — and
+    // that is what shipped once: a 1.8s cycle against an 800ms showing gave
+    // 38% of a cycle, all of it inside the rising half. Both numbers looked
+    // reasonable alone, they live in different files, and the animation was
+    // running the whole time, so nothing anywhere reported a problem.
+    //
+    // Only meaningful while the showing is switched on; 0 is the documented
+    // way to turn it off and must not be held to a pulse it never shows.
+    if (BOOT_MIN_VISIBLE_MS === 0) return;
+    const raw = /animation:\s*boot-pulse\s+([\d.]+)(m?s)\b/.exec(html);
+    expect(raw, "the boot-pulse animation is gone or was reshaped").not.toBeNull();
+    const period = Number(raw?.[1]) * (raw?.[2] === "s" ? 1000 : 1);
+    expect(period, "could not read a pulse period").toBeGreaterThan(0);
+    expect(
+      BOOT_MIN_VISIBLE_MS,
+      `the splash shows for ${BOOT_MIN_VISIBLE_MS}ms but one pulse takes ${period}ms — it would read as a fade-in`,
+    ).toBeGreaterThanOrEqual(period);
+  });
+
+  it("offers the way out well after the splash's own showing", () => {
+    // "Taking longer than usual" has to be true when it appears. Both values
+    // are counted from the same origin, so a BOOT_SLOW_MS anywhere near the
+    // minimum showing would put that message on a boot the app itself chose to
+    // make slow — the one case where it is certainly wrong.
+    expect(
+      BOOT_SLOW_MS,
+      "the slow-boot notice could fire during the splash's guaranteed showing",
+    ).toBeGreaterThan(BOOT_MIN_VISIBLE_MS * 4);
   });
 
   it("keeps the splash inside #root so React's first render clears it", () => {

@@ -151,6 +151,7 @@ pub fn run() {
             commands::agent_catalog_list,
             commands::agent_catalog_save,
             commands::agent_catalog_delete,
+            commands::quit_app,
         ])
         .run(tauri::generate_context!());
 

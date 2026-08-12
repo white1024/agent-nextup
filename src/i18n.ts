@@ -87,6 +87,9 @@ const zhTW = {
   },
   common: {
     loading: "載入中…",
+    // 開機等太久時補在 splash 下方。刻意不說「失敗」——這條路上沒有任何證據
+    // 說它壞了，只知道還沒回來。
+    bootSlow: "載入時間比平常長",
     cancel: "取消",
     close: "關閉",
     delete: "刪除",
@@ -1025,6 +1028,7 @@ const en: typeof zhTW = {
   },
   common: {
     loading: "Loading…",
+    bootSlow: "This is taking longer than usual",
     cancel: "Cancel",
     close: "Close",
     delete: "Delete",

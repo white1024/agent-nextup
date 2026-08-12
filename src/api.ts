@@ -206,6 +206,10 @@ export const api = {
   terminalList: () => invoke<TerminalSessionMeta[]>("terminal_list"),
   terminalReadBuffer: (id: number) => invoke<TerminalBuffer>("terminal_read_buffer", { id }),
   terminalShutdown: () => invoke<void>("terminal_shutdown"),
+
+  /** Quit the app. Never destroy the window to quit — see quit_app's doc
+   *  comment for the macOS crash that costs. */
+  quitApp: () => invoke<void>("quit_app"),
   terminalSetPoppedOut: (id: number, poppedOut: boolean) =>
     invoke<void>("terminal_set_popped_out", { id, poppedOut }),
   workflowStatus: () => invoke<WorkflowStatus>("workflow_status"),
