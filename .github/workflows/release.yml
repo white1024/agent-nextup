@@ -133,11 +133,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: "Agent NextUp ${{ github.ref_name }} (trial)"
+          # No "(trial)" suffix: the word came from the one occasion this
+          # packaging work was built for (D77 — builds to hand to friends),
+          # and in software "trial" reads as time- or feature-limited
+          # commercial software, which this is not. What the label was
+          # reaching for — unsigned, no auto-update, do not treat as
+          # production — the body below states outright.
+          releaseName: "Agent NextUp ${{ github.ref_name }}"
           # Point at a page that exists: the README has no "packaging" section,
           # and reference/building is where the per-OS dialogs are actually
           # written down.
-          releaseBody: "Unsigned trial build: no publisher certificate, no notarization, and nothing here updates itself. Windows and macOS both stop the first launch — SmartScreen needs \"More info\" then \"Run anyway\"; macOS needs System Settings → Privacy & Security → \"Open Anyway\". https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds has both click paths and the Linux notes. Windows also gets a portable zip that needs no installer at all."
+          releaseBody: "Unsigned build: no publisher certificate, no notarization, and nothing here updates itself. Windows and macOS both stop the first launch — SmartScreen needs \"More info\" then \"Run anyway\"; macOS needs System Settings → Privacy & Security → \"Open Anyway\". https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds has both click paths and the Linux notes. Windows also gets a portable zip that needs no installer at all."
           releaseDraft: false
           prerelease: true
 
