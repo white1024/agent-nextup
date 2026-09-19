@@ -47,11 +47,21 @@ pub fn sync_after_mutation(paths: &WorkspacePaths, app_version: &str) -> Result<
     let decisions = ledger.recent_of_kind(LedgerKind::Decision, RECENT_DECISIONS)?;
     let progress = ledger.recent_of_kind(LedgerKind::Progress, RECENT_PROGRESS)?;
 
+    // Best-effort and app-level (D128): a workspace with no id, or one opened
+    // where the app layer is unreachable, still has to hand off — it just
+    // renders no team line.
+    let teams = context
+        .workspace_id
+        .as_deref()
+        .map(crate::workspace::teams::roster_best_effort)
+        .unwrap_or_default();
+
     let handoff = render_handoff(&HandoffInput {
         context: &context,
         tasks: &tasks,
         recent_events: &recent,
         decisions: &decisions,
+        teams: &teams,
         progress: &progress,
         workflow: workflow.as_ref(),
         app_version,

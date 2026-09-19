@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 
 import { setLanguage } from "../../i18n";
 import { getThemeMode, setThemeMode, type ThemeMode } from "../../theme";
+import { getZoom, setZoom, ZOOM_STEPS } from "../../zoom";
 import {
   dismissedTeachingHints,
   restoreTeachingHints,
@@ -32,6 +33,7 @@ interface Props {
 export default function Settings({ status, onGoToProjectSettings }: Props) {
   const { t, i18n } = useTranslation();
   const [theme, setTheme] = useState<ThemeMode>(getThemeMode);
+  const [zoom, setZoomState] = useState<number>(getZoom);
   const [nudge, setNudge] = useState(verifyNudgeEnabled);
   const [hintsOff, setHintsOff] = useState(dismissedTeachingHints);
 
@@ -98,6 +100,23 @@ export default function Settings({ status, onGoToProjectSettings }: Props) {
                       ? "settings.themeDark"
                       : "settings.themeSystem",
                 )}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="sr-body">
+            <div className="sr-title">{t("settings.zoom")}</div>
+            <div className="sr-desc">{t("settings.zoomHint")}</div>
+          </div>
+          <div className="seg">
+            {ZOOM_STEPS.map((step) => (
+              <button
+                key={step}
+                className={zoom === step ? "active" : ""}
+                onClick={() => setZoomState(setZoom(step))}
+              >
+                {Math.round(step * 100)}%
               </button>
             ))}
           </div>

@@ -1,28 +1,30 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { IconCheck, IconFolder } from "./icons";
+import { api, errorMessage } from "../api";
+import { IconCheck, IconCopy, IconFolder, IconWarn } from "./icons";
 
 /**
  * A workspace path, shown so it stays readable in a narrow card (product review §4-4).
  *
  * Full paths are long and the informative end is the *tail* (`…\clients\acme`)
  * — CSS truncation cuts exactly that off. So the middle is elided instead, the
- * complete path lives in the tooltip, and a copy button saves the user from
- * selecting text that is visually abbreviated.
+ * complete path lives in the tooltip, and two buttons save the user from
+ * selecting text that is visually abbreviated: copy it, or open the folder.
  */
 export default function PathLabel({
   path,
   className,
-  copyable = true,
+  actions = true,
 }: {
   path: string;
   className?: string;
-  /** Off for dense rows (canvas nodes, switcher entries) where a button would crowd. */
-  copyable?: boolean;
+  /** Off for dense rows (canvas nodes, switcher entries) where buttons would crowd. */
+  actions?: boolean;
 }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
 
   async function copy() {
     try {
@@ -35,21 +37,49 @@ export default function PathLabel({
     }
   }
 
+  async function openInFileManager() {
+    try {
+      setOpenError(null);
+      await api.openFolder(path);
+    } catch (e) {
+      // Unlike a refused clipboard, this one is worth surfacing: the user asked
+      // for a window and none appeared, and the likeliest cause — the folder
+      // was moved or deleted outside the app — is something they need to know
+      // rather than click again. There is no toast host this far down, so the
+      // button carries it the way `copied` already does.
+      setOpenError(errorMessage(e));
+      window.setTimeout(() => setOpenError(null), 6000);
+    }
+  }
+
   return (
     <span className={`path-label ${className ?? ""}`} title={path}>
       <span className="path-text">{elidePath(path)}</span>
-      {copyable && (
-        <button
-          className="btn btn-ghost btn-icon path-copy"
-          title={copied ? t("common.copied") : t("common.copyPath")}
-          aria-label={t("common.copyPath")}
-          onClick={(e) => {
-            e.stopPropagation();
-            void copy();
-          }}
-        >
-          {copied ? <IconCheck size={12} /> : <IconFolder size={12} />}
-        </button>
+      {actions && (
+        <>
+          <button
+            className="btn btn-ghost btn-icon path-action"
+            title={openError ?? t("common.openFolder")}
+            aria-label={t("common.openFolder")}
+            onClick={(e) => {
+              e.stopPropagation();
+              void openInFileManager();
+            }}
+          >
+            {openError ? <IconWarn size={12} /> : <IconFolder size={12} />}
+          </button>
+          <button
+            className="btn btn-ghost btn-icon path-action"
+            title={copied ? t("common.copied") : t("common.copyPath")}
+            aria-label={t("common.copyPath")}
+            onClick={(e) => {
+              e.stopPropagation();
+              void copy();
+            }}
+          >
+            {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
+          </button>
+        </>
       )}
     </span>
   );

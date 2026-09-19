@@ -153,6 +153,12 @@ export const api = {
   deleteTask: (id: string) => invoke<void>("delete_task", { id }),
   setTaskArchived: (id: string, archived: boolean) =>
     invoke<TaskUpdate>("set_task_archived", { id, archived }),
+  /**
+   * Archive while giving up the named requirements (D129) — the escape hatch
+   * behind the fold-conflict dialog. `skip` is `[capability, requirement]`.
+   */
+  archiveTaskSkippingSpecs: (id: string, skip: [string, string][]) =>
+    invoke<TaskUpdate>("archive_task_skipping_specs", { id, skip }),
   archiveVerifiedDoneTasks: () => invoke<string[]>("archive_verified_done_tasks"),
   autoArchiveSweep: () => invoke<string[]>("auto_archive_sweep"),
   specsOverview: () => invoke<SpecOverview[]>("specs_overview"),
@@ -313,6 +319,9 @@ export const api = {
     invoke<DeliveryEnvelope>("exchange_get", { root, mailbox, id }),
   exchangePublish: (note: string | null, files?: string[], supersedes?: string) =>
     invoke<DeliveryEnvelope>("exchange_publish", { note, files, supersedes }),
+
+  /** Raise the OS file manager on a folder. Directory-only, enforced in Rust. */
+  openFolder: (path: string) => invoke<void>("open_folder", { path }),
 
   recentWorkspaces: () => invoke<WorkspaceOverview[]>("recent_workspaces"),
   removeRecentWorkspace: (root: string) =>

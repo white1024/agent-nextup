@@ -504,6 +504,17 @@ pub struct MessageArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct RecordDecisionArgs {
+    /// The decision and the reasoning behind it, within a few lines
+    pub message: String,
+    /// Id of the earlier decision this one overturns, e.g. "D-0003". Omit unless
+    /// this decision actually reverses a previous one.
+    #[serde(default)]
+    pub supersedes: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordRejectedArgs {
     /// The rejected proposal, in one sentence
     pub proposal: String,
@@ -912,15 +923,15 @@ impl Hub {
 
     #[tool(
         name = "record_decision",
-        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. The handoff surface renders only the first line; the full text is kept in the ledger forever."
+        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. Each decision is given an id (D-0001) shown beside it in the handoff snapshot. When this decision reverses an earlier one, pass that decision's id as `supersedes`: the old decision is kept in the record but marked SUPERSEDED, so a later session can see it was made and that it no longer holds. Reversing an earlier decision without saying so is how a workspace ends up acting on a decision nobody still stands behind. The handoff surface renders only the first line; the full text is kept in the ledger forever."
     )]
     async fn record_decision(
         &self,
-        Parameters(args): Parameters<MessageArgs>,
+        Parameters(args): Parameters<RecordDecisionArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("record_decision", move |paths| {
             let event =
-                ops::add_ledger_note(paths, APP_VERSION, ops::NoteChannel::Decision, &args.message)?;
+                ops::add_decision(paths, APP_VERSION, &args.message, args.supersedes.as_deref())?;
             verbosity_checked(event)
         })
         .await
@@ -1161,6 +1172,23 @@ impl Hub {
                 exchange::NoteDetail::Full
             };
             exchange::list_deliveries(paths, mailbox, detail)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "list_teammates",
+        description = "List the projects on the teams this workspace belongs to (team module), and which of them are downstream of it. Use it before writing a delivery note: a note is written FOR the project that receives it, and `downstream: true` marks the ones a delivery published here can actually be sent to. A teammate that is not downstream is on the team but has no flow edge from here — publishing does not reach them. This is read-only and scoped to this workspace's own teams: you still name no recipient and still cannot send, and you learn nothing about teams this workspace is not on. An empty result means this workspace is on no team, or the app-level team store is not reachable."
+    )]
+    async fn list_teammates(&self) -> Result<CallToolResult, McpError> {
+        self.dispatch("list_teammates", move |paths| {
+            let context = nextup_core::workspace::context::load_context(&paths.context_file())?;
+            let Some(id) = context.workspace_id.as_deref() else {
+                // Never joined a team, so it was never minted an id. Not an
+                // error: the honest answer to "who are my teammates" is none.
+                return Ok(json!({ "teams": [] }));
+            };
+            Ok(json!({ "teams": teams::roster_for(&teams::list_all()?, id) }))
         })
         .await
     }
@@ -1634,7 +1662,7 @@ impl Hub {
 
     #[tool(
         name = "validate_task_specs",
-        description = "Dry-run the fold of one task's spec deltas: returns conflicts (the same conflict will later cause archiving to be refused), style warnings and added/modified/removed/renamed counts. Use it to check yourself before marking a task done; a task with no deltas returns an empty report."
+        description = "Dry-run the fold of one task's spec deltas: returns conflicts (the same conflict will later cause archiving to be refused), style warnings and added/modified/removed/renamed counts. Use it to check yourself before marking a task done; a task with no deltas returns an empty report. It also reports `overlaps` — requirements another task's delta changes too. An overlap where that task has already folded is a conflict: your delta rewrites text that is no longer current, so re-read specs/<capability>/spec.md and rewrite the block to carry both changes. An overlap where neither has folded yet is a warning, and it is much cheaper to settle now than after one of you archives: agree on one wording, put it in one of the two deltas, and drop it from the other."
     )]
     async fn validate_task_specs(
         &self,

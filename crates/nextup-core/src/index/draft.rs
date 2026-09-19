@@ -62,7 +62,11 @@ pub fn draft_adoption(root: &Path, files: &[ScannedFile], todos: &[TodoHit]) -> 
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let languages: Vec<String> = ranked.iter().take(3).map(|(l, _)| l.to_string()).collect();
 
-    let domain = if languages.is_empty() { "generic" } else { "coding" }.to_string();
+    // "general", not "generic": init writes "general" when nobody named a domain,
+    // and two words for the same nothing means the UI's "hide the unset label"
+    // rule only recognises one of them — adopted workspaces used to carry a chip
+    // saying "generic" that no rule could hide (D137).
+    let domain = if languages.is_empty() { "general" } else { "coding" }.to_string();
     let description = if languages.is_empty() {
         format!("Existing project (auto-drafted): {} text files scanned.", files.len())
     } else {
@@ -136,10 +140,10 @@ mod tests {
     }
 
     #[test]
-    fn prose_only_project_is_generic() {
+    fn prose_only_project_falls_back_to_general() {
         let files = vec![file("notes.md", Some("markdown"))];
         let draft = draft_adoption(Path::new("/tmp/notes"), &files, &[]);
-        assert_eq!(draft.domain, "generic");
+        assert_eq!(draft.domain, "general");
         assert!(draft.languages.is_empty());
         assert!(draft.suggested_tasks.is_empty());
     }

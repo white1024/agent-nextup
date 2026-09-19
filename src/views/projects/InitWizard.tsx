@@ -1,12 +1,13 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import { api } from "../../api";
 import { Check } from "../../components/controls";
 import { useGuardedMutation } from "../../hooks";
+import { shownDomain } from "../../lib/domain";
 import { MODULE_CATALOG } from "../../lib/modules";
-import type { InitTargetProbe, SystemStatus } from "../../types";
+import type { InitTargetProbe, SystemStatus, TemplateSummary } from "../../types";
 import TemplatePicker from "./TemplatePicker";
 
 /** Textarea → one trimmed entry per non-empty line. */
@@ -51,6 +52,17 @@ export default function InitWizard({
   const [goals, setGoals] = useState("");
   const [boundaries, setBoundaries] = useState("");
   const [templateId, setTemplateId] = useState("generic-v1");
+  // The chosen template's own domain, which init uses when the field above is
+  // left blank (D137). Held here rather than derived from `templateId` because
+  // custom templates carry their own hints — a lookup table would be a lie the
+  // moment someone adds one.
+  const [templateDomain, setTemplateDomain] = useState("");
+  // Stable identity: TemplatePicker reports through an effect, and a fresh
+  // arrow each render would re-run it on every keystroke in this form.
+  const onTemplateResolved = useCallback(
+    (tpl: TemplateSummary | null) => setTemplateDomain(tpl?.domainHint ?? ""),
+    [],
+  );
   const [gitAvailable, setGitAvailable] = useState(false);
   const [initGit, setInitGit] = useState(true);
   const [selectedModules, setSelectedModules] = useState<string[]>([]);
@@ -185,12 +197,19 @@ export default function InitWizard({
           placeholder={t("wizard.domainPlaceholder")}
           list="domain-suggestions"
         />
+        {domain.trim() === "" && shownDomain(templateDomain) !== null && (
+          <span className="muted template-hint">
+            {t("wizard.domainFromTemplate", { domain: templateDomain })}
+          </span>
+        )}
         <datalist id="domain-suggestions">
           <option value="coding" />
           <option value="research" />
           <option value="business" />
           <option value="life" />
-          <option value="general" />
+          {/* No "general" suggestion: it is the word for "nobody said" (D137),
+              and picking it from a list is picking a value that renders as
+              nothing — offering it is offering a no-op. */}
         </datalist>
       </label>
 
@@ -230,7 +249,11 @@ export default function InitWizard({
         />
       </label>
 
-      <TemplatePicker templateId={templateId} onSelect={setTemplateId} />
+      <TemplatePicker
+        templateId={templateId}
+        onSelect={setTemplateId}
+        onResolved={onTemplateResolved}
+      />
 
       {gitAvailable && (
         <Check checked={initGit} onChange={setInitGit}>

@@ -55,6 +55,7 @@ pub fn run() {
             commands::create_task,
             commands::update_task_status,
             commands::set_task_archived,
+            commands::archive_task_skipping_specs,
             commands::edit_task,
             commands::delete_task,
             commands::archive_verified_done_tasks,
@@ -152,6 +153,7 @@ pub fn run() {
             commands::agent_catalog_save,
             commands::agent_catalog_delete,
             commands::quit_app,
+            commands::open_folder,
         ])
         .run(tauri::generate_context!());
 

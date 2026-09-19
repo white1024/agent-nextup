@@ -407,7 +407,7 @@ function MemberNodeComp({ data, selected }: NodeProps<MemberNode>) {
             is a team-level fact and lives in the header. */}
         {data.missing && <span className="chip team-missing-chip">{t("teams.missing")}</span>}
       </div>
-      <PathLabel className="cn-path" path={data.root} copyable={false} />
+      <PathLabel className="cn-path" path={data.root} actions={false} />
       <div className="cn-meta">
         <span className={data.pending > 0 ? "cn-meta-hot" : ""}>
           {data.pending > 0 ? t("teams.cardPending", { n: data.pending }) : t("teams.nodeIdle")}

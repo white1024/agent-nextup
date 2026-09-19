@@ -147,6 +147,15 @@ export interface LedgerEvent {
   /** Transition endpoints for `task_status_changed`. */
   from?: TaskStatus;
   to?: TaskStatus;
+  /** ── Decision identity and supersession — decisions only, absent on older lines ── */
+  /** Workspace-local decision id (`D-0001`), so a later decision can point at this one. */
+  id?: string;
+  /**
+   * The decision id this decision overturns. Set on the NEW line only — the ledger is
+   * append-only, so the superseded line is never edited. Read the other direction with
+   * `supersession()`.
+   */
+  supersedes?: string;
 }
 
 /** Ledger tail after a caller-held line cursor, for the notify layer (D62). */
@@ -169,6 +178,13 @@ export interface LedgerPage {
   events: LedgerEvent[];
   /** Matches under the active filter across the whole ledger, not just this page. */
   total: number;
+  /**
+   * For each decision on this page that a later decision overturned, the ids that
+   * overturned it. The engine computes this over the whole ledger — do not re-derive it
+   * from `events`: a superseding decision is newer, so on page 2 the reversal is back on
+   * page 1 and a local projection would show a dead decision as live.
+   */
+  superseded: Record<string, string[]>;
 }
 
 /** One capability row of the spec layer (D79). */
@@ -187,6 +203,19 @@ export interface SpecFoldSummary {
   modified: number;
   removed: number;
   renamed: number;
+  /** Requirements deliberately given up rather than folded (D129). */
+  skipped?: string[];
+}
+
+/** One requirement two tasks' deltas both change (D129). */
+export interface SpecOverlap {
+  capability: string;
+  requirement: string;
+  otherTask: string;
+  /** The other task already folded — its text is in `specs/` now. */
+  otherFolded: boolean;
+  /** The other task is newer, so by the project's rule its wording wins. */
+  otherNewer: boolean;
 }
 
 /** Dry-run fold report for one task's delta bundle (D79). */
@@ -197,6 +226,8 @@ export interface TaskSpecsReport {
   problems: string[];
   warnings: string[];
   alreadySynced: string[];
+  /** Requirements another task's delta also changes (D129). */
+  overlaps: SpecOverlap[];
   added: number;
   modified: number;
   removed: number;

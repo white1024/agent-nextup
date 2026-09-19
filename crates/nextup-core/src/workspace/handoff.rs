@@ -12,7 +12,8 @@ use std::fmt::Write as _;
 use crate::error::Result;
 use crate::workspace::context::ProjectContext;
 use crate::workspace::layout::WorkspacePaths;
-use crate::workspace::ledger::{clamp_line, LedgerEvent, SUMMARY_MAX_CHARS};
+use crate::workspace::ledger::{clamp_line, supersession, LedgerEvent, SUMMARY_MAX_CHARS};
+use crate::workspace::teams::TeamRoster;
 use crate::workspace::tasks::{compute_counts, Task, TaskStatus};
 use crate::workspace::workflow::{gate_label, WorkflowStatus};
 
@@ -31,6 +32,10 @@ pub struct HandoffInput<'a> {
     pub tasks: &'a [Task],
     pub recent_events: &'a [LedgerEvent],
     pub decisions: &'a [LedgerEvent],
+    /// Teams this workspace is a member of (D128). Empty when it is in none,
+    /// and also when the app-level store could not be read — the snapshot
+    /// still has to render either way.
+    pub teams: &'a [TeamRoster],
     /// Newest few `progress` entries (D78) — where the last session stopped.
     pub progress: &'a [LedgerEvent],
     /// Live harness status; `None` for legacy workspaces without workflow.json.
@@ -106,6 +111,29 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
         counts.total, counts.todo, counts.in_progress, counts.blocked, counts.done,
         unverified_suffix
     );
+    // Who this project can hand work to (D128). One line per team, and it
+    // names the downstream members specifically: the shipped curriculum tells
+    // an agent to write its delivery note for the receiving project, which it
+    // cannot do while the receiving project is unknown to it. Naming them is
+    // not permission to send — routing stays with the user or the coordinator.
+    for roster in input.teams {
+        let downstream: Vec<&str> =
+            roster.members.iter().filter(|m| m.downstream).map(|m| m.name.as_str()).collect();
+        let rest: Vec<&str> =
+            roster.members.iter().filter(|m| !m.downstream).map(|m| m.name.as_str()).collect();
+        let mut line = format!("- **Team «{}»:** ", roster.team_name);
+        if downstream.is_empty() {
+            // Worth saying outright: publishing here reaches nobody until the
+            // user draws an edge, and silence would read as "no teammates".
+            line.push_str("no project downstream of this one — a delivery published here has nowhere to go along the current flow");
+        } else {
+            let _ = write!(line, "deliver to {}", downstream.join(", "));
+        }
+        if !rest.is_empty() {
+            let _ = write!(line, " · also on the team: {}", rest.join(", "));
+        }
+        let _ = writeln!(md, "{line}");
+    }
     if let Some(ws) = input.workflow {
         let phase_title = ws
             .workflow
@@ -309,9 +337,33 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
     if input.decisions.is_empty() {
         let _ = writeln!(md, "**Decisions:** none recorded this cycle.");
     } else {
+        // Projecting over the window is complete, not a shortcut: a decision
+        // that overturns another is by definition newer than it, so if the old
+        // one is inside this newest-N window the new one is too.
+        let overturned = supersession(input.decisions);
         let _ = writeln!(md, "**Decisions:**");
         for decision in input.decisions {
-            let _ = writeln!(md, "- `{}` {}", decision.at, lens_line(&decision.message));
+            // Decisions recorded before ids existed have none; they render the
+            // way they always did rather than growing a fake identity.
+            let tag = decision.id.as_deref().unwrap_or(&decision.at);
+            match decision.id.as_deref().and_then(|id| overturned.get(id)) {
+                // The overturned decision is kept and marked, never dropped —
+                // the reason a session reached the wrong conclusion is part of
+                // the record, and a decision that silently vanished would read
+                // as one that was never made.
+                Some(by) => {
+                    let _ = writeln!(
+                        md,
+                        "- ~~`{}` {}~~ — SUPERSEDED by {}",
+                        tag,
+                        lens_line(&decision.message),
+                        by.join(", ")
+                    );
+                }
+                None => {
+                    let _ = writeln!(md, "- `{}` {}", tag, lens_line(&decision.message));
+                }
+            }
         }
     }
 
@@ -343,12 +395,67 @@ mod tests {
         )
     }
 
+    fn render_with_teams(teams: &[TeamRoster]) -> String {
+        render_handoff(&HandoffInput {
+            context: &sample_context(),
+            tasks: &[],
+            recent_events: &[],
+            decisions: &[],
+            teams,
+            progress: &[],
+            workflow: None,
+            app_version: "0.1.0",
+            generated_at: "2026-09-16T00:00:00Z".into(),
+        })
+    }
+
+    fn roster(team: &str, members: &[(&str, bool)]) -> TeamRoster {
+        TeamRoster {
+            team_id: format!("t-{team}"),
+            team_name: team.into(),
+            members: members
+                .iter()
+                .map(|(name, downstream)| crate::workspace::teams::RosterMember {
+                    workspace_id: format!("ws-{name}"),
+                    name: (*name).into(),
+                    downstream: *downstream,
+                })
+                .collect(),
+        }
+    }
+
+    /// The reason this line exists: an agent is told to write its delivery note
+    /// for the receiving project, so the snapshot has to say which project that
+    /// is — and separate it from teammates it cannot reach.
+    #[test]
+    fn team_line_separates_downstream_from_the_rest() {
+        let md = render_with_teams(&[roster("build chain", &[("API", true), ("QA", false)])]);
+        assert!(md.contains("**Team «build chain»:** deliver to API"), "{md}");
+        assert!(md.contains("also on the team: QA"), "{md}");
+    }
+
+    /// A team with no edge out of here is the case that would otherwise read as
+    /// "you have teammates, go ahead" while nothing published could move.
+    #[test]
+    fn team_line_says_so_when_nothing_is_downstream() {
+        let md = render_with_teams(&[roster("build chain", &[("API", false)])]);
+        assert!(md.contains("no project downstream of this one"), "{md}");
+    }
+
+    /// A workspace on no team, or one whose app layer could not be read, still
+    /// renders a snapshot — it just has no team line.
+    #[test]
+    fn no_teams_renders_no_team_line() {
+        assert!(!render_with_teams(&[]).contains("**Team"));
+    }
+
     fn render(tasks: &[Task], events: &[LedgerEvent], decisions: &[LedgerEvent]) -> String {
         render_handoff(&HandoffInput {
             context: &sample_context(),
             tasks,
             recent_events: events,
             decisions,
+            teams: &[],
             progress: &[],
             workflow: None,
             app_version: "0.1.0",
@@ -368,6 +475,8 @@ mod tests {
             tasks: &[],
             recent_events: &[],
             decisions: &[],
+
+            teams: &[],
             progress: &[progress],
             workflow: None,
             app_version: "0.1.0",
@@ -492,6 +601,8 @@ mod tests {
             tasks: &store.list().unwrap(),
             recent_events: &[],
             decisions: &[],
+
+            teams: &[],
             progress: &[],
             workflow: None,
             app_version: "0.1.0",
@@ -578,6 +689,8 @@ mod tests {
             tasks: &[],
             recent_events: &[],
             decisions: &[],
+
+            teams: &[],
             progress: &[],
             workflow: Some(&status),
             app_version: "0.1.0",

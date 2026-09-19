@@ -16,7 +16,7 @@ import { describe, expect, it } from "vitest";
  *   shell/       the parts of the persistent app shell; App.tsx owns them
  *   views/<x>/   one screen and the pieces only that screen uses
  *   src/*        entry points (main.tsx, App.tsx) and the platform boundary
- *                (api.ts, types.ts, i18n.ts, theme.ts, styles.css)
+ *                (api.ts, types.ts, i18n.ts, theme.ts, zoom.ts, styles.css)
  *
  * Dependencies run downward through that list. Two rules do most of the work:
  *

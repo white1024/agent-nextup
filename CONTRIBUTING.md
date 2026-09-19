@@ -99,7 +99,7 @@ checked mechanically:
 | `components/` | pieces that **more than one** screen uses | may not import `shell/` or `views/` |
 | `shell/` | the persistent app shell's own parts: workspace switcher, command palette, toast layer, error boundary | only `App.tsx` may import them |
 | `views/<screen>/` | one screen and the pieces only that screen uses | `index` is the screen; everything else is private to it |
-| `src/*` | entry points (`main.tsx`, `App.tsx`) and the platform boundary (`api.ts`, `types.ts`, `i18n.ts`, `theme.ts`, `styles.css`) | — |
+| `src/*` | entry points (`main.tsx`, `App.tsx`) and the platform boundary (`api.ts`, `types.ts`, `i18n.ts`, `theme.ts`, `zoom.ts`, `styles.css`) | — |
 
 Dependencies run downward through that table. Two of those rules are worth
 spelling out, because they are the ones you are most likely to trip over:
@@ -131,7 +131,7 @@ accident:
 
 Rust carries most of the suite, inline with the code it covers. On the frontend,
 vitest runs in the node environment with no jsdom, so unit tests cover the pure
-modules in `lib/` plus four cross-cutting guards:
+modules in `lib/` plus six cross-cutting guards:
 
 - `layering.test.ts` — the folder rules above
 - `styles.test.ts` — every `var(--x)` resolves
@@ -141,6 +141,15 @@ modules in `lib/` plus four cross-cutting guards:
 - `i18n.test.ts` — every static `t("…")` call site names a key that exists. A
   missing key does not throw at runtime, it renders the key itself, so nothing
   else would catch it
+- `navigation.test.ts` — where a project change leaves you. Entering a project
+  and switching between two of them end in the same state, so the landing has
+  to be decided by the action rather than read back off the result; and every
+  workspace-scoped view has to render inside the keyed block, or one project's
+  open envelope and loaded spec stay on screen under the next one's name
+- `domainChip.test.ts` — the rule for an unset domain lives in one module and
+  both screens ask it. The project grid once hid the placeholder with an inline
+  literal that the dashboard never got, and a third copy is how the next screen
+  goes wrong the same way
 
 React components are deliberately not unit-tested — that would mean adopting
 jsdom, which has not been judged worth it. If you add a guard of your own, make

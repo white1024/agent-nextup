@@ -748,7 +748,8 @@ export default function TeamDetail({
             <aside className="canvas-inspector">
               <div className="ci-head">
                 <div className="ci-title">
-                  {selectedMember.name}
+                  {/* Own element so it can truncate — see .ci-name in styles.css */}
+                  <span className="ci-name">{selectedMember.name}</span>
                   {missing.has(selectedMember.workspaceId) && (
                     <span className="chip team-missing-chip">{t("teams.missing")}</span>
                   )}
@@ -1057,7 +1058,7 @@ export default function TeamDetail({
                   }}
                 >
                   <span className="team-member-name">{row.name}</span>
-                  <PathLabel className="team-member-path" path={row.root} copyable={false} />
+                  <PathLabel className="team-member-path" path={row.root} actions={false} />
                 </button>
               ))}
             </div>
@@ -1087,7 +1088,7 @@ export default function TeamDetail({
               <div className="settings-row">
                 <div className="sr-body">
                   <div className="sr-title">{team.prime.name}</div>
-                  <PathLabel className="team-member-path" path={team.prime.root} copyable={false} />
+                  <PathLabel className="team-member-path" path={team.prime.root} actions={false} />
                 </div>
                 {/* Clearing takes authority away and deletes nothing — the
                     reversible tier of D102, so no red and no confirmation. */}
@@ -1125,7 +1126,7 @@ export default function TeamDetail({
                   onClick={() => void setPrime(row.root)}
                 >
                   <span className="team-member-name">{row.name}</span>
-                  <PathLabel className="team-member-path" path={row.root} copyable={false} />
+                  <PathLabel className="team-member-path" path={row.root} actions={false} />
                 </button>
               ))}
             </div>

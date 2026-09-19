@@ -148,7 +148,11 @@ export default function Ledger({ refreshKey, onMutated }: Props) {
             /* Keyed by the ask: a filter/paging switch remounts the list so
                newly revealed rows are absorbed as baseline; only same-ask
                refreshes (watcher deltas) diff-flash true arrivals (D27). */
-            <HistoryList key={loaded!.token} events={page.events} />
+            <HistoryList
+              key={loaded!.token}
+              events={page.events}
+              superseded={page.superseded}
+            />
           )}
           {!shownAll && !capped && (
             <div className="ledger-foot">
@@ -164,7 +168,14 @@ export default function Ledger({ refreshKey, onMutated }: Props) {
   );
 }
 
-function HistoryList({ events }: { events: LedgerEvent[] }) {
+function HistoryList({
+  events,
+  superseded,
+}: {
+  events: LedgerEvent[];
+  /** Engine-computed, whole-ledger — never re-derive it from `events` (see types.ts). */
+  superseded: Record<string, string[]>;
+}) {
   const { t, i18n } = useTranslation();
   const fresh = useFreshKeys(events.map(eventKey));
 
@@ -189,10 +200,13 @@ function HistoryList({ events }: { events: LedgerEvent[] }) {
           <ul className="event-list event-list--page">
             {group.rows.map((event, i) => {
               const key = eventKey(event);
+              const by = event.id ? superseded[event.id] : undefined;
               return (
                 <li
                   key={`${key}-${i}`}
-                  className={`event-item ${fresh.has(key) ? "entering agent-flash" : ""}`}
+                  className={`event-item ${by ? "event-item--superseded" : ""} ${
+                    fresh.has(key) ? "entering agent-flash" : ""
+                  }`}
                 >
                   <span className="event-time" title={absoluteTime(event.at, i18n.language)}>
                     {clockTime(event.at, i18n.language)}
@@ -205,6 +219,14 @@ function HistoryList({ events }: { events: LedgerEvent[] }) {
                     taskId={event.taskId}
                     message={event.message}
                   />
+                  {/* The decision is kept and struck through, never hidden: it was
+                      really made, and the record of a reversal is worth more than a
+                      tidy list. */}
+                  {by && (
+                    <span className="event-superseded">
+                      {t("ledgerView.supersededBy", { ids: by.join(", ") })}
+                    </span>
+                  )}
                 </li>
               );
             })}

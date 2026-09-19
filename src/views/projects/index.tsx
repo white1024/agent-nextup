@@ -16,6 +16,7 @@ import {
 import type { SystemStatus, TemplateSummary, WorkspaceOverview } from "../../types";
 import EmptyState from "../../components/EmptyState";
 import { CAT_ALL, categoryOf } from "../../lib/categories";
+import { shownDomain } from "../../lib/domain";
 import InitWizard from "./InitWizard";
 import AdoptWizard from "./AdoptWizard";
 import ImportForm from "./ImportForm";
@@ -189,13 +190,11 @@ export default function ProjectsHome({
                 >
                   <span className="ws-card-name">
                     {ws.name}
-                    {/* "general" is what init writes when nobody said
-                        otherwise (init.rs), so on most catalogs every card
-                        carried the same chip — one per card of information
-                        the grid already has, which is none (r2 3-5). A domain
-                        someone actually chose still shows. */}
-                    {ws.domain && ws.domain !== "general" && (
-                      <span className="chip">{ws.domain}</span>
+                    {/* Why the unset domain is not rendered: lib/domain.ts. The
+                        rule used to live here as a literal, which is how the
+                        dashboard went on showing it (r2 3-5, D137). */}
+                    {shownDomain(ws.domain) !== null && (
+                      <span className="chip">{shownDomain(ws.domain)}</span>
                     )}
                     {!ws.exists && <span className="chip">{t("welcome.recentMissing")}</span>}
                     {runningRoots.has(ws.root) && (
@@ -205,7 +204,7 @@ export default function ProjectsHome({
                       </span>
                     )}
                   </span>
-                  <PathLabel className="ws-card-path" path={ws.root} copyable={false} />
+                  <PathLabel className="ws-card-path" path={ws.root} actions={false} />
                   <span className="ws-card-meta">
                     {ws.templateName && <>{ws.templateName}{" · "}</>}
                     {ws.currentPhase && (

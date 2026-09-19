@@ -11,9 +11,18 @@ import type { SystemStatus, WorkspaceInfo, WorkspaceOverview } from "../types";
 import ConfirmDanger from "../components/ConfirmDanger";
 import { hasOpenModal } from "../components/Modal";
 
+/**
+ * How many recent projects the dropdown lists. Six keeps the popup shorter
+ * than the shortest window we support even with the section header, the
+ * remainder row and "open another folder" stacked under it.
+ */
+const RECENT_LIMIT = 6;
+
 interface Props {
   workspace: WorkspaceInfo;
   onSwitched: (status: SystemStatus) => void;
+  /** Jump to the projects home — where the list is complete. */
+  onSeeAll: () => void;
 }
 
 /**
@@ -22,8 +31,13 @@ interface Props {
  * state and watcher atomically). Getting back to the projects home is the
  * sidebar's permanent All projects item; actually closing the workspace lives in
  * Settings.
+ *
+ * Only the most recent few are listed. The registry keeps every project ever
+ * opened and never evicts one, which is the right promise for the projects
+ * home but the wrong shape for a dropdown — past a dozen or so the menu is
+ * taller than the screen and the thing you want is rarely down there anyway.
  */
-export default function WorkspaceSwitcher({ workspace, onSwitched }: Props) {
+export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: Props) {
   const { t } = useTranslation();
   const [openMenu, setOpenMenu] = useState(false);
   const { recent, setRecent, reload: reloadRecent } = useRecentWorkspaces();
@@ -131,6 +145,8 @@ export default function WorkspaceSwitcher({ workspace, onSwitched }: Props) {
     first.focus();
   }, [openMenu, recent]);
 
+  const { listed, hidden } = menuSlice(recent, RECENT_LIMIT);
+
   function switchTo(root: string) {
     if (root === workspace.root) {
       setOpenMenu(false);
@@ -181,10 +197,10 @@ export default function WorkspaceSwitcher({ workspace, onSwitched }: Props) {
           {error && <div className="alert alert-error switcher-error">{error}</div>}
           {busy && <div className="muted switcher-hint">{t("switcher.switching")}</div>}
 
-          {recent !== null && recent.length > 0 && (
+          {listed.length > 0 && (
             <>
               <div className="switcher-section">{t("welcome.recentTitle")}</div>
-              {recent.map((ws) => {
+              {listed.map((ws) => {
                 const isCurrent = ws.root === workspace.root;
                 return (
                   <div className="switcher-row" key={ws.root}>
@@ -215,6 +231,19 @@ export default function WorkspaceSwitcher({ workspace, onSwitched }: Props) {
                   </div>
                 );
               })}
+              {hidden > 0 && (
+                <button
+                  className="switcher-item switcher-more"
+                  role="menuitem"
+                  disabled={busy}
+                  onClick={() => {
+                    setOpenMenu(false);
+                    onSeeAll();
+                  }}
+                >
+                  {t("switcher.more", { n: hidden })}
+                </button>
+              )}
               <div className="switcher-divider" />
             </>
           )}
@@ -243,4 +272,22 @@ export default function WorkspaceSwitcher({ workspace, onSwitched }: Props) {
 
     </div>
   );
+}
+
+/**
+ * The head of the recent list, plus how many rows that leaves out.
+ *
+ * Taking the head is what makes this "the most recent few": `record_workspace`
+ * re-inserts at index 0 on every open, so the list arrives most-recently-opened
+ * first and the cut only ever falls on projects untouched for a while. The
+ * current project is always row one, because opening it is what put it there.
+ *
+ * `hidden` exists so the cut can be *said*. Silently showing six of thirty
+ * would read as "the rest are gone", and this app deliberately never forgets a
+ * project — the registry has no size cap and removal is explicit only. Keeping
+ * the count next to the slice is what stops the two from drifting apart.
+ */
+export function menuSlice<T>(all: T[] | null, limit: number): { listed: T[]; hidden: number } {
+  const listed = (all ?? []).slice(0, limit);
+  return { listed, hidden: (all?.length ?? 0) - listed.length };
 }

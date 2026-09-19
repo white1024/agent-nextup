@@ -114,7 +114,22 @@ pub fn initialize_project(
         b"secrets.enc\nindex.sqlite\n.mutex\n",
     )?;
 
-    let domain = if params.domain.trim().is_empty() { "general" } else { params.domain.trim() };
+    // What the person typed wins. Left blank, the domain comes from the template
+    // they picked — every shipped template carries a domainHint ("coding",
+    // "research", …) and until D137 nothing on this path read it, so picking
+    // the software-development template still handed the next agent
+    // `domain: general`. That label is not decoration: it goes into the status
+    // block the handoff writes for whoever picks the workspace up.
+    // Both empty is still "general" — the one word for "nobody said".
+    let typed = params.domain.trim();
+    let hint = template.domain_hint.trim();
+    let domain = if !typed.is_empty() {
+        typed
+    } else if !hint.is_empty() {
+        hint
+    } else {
+        "general"
+    };
     let context = ProjectContext::new(
         name,
         domain,
@@ -224,6 +239,43 @@ mod tests {
         let paths = WorkspacePaths::new(dir.path());
         let modules = crate::workspace::modules::get_modules(&paths).unwrap();
         assert!(modules.is_enabled(crate::workspace::modules::MODULE_COLLAB));
+    }
+
+    /// D137: the template someone picks is the loudest choice in the wizard, so
+    /// a blank domain field means "the domain this template is for" — not
+    /// "general", which is what the next agent used to read in the status block
+    /// no matter which template was chosen.
+    #[test]
+    fn blank_domain_comes_from_the_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(dir.path());
+        p.domain = "   ".into();
+        p.template_id = Some("coding-v1".into());
+        let ctx = initialize_project(&p, &StaticKeyProvider([1u8; 32]), "0.1.0").unwrap();
+        assert_eq!(ctx.domain, "coding");
+    }
+
+    /// The hint is a default, never an override: what the person typed is the
+    /// one thing here that came from a human.
+    #[test]
+    fn typed_domain_beats_the_template_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(dir.path());
+        p.domain = "  side project  ".into();
+        p.template_id = Some("coding-v1".into());
+        let ctx = initialize_project(&p, &StaticKeyProvider([1u8; 32]), "0.1.0").unwrap();
+        assert_eq!(ctx.domain, "side project");
+    }
+
+    /// Nobody said, and the default template does not say either: still
+    /// "general" — the word the UI knows to hide (D137).
+    #[test]
+    fn blank_domain_on_the_generic_template_stays_general() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(dir.path());
+        p.domain = String::new();
+        let ctx = initialize_project(&p, &StaticKeyProvider([1u8; 32]), "0.1.0").unwrap();
+        assert_eq!(ctx.domain, "general");
     }
 
     /// D79: choosing the specs module scaffolds `specs/` up front — without

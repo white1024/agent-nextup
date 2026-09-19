@@ -279,6 +279,24 @@ pub async fn set_task_archived(
     blocking(move || ops::set_task_archived(&ws.paths(), APP_VERSION, &id, archived)).await
 }
 
+/// Archive a task, giving up the named requirements instead of folding them
+/// (D129). The escape hatch behind the fold-conflict dialog: a newer task
+/// already folded its own version of a requirement this one also rewrites, and
+/// the user has decided this task's wording is obsolete rather than asking an
+/// agent to merge the two. `skip` is `[capability, requirement]` pairs.
+#[tauri::command]
+pub async fn archive_task_skipping_specs(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    skip: Vec<(String, String)>,
+) -> CmdResult<TaskUpdate> {
+    let ws = state.require_workspace()?;
+    blocking(move || {
+        ops::set_task_archived_skipping_specs(&ws.paths(), APP_VERSION, &id, &skip)
+    })
+    .await
+}
+
 /// Bulk-archive every done-and-verified task (the tasks page sweep button,
 /// D40). Returns the archived ids; empty means there was nothing to sweep.
 #[tauri::command]
@@ -1494,4 +1512,106 @@ pub fn quit_app(app: tauri::AppHandle) -> CmdResult<()> {
         app.exit(0);
     }
     Ok(())
+}
+
+/// Open a folder in the OS file manager (Explorer / Finder / the XDG handler).
+///
+/// # Why this is directory-only
+///
+/// The opener plugin's `open_path` hands a path to whatever the desktop has
+/// registered for it — and for a *file* that means **launching its default
+/// application**. A command that forwarded any path would therefore be a
+/// launcher: `open_folder("…\payload.exe")` runs the payload. A directory can
+/// only ever raise a file manager, so the `is_dir` check below is not
+/// validation hygiene, it is the entire reason this is safe to expose. It runs
+/// against the real filesystem, and no program parameter is accepted.
+///
+/// That check is also why no path allowlist is needed. The rest of this IPC
+/// layer already takes frontend-supplied paths for real filesystem work
+/// (`init_project` creates a workspace anywhere, `remove_recent_workspace`
+/// drops any root), so an allowlist here would be inconsistent, and it would
+/// reject the two callers that are not workspace roots: a delivery's
+/// attachment directory and a team member's workspace. What a compromised
+/// frontend would gain from opening some other folder in Explorer is a window;
+/// what it would gain from running an executable is the machine.
+#[tauri::command]
+pub async fn open_folder(app: AppHandle, path: String) -> CmdResult<()> {
+    blocking(move || {
+        let target = folder_to_open(&path)?;
+        tauri_plugin_opener::OpenerExt::opener(&app)
+            .open_path(target.to_string_lossy().to_string(), None::<&str>)
+            .map_err(|e| NextUpError::Ipc(format!("could not open {path}: {e}")))
+    })
+    .await
+}
+
+/// The guard `open_folder` is safe *because of* — split out so it can be
+/// tested without an `AppHandle`, since what it refuses is the whole point.
+fn folder_to_open(path: &str) -> CmdResult<PathBuf> {
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err(NextUpError::NotFound(format!("folder no longer exists: {path}")));
+    }
+    if !target.is_dir() {
+        return Err(NextUpError::InvalidInput(format!("not a folder: {path}")));
+    }
+    Ok(target)
+}
+
+#[cfg(test)]
+mod open_folder_tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolved = folder_to_open(&dir.path().to_string_lossy()).expect("a directory opens");
+        assert_eq!(resolved, dir.path());
+    }
+
+    /// The one that matters. `open_path` on a file launches its default
+    /// application, so a file reaching the opener turns this command into a
+    /// launcher — `.exe` included. Refusing non-directories is what keeps it
+    /// from being one, and `invalid_input` (not `not_found`) says the path was
+    /// found and rejected.
+    #[test]
+    fn a_file_is_refused_even_though_it_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("payload.exe");
+        std::fs::write(&file, b"MZ").expect("write");
+        let err = folder_to_open(&file.to_string_lossy()).expect_err("a file must not open");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// The everyday failure: the project folder was moved or deleted outside
+    /// the app, and the button still carries the stale path.
+    #[test]
+    fn a_missing_path_reports_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("moved-away");
+        let err = folder_to_open(&gone.to_string_lossy()).expect_err("a ghost must not open");
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    /// No program parameter is ever passed to the opener. `open_path`'s second
+    /// argument names the application to open with, and a `Some(..)` there
+    /// would reintroduce exactly the arbitrary-execution path the directory
+    /// check above closes.
+    ///
+    /// Both needles are split across two literals so this assertion does not
+    /// count itself — written whole, the `None` check is satisfied by its own
+    /// source line and passes even after the real call is changed (which is
+    /// what it did on the first run of the breaking test).
+    #[test]
+    fn the_opener_is_never_handed_a_program() {
+        let source = include_str!("commands.rs");
+        let call = concat!("open_", "path(");
+        assert_eq!(source.matches(call).count(), 1, "one opener call, no second path in");
+        let no_program = concat!("None::<", "&str>");
+        assert_eq!(
+            source.matches(no_program).count(),
+            1,
+            "open_path's program argument stays None — see open_folder's doc comment"
+        );
+    }
 }

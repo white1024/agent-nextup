@@ -9,9 +9,15 @@ import type { TemplateSummary } from "../../types";
 export default function TemplatePicker({
   templateId,
   onSelect,
+  onResolved,
 }: {
   templateId: string;
   onSelect: (id: string) => void;
+  /** The selected template once the catalog has loaded — `null` while it has
+   *  not, or when the id no longer matches anything. The wizard needs the
+   *  template's own domain, and this component is the only one that holds the
+   *  catalog; passing the id alone would make the wizard fetch it twice. */
+  onResolved?: (tpl: TemplateSummary | null) => void;
 }) {
   const { t } = useTranslation();
   // `null` until the first read resolves (D65, invariant 10) — see the empty
@@ -32,6 +38,11 @@ export default function TemplatePicker({
         setLoadFailed(true);
       });
   }, []);
+
+  const selected = templates?.find((tpl) => tpl.id === templateId) ?? null;
+  useEffect(() => {
+    onResolved?.(selected);
+  }, [selected, onResolved]);
 
   if (loadFailed) {
     return <p className="muted template-hint">{t("wizard.templatesUnavailable")}</p>;

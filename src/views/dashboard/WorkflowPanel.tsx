@@ -230,7 +230,13 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus }: Props
                   <span className="wf-num" aria-hidden="true">
                     {done ? "✓" : i + 1}
                   </span>
-                  {p.title}
+                  {/* Its own element so it can truncate: `text-overflow` needs a
+                      block container with inline content, and .wf-pill is a flex
+                      container — the ellipsis declared there never once ran, so
+                      a squeezed strip cut phase names mid-glyph ("3 S", G068).
+                      Names are never dropped to save room: the strip scrolls
+                      instead, because the names are what it is showing. */}
+                  <span className="wf-title">{p.title}</span>
                 </span>
                 <span className="wf-caption">
                   {done

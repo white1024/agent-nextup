@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -89,6 +90,13 @@ type View =
   | "terminal"
   | "settings"
   | "projectSettings";
+
+/**
+ * What a `system_status` change was: going into a project (or out of one), or
+ * trading one open project for another. `applyStatus` below is the only
+ * reader, and the distinction is the whole reason it takes an argument.
+ */
+type StatusChange = "enter" | "switch";
 
 const NAV: { view: View; icon: ComponentType<IconProps> }[] = [
   { view: "dashboard", icon: IconDashboard },
@@ -399,12 +407,11 @@ export default function App() {
   async function openTerminalOf(root: string) {
     if (wsRoot !== root) {
       try {
-        setStatus(await api.openWorkspace(root));
+        applySwitched(await api.openWorkspace(root));
       } catch (e) {
         setLoadError(errorMessage(e));
         return;
       }
-      setRefreshKey((k) => k + 1);
     }
     setView("terminal");
   }
@@ -630,13 +637,33 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
-  // Open/create/switch/close all land here: into the dashboard when a
-  // workspace is loaded, back home when it was closed.
-  const applyStatus = useCallback((s: SystemStatus) => {
+  /**
+   * Every open/create/switch/close funnels through here. Where it leaves you
+   * comes from the *action*, not from the result — reading it off
+   * `s.workspace` alone treats those as one question, and that is what used
+   * to throw you to the dashboard every time you changed project.
+   *
+   *   "enter"  — you asked to go into a project, or out of one: the
+   *              dashboard, or the projects home when nothing is open.
+   *   "switch" — you asked for a different project, not a different page, so
+   *              the page stays. Switching changes the subject, not the task;
+   *              comparing two projects' task lists should not cost a detour
+   *              through the dashboard each way.
+   *
+   * A kept page the new project cannot show is not this function's problem:
+   * the two self-correcting effects above already pull you off a module-gated
+   * view whose module is off over there, and off any workspace view when
+   * nothing is open.
+   */
+  const applyStatus = useCallback((s: SystemStatus, action: StatusChange = "enter") => {
     setStatus(s);
-    setView(s.workspace ? "dashboard" : "projects");
+    if (action === "enter") setView(s.workspace ? "dashboard" : "projects");
     setRefreshKey((k) => k + 1);
   }, []);
+  const applySwitched = useCallback(
+    (s: SystemStatus) => applyStatus(s, "switch"),
+    [applyStatus],
+  );
 
   const paletteCommands = useMemo<Command[]>(() => {
     if (status === null) return [];
@@ -893,7 +920,11 @@ export default function App() {
 
         {status.workspace !== null && (
           <div className="sidebar-ws">
-            <WorkspaceSwitcher workspace={status.workspace} onSwitched={applyStatus} />
+            <WorkspaceSwitcher
+              workspace={status.workspace}
+              onSwitched={applySwitched}
+              onSeeAll={() => showCategory(CAT_ALL)}
+            />
             <nav className="nav">
               <div className="nav-label">{t("nav.section")}</div>
               {NAV.filter(({ view: v }) => {
@@ -1000,6 +1031,7 @@ export default function App() {
               sessions={termSessions}
               overview={recent}
               onOpen={(root) => void openTerminalOf(root)}
+              onSessionsChanged={() => void reloadTerminals()}
             />
           )}
           {view === "templates" && <TemplatesHome />}
@@ -1012,7 +1044,20 @@ export default function App() {
             />
           )}
           {workspaceLoaded && (
-            <>
+            // Keyed by root: every workspace view remounts when the project
+            // changes, so a view's own state cannot outlive the project it
+            // was read from. Until switching kept your page this came free —
+            // every switch landed on the dashboard, which unmounted whatever
+            // you had been looking at. Now it has to be said out loud, and
+            // the cost of leaving it unsaid is not a stale list: Specs holds
+            // the selected spec's id *and its rendered body*, Inbox holds the
+            // opened envelope, Tools holds the last doctor report, Terminal
+            // holds the active tab (D69 path B). Carried across a switch,
+            // each of those shows one project's content under another
+            // project's name — which is why TerminalView's own key, the one
+            // an adversarial review asked for, is this block's job now
+            // rather than a second statement of the same rule.
+            <Fragment key={wsRoot ?? ""}>
               {view === "dashboard" && (
                 <Dashboard
                   status={status}
@@ -1057,9 +1102,6 @@ export default function App() {
               )}
               {view === "terminal" && (
                 <TerminalView
-                  // Remount on a workspace change so per-root state (active tab,
-                  // D69 path B) never carries across roots (adversarial-review).
-                  key={status.workspace?.root ?? ""}
                   root={status.workspace?.root ?? ""}
                   projectName={status.workspace?.name ?? ""}
                   onSessionsChanged={reloadTerminals}
@@ -1074,7 +1116,7 @@ export default function App() {
                   onGoToAppSettings={() => setView("settings")}
                 />
               )}
-            </>
+            </Fragment>
           )}
         </ErrorBoundary>
       </main>

@@ -119,6 +119,89 @@ pub fn teams_file() -> Result<PathBuf> {
     })
 }
 
+/// One team a member workspace belongs to, seen from that member's side.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamRoster {
+    pub team_id: String,
+    pub team_name: String,
+    /// The team's OTHER members — the asking workspace is never in its own
+    /// roster, and neither is the team's prime.
+    pub members: Vec<RosterMember>,
+}
+
+/// One teammate, and whether work flows from the asker to them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterMember {
+    pub workspace_id: String,
+    pub name: String,
+    /// An edge runs asker → this member, so a delivery published here can be
+    /// sent to them. False means they are in the team but not downstream:
+    /// nothing published here reaches them along the current graph.
+    pub downstream: bool,
+}
+
+/// The teams `workspace_id` is a member of, each with its other members and
+/// which of them are downstream of it.
+///
+/// Why a member gets to see this at all (D128): the shipped team curriculum
+/// asks an agent to write a delivery note *for the receiving project* and to
+/// attach the specs that project needs to check the work — while the agent had
+/// no way to learn who that project is. Telling it who is downstream is what
+/// makes that instruction followable.
+///
+/// What it deliberately does NOT do is let the agent act on the answer:
+/// `publish_delivery` still names no recipient and still cannot send. This is
+/// the read half only, and it is scoped to the asker's own teams — a member of
+/// one team learns nothing about any other team's existence.
+///
+/// The prime is excluded on purpose. It is not in `members` (D117 — it sits
+/// above the flow, with no node and no edges), and a member's delivery travels
+/// along edges, so a prime could never be a destination for one. Listing it
+/// would be offering a recipient that is not reachable.
+pub fn roster_for(teams: &[Team], workspace_id: &str) -> Vec<TeamRoster> {
+    teams
+        .iter()
+        .filter(|team| team.members.iter().any(|m| m.workspace_id == workspace_id))
+        .map(|team| TeamRoster {
+            team_id: team.id.clone(),
+            team_name: team.name.clone(),
+            members: team
+                .members
+                .iter()
+                .filter(|m| m.workspace_id != workspace_id)
+                .map(|m| RosterMember {
+                    workspace_id: m.workspace_id.clone(),
+                    name: m.name.clone(),
+                    downstream: team
+                        .edges
+                        .iter()
+                        .any(|e| e.from == workspace_id && e.to == m.workspace_id),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// [`roster_for`] against the app-level store, degrading to an empty roster
+/// when that store cannot be read.
+///
+/// Best-effort on purpose: this runs inside snapshot regeneration, which fires
+/// on every task, decision and phase change. A workspace has to be able to
+/// hand off when the app layer is missing entirely — no home directory, no
+/// `teams.json` yet, a workspace opened on a machine that never ran the app.
+/// The team section simply does not render.
+pub fn roster_best_effort(workspace_id: &str) -> Vec<TeamRoster> {
+    let Some(path) = default_teams_path() else {
+        return Vec::new();
+    };
+    match load_teams(&path) {
+        Ok(file) => roster_for(&file.teams, workspace_id),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The whole graph, reloaded from disk. Every team command answers with this —
 /// the GUI keeps no local copy of the graph, so a mutation and a plain read
 /// hand back the same shape (D52).
@@ -599,6 +682,61 @@ mod tests {
             add_member(&path, &team.id, member(id)).unwrap();
         }
         (dir, path, team)
+    }
+
+    /// The roster answers "who can I hand work to", so edge DIRECTION is the
+    /// whole point: `a → b` means b receives from a, and b must not see a as
+    /// somewhere it can deliver.
+    #[test]
+    fn roster_marks_only_downstream_members() {
+        let (_g, path, team) = seeded();
+        add_edge(&path, &team.id, "a", "b").unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+
+        let from_a = roster_for(&teams, "a");
+        assert_eq!(from_a.len(), 1);
+        let a_sees: Vec<(&str, bool)> =
+            from_a[0].members.iter().map(|m| (m.name.as_str(), m.downstream)).collect();
+        assert_eq!(a_sees, vec![("b", true), ("c", false)], "a delivers to b only");
+
+        let from_b = roster_for(&teams, "b");
+        let b_sees: Vec<(&str, bool)> =
+            from_b[0].members.iter().map(|m| (m.name.as_str(), m.downstream)).collect();
+        assert_eq!(b_sees, vec![("a", false), ("c", false)], "the edge does not run backwards");
+    }
+
+    /// A workspace is never its own teammate, and it only ever sees teams it is
+    /// actually on — a member of one team learns nothing about another's
+    /// existence (D128 scope).
+    #[test]
+    fn roster_excludes_self_and_other_teams() {
+        let (_g, path, _team) = seeded();
+        let other = create_team(&path, "unrelated").unwrap();
+        add_member(&path, &other.id, member("z")).unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+
+        let from_a = roster_for(&teams, "a");
+        assert_eq!(from_a.len(), 1, "a is on one team, so it sees one team");
+        assert_eq!(from_a[0].team_name, "research to dev");
+        assert!(from_a[0].members.iter().all(|m| m.workspace_id != "a"), "never lists itself");
+        assert!(
+            !from_a[0].members.iter().any(|m| m.name == "z"),
+            "a is not on z's team and must not learn z exists"
+        );
+        assert!(roster_for(&teams, "nobody").is_empty(), "a non-member is on no teams");
+    }
+
+    /// The prime is not in `members` (D117) and a member's delivery travels
+    /// along edges, which the prime has none of — so listing it would offer a
+    /// recipient that can never receive.
+    #[test]
+    fn roster_omits_the_prime() {
+        let (_g, path, team) = seeded();
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+        let from_a = roster_for(&teams, "a");
+        let names: Vec<&str> = from_a[0].members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c"]);
     }
 
     /// The process-local `Mutex` this replaced (D116) already covered threads;

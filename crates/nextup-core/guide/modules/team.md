@@ -2,7 +2,7 @@
 
 > This file exists because the **team** module is enabled for this workspace. It is engine-shipped material: the main contract is in [01-nextup-guide.md](../01-nextup-guide.md), and this file only covers what the module adds. Disabling the module in the app leaves this file in place — it simply stops applying.
 
-Cross-project delivery. This workspace may belong to one or more **teams** (the user wires several projects into a workflow in the app's team view). The team graph — members and flows — lives in the app layer and **agents neither see it nor need to**. Your field of view is this workspace's `.nextup/exchange/` in- and out-boxes.
+Cross-project delivery. This workspace may belong to one or more **teams** (the user wires several projects into a workflow in the app's team view). The team graph lives in the app layer and you do not edit it, but you can see **your own position in it**: `list_teammates` names the projects on the teams this workspace is on and marks which of them are **downstream** of it. Everything else is out of view — you learn nothing about teams this workspace is not on. Besides that, your field of view is this workspace's `.nextup/exchange/` in- and out-boxes.
 
 ## Publishing
 
@@ -14,7 +14,9 @@ Cross-project delivery. This workspace may belong to one or more **teams** (the 
 
 **Attach the real file, not a copy you made for the occasion.** Every attachment is a snapshot either way — the bytes are copied at publish and never updated afterwards, so what the receiver holds is always as of the moment you sent it, and that is fine (it is what "as delivered" means). The problem with a hand-made copy is on *your* side: a second file in your own workspace that says what the spec says is a second source of truth, and the next person to change the capability will update one of them. Point at the real path and there is only ever one document to keep right.
 
-**You do not name a recipient and you cannot send** — it is routed along the team flow graph by the user in the app, or by a project the user put in charge of that team (its **coordinator**), or automatically on edges the user marked for it. Where a workspace belongs to several teams, whoever sends chooses at that step. After publishing, tell the user it is ready to send; if the team has a coordinator, it may go on its own.
+**Know who it is for before you write it.** A delivery note is written for the project that receives it, so call `list_teammates` first and write for the ones marked `downstream: true` — name the capability they asked for in their words, say what changed since the last delivery, point at the attached spec. A note written for nobody in particular is the one the receiver has to come back and ask about. If nothing is downstream, say so when you tell the user the delivery is ready: publishing worked, but nothing can move until they draw that edge.
+
+**You still do not name a recipient and you still cannot send** — knowing the roster is not permission to route. It is routed along the team flow graph by the user in the app, or by a project the user put in charge of that team (its **coordinator**), or automatically on edges the user marked for it. Where a workspace belongs to several teams, whoever sends chooses at that step. After publishing, tell the user it is ready to send; if the team has a coordinator, it may go on its own.
 
 **Correcting a delivery you already published**: publish the new one with `supersedes: <old id>` while the old one is still in the outbox. Nothing is deleted — the old envelope is marked as replaced so the user does not send it by mistake, and the choice stays theirs; an auto-send edge skips replaced envelopes rather than deciding for them. Once a delivery has been sent, it is gone: the downstream copy cannot be recalled, superseding it is refused, and the honest move is to publish the correction and say plainly what changed.
 

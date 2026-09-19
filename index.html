@@ -63,6 +63,31 @@
         /* storage or the bridge can be unavailable; the app still corrects
            itself on mount, so there is nothing to report here */
       }
+      // Pin the zoom before first paint, for the same reason and by the same
+      // route as the theme above: zoom.ts applies it once the bundle has
+      // parsed, so without this the splash paints at 1.0 and then jumps —
+      // a size step on every single launch for anyone not at 100%.
+      //
+      // Same storage key and same snapping semantics as getZoom(): only the
+      // offered steps are honoured, so a hand-edited value cannot be pinned
+      // here into something no button can undo.
+      try {
+        var zoom = Number(localStorage.getItem("nextup-zoom"));
+        var steps = [0.8, 0.9, 1, 1.1, 1.25]; /* ZOOM_STEPS */
+        if (zoom && steps.indexOf(zoom) !== -1 && zoom !== 1) {
+          var zi = window.__TAURI_INTERNALS__;
+          if (zi && zi.metadata) {
+            var zp = zi.invoke("plugin:webview|set_webview_zoom", {
+              label: zi.metadata.currentWebview.label,
+              value: zoom,
+            });
+            if (zp && zp.catch) zp.catch(function () {});
+          }
+        }
+      } catch (err) {
+        /* best-effort exactly like the theme pin: applyZoom() on mount is the
+           authority, this is only earlier */
+      }
     </script>
 
     <style>

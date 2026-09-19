@@ -212,6 +212,11 @@ pub struct SpecFoldSummary {
     pub modified: usize,
     pub removed: usize,
     pub renamed: usize,
+    /// Requirements the user chose to give up rather than fold (D129). Named
+    /// rather than counted: "we decided not to apply this" is a fact someone
+    /// may need to look up later, and a number cannot answer that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 /// Fold a task's delta bundle into the main specs — the only fold entry
@@ -220,6 +225,15 @@ pub struct SpecFoldSummary {
 /// prepare-all), then stamps `spec_folded_at`. `Ok(None)` = nothing to do
 /// (no bundle, or already folded). Callers hold the mutation lock.
 fn fold_task_specs(paths: &WorkspacePaths, task: &Task) -> Result<Option<SpecFoldSummary>> {
+    fold_task_specs_skipping(paths, task, &[])
+}
+
+/// [`fold_task_specs`] with named requirements given up (D129 escape hatch).
+fn fold_task_specs_skipping(
+    paths: &WorkspacePaths,
+    task: &Task,
+    skip: &[(String, String)],
+) -> Result<Option<SpecFoldSummary>> {
     if task.spec_folded_at.is_some() {
         return Ok(None);
     }
@@ -242,7 +256,26 @@ fn fold_task_specs(paths: &WorkspacePaths, task: &Task) -> Result<Option<SpecFol
             task.id
         )));
     }
-    let outcomes = specs::plan_task_fold(paths, &deltas)?
+    // A newer task may have folded its own rewrite of the same requirement
+    // while this one sat unarchived. `fold` cannot see that — a MODIFIED that
+    // still matches by name looks exactly like a legitimate edit — so this
+    // delta would overwrite the newer text with no conflict, no warning and
+    // no trace (D129). Checked here rather than inside `fold` because it is
+    // the only layer that knows about other tasks at all.
+    let others: Vec<(String, bool)> = TaskStore::new(paths.tasks_dir())
+        .list()?
+        .into_iter()
+        .map(|t| (t.id, t.spec_folded_at.is_some()))
+        .collect();
+    let blocking: Vec<String> = specs::cross_task_overlaps(paths, &task.id, &others)?
+        .iter()
+        .filter(|o| o.blocks_fold() && !skip.iter().any(|(c, r)| *c == o.capability && *r == o.requirement))
+        .map(specs::overlap_block_message)
+        .collect();
+    if !blocking.is_empty() {
+        return Err(NextUpError::SpecFoldConflict { id: task.id.clone(), conflicts: blocking });
+    }
+    let outcomes = specs::plan_task_fold_skipping(paths, &deltas, skip)?
         .map_err(|conflicts| NextUpError::SpecFoldConflict { id: task.id.clone(), conflicts })?;
     let mut summary = SpecFoldSummary {
         capabilities: Vec::new(),
@@ -250,6 +283,7 @@ fn fold_task_specs(paths: &WorkspacePaths, task: &Task) -> Result<Option<SpecFol
         modified: 0,
         removed: 0,
         renamed: 0,
+        skipped: Vec::new(),
     };
     for (capability, out) in &outcomes {
         let file = paths.spec_file(capability);
@@ -262,6 +296,7 @@ fn fold_task_specs(paths: &WorkspacePaths, task: &Task) -> Result<Option<SpecFol
         summary.modified += out.modified;
         summary.removed += out.removed;
         summary.renamed += out.renamed;
+        summary.skipped.extend(out.skipped.iter().cloned());
     }
     TaskStore::new(paths.tasks_dir()).set_spec_folded_at(&task.id, Some(now_rfc3339()))?;
     Ok(Some(summary))
@@ -297,6 +332,7 @@ pub fn pending_spec_folds(paths: &WorkspacePaths) -> Result<Vec<specs::TaskSpecs
                 problems: vec![e.to_string()],
                 warnings: Vec::new(),
                 already_synced: Vec::new(),
+                overlaps: Vec::new(),
                 added: 0,
                 modified: 0,
                 removed: 0,
@@ -335,12 +371,42 @@ pub fn set_task_archived(
     id: &str,
     archived: bool,
 ) -> Result<TaskUpdate> {
+    archive_inner(paths, app_version, id, archived, &[])
+}
+
+/// Archive, giving up the named requirements instead of folding them (D129).
+///
+/// The user-facing escape hatch for the one case the engine refuses: a newer
+/// task already folded its own version of a requirement this task also
+/// rewrites. Re-writing the delta is the better answer and the error says so —
+/// but it needs the agent that wrote it, and a user who has decided this
+/// task's wording is simply obsolete should not have to hand-edit a delta file
+/// to say so. `skip` is `(capability, requirement)`; the rest of the bundle
+/// folds as usual and the given-up names are reported back.
+pub fn set_task_archived_skipping_specs(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    skip: &[(String, String)],
+) -> Result<TaskUpdate> {
+    // Skipping only ever makes sense while archiving — un-archiving folds
+    // nothing, so there is nothing to give up.
+    archive_inner(paths, app_version, id, true, skip)
+}
+
+fn archive_inner(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    archived: bool,
+    skip: &[(String, String)],
+) -> Result<TaskUpdate> {
     with_mutation_lock(paths, || {
         let store = TaskStore::new(paths.tasks_dir());
         let mut folded = None;
         if archived {
             let task = store.get(id)?;
-            folded = fold_task_specs(paths, &task)?.map(|summary| (task, summary));
+            folded = fold_task_specs_skipping(paths, &task, skip)?.map(|summary| (task, summary));
         }
         let task = store.set_archived(id, archived)?;
         if let Some((pre_fold, summary)) = &folded {
@@ -585,12 +651,61 @@ pub fn add_ledger_note(
     channel: NoteChannel,
     message: &str,
 ) -> Result<LedgerEvent> {
+    add_ledger_entry(paths, app_version, channel, message, None)
+}
+
+/// Record a decision, optionally naming an earlier decision it overturns.
+///
+/// Supersession is appended, not stamped backwards: the new line carries
+/// `supersedes`, and readers project the superseded set. The delivery-envelope
+/// shape (D87 — engine writes `superseded_by` onto the old envelope inside the
+/// same lock) is right for a mutable JSON file and wrong here, because editing
+/// a ledger line after the fact is exactly what the append-only contract
+/// exists to prevent.
+///
+/// Naming a decision that something already overturned is allowed. The
+/// projection is a set, so a second mention changes nothing, and refusing it
+/// would mean the engine deciding which supersession chain is the real one —
+/// a judgement it has no basis for.
+pub fn add_decision(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    message: &str,
+    supersedes: Option<&str>,
+) -> Result<LedgerEvent> {
+    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes)
+}
+
+fn add_ledger_entry(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    channel: NoteChannel,
+    message: &str,
+    supersedes: Option<&str>,
+) -> Result<LedgerEvent> {
     let message = message.trim();
     if message.is_empty() {
         return Err(NextUpError::InvalidInput("message cannot be empty".into()));
     }
+    let supersedes = supersedes.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     mutate(paths, app_version, || {
-        let event = LedgerEvent::new(channel.kind(), message, None);
+        let mut event = LedgerEvent::new(channel.kind(), message, None);
+        if channel.kind() == LedgerKind::Decision {
+            // Inside the mutation lock and before the append, so two concurrent
+            // writers cannot be handed the same number.
+            let ledger = ledger_for(paths);
+            if let Some(target) = supersedes.as_deref() {
+                if ledger.decision(target)?.is_none() {
+                    return Err(NextUpError::InvalidInput(format!(
+                        "cannot supersede {target}: no decision in this workspace carries that id \
+                         (decision ids look like D-0001 and appear next to each decision in the \
+                         handoff snapshot; decisions recorded before this feature have none and \
+                         cannot be superseded)"
+                    )));
+                }
+            }
+            event = event.with_id(ledger.next_decision_id()?).superseding(supersedes.clone());
+        }
         // The line the caller gets back is the one that was appended.
         Ok((event.clone(), event))
     })
@@ -1184,6 +1299,76 @@ mod tests {
         assert!(on_disk.contains("we will index with SQLite FTS5"));
     }
 
+    /// Decisions get a workspace-local id so a later one can point at them.
+    /// Notes and progress do not: they are not things anything needs to
+    /// reverse, and handing every ledger line an id would make the file
+    /// bigger for no reader.
+    #[test]
+    fn decisions_get_sequential_ids_and_other_channels_do_not() {
+        let (_g, paths) = workspace();
+        let first = add_decision(&paths, "0.1.0", "use sled", None).unwrap();
+        let second = add_decision(&paths, "0.1.0", "index with FTS5", None).unwrap();
+        assert_eq!(first.id.as_deref(), Some("D-0001"));
+        assert_eq!(second.id.as_deref(), Some("D-0002"));
+        let note = add_ledger_note(&paths, "0.1.0", NoteChannel::Note, "n").unwrap();
+        let progress = add_ledger_note(&paths, "0.1.0", NoteChannel::Progress, "p").unwrap();
+        assert_eq!(note.id, None);
+        assert_eq!(progress.id, None);
+    }
+
+    /// The point of the whole feature: the superseded decision is still in the
+    /// record — the ledger is append-only and a decision that was made stays
+    /// made — but the snapshot the next session reads says it no longer holds.
+    #[test]
+    fn superseding_marks_the_old_decision_without_removing_it() {
+        let (_g, paths) = workspace();
+        let old = add_decision(&paths, "0.1.0", "store state in sled", None).unwrap();
+        let new =
+            add_decision(&paths, "0.1.0", "files are the source of truth", old.id.as_deref())
+                .unwrap();
+        assert_eq!(new.supersedes.as_deref(), Some("D-0001"));
+
+        let snapshot = std::fs::read_to_string(paths.handoff_file()).unwrap();
+        assert!(snapshot.contains("store state in sled"), "the old decision is kept, not dropped");
+        assert!(
+            snapshot.contains("SUPERSEDED by D-0002"),
+            "the old decision must be marked, or the next session acts on it:\n{snapshot}"
+        );
+        // and the ledger line itself was never edited
+        let old_line = ledger_for(&paths)
+            .decision("D-0001")
+            .unwrap()
+            .expect("the superseded decision is still a ledger line");
+        assert_eq!(old_line.message, old.message);
+        assert_eq!(old_line.supersedes, None, "supersession is recorded forwards, never stamped back");
+    }
+
+    /// Naming an id that does not exist is the likely agent mistake here
+    /// (guessing a number instead of reading one off the snapshot), so it
+    /// fails loudly rather than recording a decision that claims to reverse
+    /// something it does not.
+    #[test]
+    fn superseding_an_unknown_decision_is_rejected() {
+        let (_g, paths) = workspace();
+        add_decision(&paths, "0.1.0", "a real decision", None).unwrap();
+        let err = add_decision(&paths, "0.1.0", "reverses nothing", Some("D-0099")).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        // and nothing was written
+        assert_eq!(ledger_for(&paths).decisions().unwrap().len(), 1);
+    }
+
+    /// Two sessions may overturn the same decision for different reasons;
+    /// both are real events and the snapshot names both.
+    #[test]
+    fn a_decision_can_be_superseded_more_than_once() {
+        let (_g, paths) = workspace();
+        add_decision(&paths, "0.1.0", "original call", None).unwrap();
+        add_decision(&paths, "0.1.0", "first reversal", Some("D-0001")).unwrap();
+        add_decision(&paths, "0.1.0", "second reversal", Some("D-0001")).unwrap();
+        let snapshot = std::fs::read_to_string(paths.handoff_file()).unwrap();
+        assert!(snapshot.contains("SUPERSEDED by D-0002, D-0003"), "{snapshot}");
+    }
+
     /// The blank-message rule lives in ops so the GUI and the agent hub can
     /// never drift apart on it.
     #[test]
@@ -1511,6 +1696,106 @@ mod tests {
 
     fn spec_folded_lines(paths: &WorkspacePaths) -> Vec<LedgerEvent> {
         Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::SpecFolded, 20).unwrap()
+    }
+
+    /// The scenario that exposed this (D129): A is done with a delta but not
+    /// archived; B is created later for a new requirement, touches the same
+    /// requirement, and archives first. A's delta was written against the text
+    /// B has since replaced — folding it would overwrite B's wording with an
+    /// older rewrite, and before this check that happened silently: `fold`
+    /// reported no conflict, no warning, no no-op.
+    #[test]
+    fn older_task_cannot_silently_overwrite_a_newer_folded_requirement() {
+        let (_g, paths) = workspace();
+        let a = done_task(&paths, "A: earlier work", true);
+        write_delta(&paths, &a.id, "export", DELTA_OK);
+        // A folds nothing yet — it stays unarchived.
+
+        let b = done_task(&paths, "B: the new requirement", true);
+        write_delta(&paths, &b.id, "export", DELTA_OK);
+        set_task_archived(&paths, "0.1.0", &b.id, true).unwrap();
+        let after_b = std::fs::read_to_string(paths.spec_file("export")).unwrap();
+
+        let err = set_task_archived(&paths, "0.1.0", &a.id, true).unwrap_err();
+        assert_eq!(err.kind(), "spec_fold_conflict");
+        assert!(err.to_string().contains(&b.id), "names the task that got there first: {err}");
+        assert!(err.to_string().contains("匯出"), "names the requirement: {err}");
+        assert_eq!(
+            std::fs::read_to_string(paths.spec_file("export")).unwrap(),
+            after_b,
+            "a refused fold writes nothing"
+        );
+        assert!(!TaskStore::new(paths.tasks_dir()).get(&a.id).unwrap().archived);
+    }
+
+    /// The other direction is the project's rule, not a conflict: a NEWER task
+    /// carrying the later requirement folds over an older one that already
+    /// went in. That is the ordinary "we changed our minds later" path and
+    /// must stay frictionless.
+    #[test]
+    fn newer_task_folds_over_an_older_folded_requirement() {
+        let (_g, paths) = workspace();
+        let a = done_task(&paths, "A: earlier", true);
+        write_delta(&paths, &a.id, "export", DELTA_OK);
+        set_task_archived(&paths, "0.1.0", &a.id, true).unwrap();
+
+        let b = done_task(&paths, "B: later", true);
+        write_delta(
+            &paths,
+            &b.id,
+            "export",
+            "## MODIFIED Requirements\n\n### Requirement: 匯出\n必須支援匯出與匯入。\n\n#### Scenario: s\n- **WHEN** x\n- **THEN** y\n",
+        );
+        let updated = set_task_archived(&paths, "0.1.0", &b.id, true).unwrap().task;
+        assert!(updated.archived, "the newer task is not blocked by the older one");
+        assert!(std::fs::read_to_string(paths.spec_file("export")).unwrap().contains("匯入"));
+    }
+
+    /// Both still unarchived: nothing is wrong yet, but whoever archives
+    /// second will be stopped — so the dry-run says so while the agent that
+    /// wrote the delta is still around to merge the two.
+    #[test]
+    fn dry_run_warns_about_an_unfolded_overlap_before_it_becomes_a_conflict() {
+        let (_g, paths) = workspace();
+        let a = done_task(&paths, "A", true);
+        write_delta(&paths, &a.id, "export", DELTA_OK);
+        let b = done_task(&paths, "B", true);
+        write_delta(&paths, &b.id, "export", DELTA_OK);
+
+        let report = specs::dry_run_task_specs(&paths, &a.id).unwrap();
+        assert!(report.ok, "an unfolded overlap is a warning, not a blocker");
+        assert_eq!(report.overlaps.len(), 1);
+        assert_eq!(report.overlaps[0].other_task, b.id);
+        assert!(!report.overlaps[0].other_folded);
+        assert!(report.warnings.iter().any(|w| w.contains(&b.id)), "{:?}", report.warnings);
+    }
+
+    /// The escape hatch (layer ③): give up just the contested requirement and
+    /// archive. Everything else in the bundle still folds, and what was given
+    /// up is named rather than quietly missing.
+    #[test]
+    fn skipping_the_contested_requirement_archives_and_keeps_the_rest() {
+        let (_g, paths) = workspace();
+        let a = done_task(&paths, "A", true);
+        write_delta(&paths, &a.id, "export", DELTA_OK);
+        write_delta(&paths, &a.id, "report", DELTA_OK);
+        let b = done_task(&paths, "B", true);
+        write_delta(&paths, &b.id, "export", DELTA_OK);
+        set_task_archived(&paths, "0.1.0", &b.id, true).unwrap();
+
+        set_task_archived(&paths, "0.1.0", &a.id, true).unwrap_err();
+        let update = set_task_archived_skipping_specs(
+            &paths,
+            "0.1.0",
+            &a.id,
+            &[("export".to_string(), "匯出".to_string())],
+        )
+        .unwrap();
+        assert!(update.task.archived);
+        // the other capability in the same bundle still folded
+        assert!(paths.spec_file("report").exists(), "unrelated capability still folds");
+        let summary = update.spec_fold.expect("a fold happened");
+        assert_eq!(summary.skipped, vec!["匯出".to_string()], "what was given up is named");
     }
 
     #[test]

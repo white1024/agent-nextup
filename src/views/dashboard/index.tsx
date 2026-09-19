@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, errorKind, errorMessage } from "../../api";
 import { useFlash, useGuardedMutation, useWorkspaceData } from "../../hooks";
 import { useFreshKeys } from "../../hooks/anim";
+import { shownDomain } from "../../lib/domain";
 import { eventCat, eventKey } from "../../lib/ledger";
 import EmptyState from "../../components/EmptyState";
 import EventMessage from "../../components/EventMessage";
@@ -260,16 +261,19 @@ export default function Dashboard({
   }
 
 
+  // Nothing to say beats saying "general" on every dashboard (lib/domain.ts).
+  const domainLabel = shownDomain(workspace?.domain);
+
   return (
     <div className="view">
       <header className="view-header">
         <div className="vh-main">
           <h1>{workspace?.name ?? t("dashboard.heading")}</h1>
           <div className="vh-meta">
-            {workspace?.domain && (
+            {domainLabel !== null && (
               <span className="chip">
                 <span className="dot" aria-hidden="true" />
-                {workspace.domain}
+                {domainLabel}
               </span>
             )}
             {workspace && <PathLabel className="vh-path" path={workspace.root} />}

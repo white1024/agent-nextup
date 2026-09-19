@@ -457,6 +457,10 @@ pub struct FoldOutcome {
     /// Early-synced operations that were skipped (the main spec already
     /// contained the edit — e.g. a human applied it by hand).
     pub noops: Vec<String>,
+    /// Requirements deliberately given up via the skip path (D129) — distinct
+    /// from `noops`, which are edits that turned out to be unnecessary. These
+    /// were necessary and were dropped anyway, so they are recorded.
+    pub skipped: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -855,6 +859,12 @@ struct FoldInput<'a> {
     current: Option<&'a str>,
     /// Raw delta file content.
     delta: &'a str,
+    /// Requirement names to drop from this delta before folding (D129) — the
+    /// user's escape hatch when a newer task already folded the same
+    /// requirement and this task's version is no longer wanted. Everything
+    /// else in the bundle still folds; only the named requirements are given
+    /// up, and the fold outcome names each one.
+    skip: &'a [String],
 }
 
 /// What a planned fold would do: every capability's outcome, or every problem
@@ -876,18 +886,52 @@ fn fold_batch(items: &[FoldInput<'_>]) -> FoldPlan {
             Err(errs) => {
                 problems.extend(errs.into_iter().map(|e| format!("[{}] {e}", item.capability)))
             }
-            Ok(delta) => match fold(item.capability, item.current, &delta) {
+            Ok(mut delta) => {
+                let dropped = drop_requirements(&mut delta, item.skip);
+                match fold(item.capability, item.current, &delta) {
                 Ok(mut outcome) => {
                     outcome.warnings.extend(lint_delta(&delta));
+                    outcome.skipped = dropped;
                     outcomes.push((item.capability.to_string(), outcome));
                 }
                 Err(errs) => {
                     problems.extend(errs.into_iter().map(|e| format!("[{}] {e}", item.capability)))
                 }
-            },
+                }
+            }
         }
     }
     if problems.is_empty() { Ok(outcomes) } else { Err(problems) }
+}
+
+/// Remove the named requirements from every section of a delta, returning the
+/// ones actually dropped. Used only by the skip path: a requirement given up
+/// on purpose leaves a record in the fold outcome, so "we chose not to apply
+/// this" never looks like "this was never in the delta".
+fn drop_requirements(delta: &mut DeltaSpec, names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut dropped = Vec::new();
+    for section in [&mut delta.added, &mut delta.modified, &mut delta.removed] {
+        section.retain(|b| {
+            let keep = !names.contains(&b.name);
+            if !keep {
+                dropped.push(b.name.clone());
+            }
+            keep
+        });
+    }
+    delta.renamed.retain(|r| {
+        let keep = !names.contains(&r.from) && !names.contains(&r.to);
+        if !keep {
+            dropped.push(format!("{} → {}", r.from, r.to));
+        }
+        keep
+    });
+    dropped.sort();
+    dropped.dedup();
+    dropped
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +993,151 @@ pub struct DeltaFile {
 /// Capability names under `specs/` (directories holding a spec.md), sorted.
 pub fn list_capabilities(paths: &WorkspacePaths) -> Result<Vec<String>> {
     capability_dirs(&paths.specs_dir())
+}
+
+/// One requirement that two tasks' deltas both touch (D129).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecOverlap {
+    pub capability: String,
+    pub requirement: String,
+    /// The other task whose delta touches the same requirement.
+    pub other_task: String,
+    /// The other task already folded — its edit is in `specs/` now, so a
+    /// delta written before that fold describes text that no longer exists.
+    pub other_folded: bool,
+    /// The other task is newer (task ids ascend), so by the project's rule
+    /// its requirement text is the one that wins.
+    pub other_newer: bool,
+}
+
+impl SpecOverlap {
+    /// A folded, newer task has already put its version in `specs/`, and this
+    /// delta was written against the text it replaced. Folding now would
+    /// overwrite the newer requirement with an older rewrite, silently —
+    /// `fold` cannot see it, because a MODIFIED that still matches by name is
+    /// indistinguishable from a legitimate edit.
+    pub fn blocks_fold(&self) -> bool {
+        self.other_folded && self.other_newer
+    }
+}
+
+/// What an agent is told when a newer task already folded the same
+/// requirement. Written FOR the agent: it says what is stale, why, and the one
+/// action that fixes it — re-reading the current text and rewriting the block
+/// to carry both needs. The old wording ("fix the task's delta files") was
+/// addressed to whoever read it, which in practice was a human being asked to
+/// hand-edit a file that only agents write.
+pub fn overlap_block_message(o: &SpecOverlap) -> String {
+    format!(
+        "[{}] '{}' was already changed by {} and folded into specs/ — your delta rewrites text \
+         that is no longer current. Re-read specs/{}/spec.md and rewrite this MODIFIED block so \
+         it carries BOTH changes; if this task's change is no longer needed, drop the block \
+         instead. (Archiving with skipConflicting discards only this requirement's edit.)",
+        o.capability, o.requirement, o.other_task, o.capability
+    )
+}
+
+/// Non-blocking form: the other task has not folded yet, so whichever archives
+/// first wins the text and the other will be stopped by the check above.
+pub fn overlap_warning(o: &SpecOverlap) -> String {
+    format!(
+        "[{}] '{}' is also changed by {}, which has not folded yet — whichever task archives \
+         first sets the text, and the other will be stopped. Agree on one wording now: fold both \
+         needs into one of the two deltas and drop it from the other.",
+        o.capability, o.requirement, o.other_task
+    )
+}
+
+/// Every requirement name a delta touches, in any section.
+fn delta_requirement_names(content: &str) -> Vec<String> {
+    let Ok(delta) = parse_delta(content) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = delta
+        .added
+        .iter()
+        .chain(&delta.modified)
+        .chain(&delta.removed)
+        .map(|b| b.name.clone())
+        .collect();
+    for r in &delta.renamed {
+        names.push(r.from.clone());
+        names.push(r.to.clone());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Task ids ascend (`T-0007` > `T-0002`), so "newer" is a numeric comparison
+/// on the id — the project's rule is that a later task carries the later
+/// requirement. Ids that do not parse sort as oldest, which is the safe
+/// direction: an unknown id never claims to outrank a known one.
+fn task_seq(id: &str) -> u32 {
+    id.rsplit('-').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// Requirements this task's delta touches that some OTHER task's delta also
+/// touches (D129).
+///
+/// Why this can be answered at all: archiving never deletes a task's delta
+/// bundle, so `tasks/*/specs/` still holds what every task changed, folded or
+/// not. No new record was needed — the evidence was already on disk, it had
+/// simply never been read across tasks.
+///
+/// `others` is every other task paired with whether it has already folded.
+/// Callers supply it because they already hold the task list.
+pub fn cross_task_overlaps(
+    paths: &WorkspacePaths,
+    task_id: &str,
+    others: &[(String, bool)],
+) -> Result<Vec<SpecOverlap>> {
+    let mine = read_task_deltas(paths, task_id)?;
+    if mine.is_empty() {
+        return Ok(Vec::new());
+    }
+    let my_seq = task_seq(task_id);
+    let mut out = Vec::new();
+    for (other_id, other_folded) in others {
+        if other_id == task_id {
+            continue;
+        }
+        // Containment (D79 batch 4 review, W3): another task's unreadable
+        // bundle is that task's problem and shows up in its own report. Letting
+        // it propagate here would make one broken file take down every other
+        // task's fold check — which is exactly what the `?` here did until the
+        // existing bulk-archive tests caught it.
+        let Ok(their_deltas) = read_task_deltas(paths, other_id) else {
+            continue;
+        };
+        for their_delta in their_deltas {
+            let Some(my_delta) = mine.iter().find(|d| d.capability == their_delta.capability) else {
+                continue;
+            };
+            let theirs = delta_requirement_names(&their_delta.content);
+            for name in delta_requirement_names(&my_delta.content) {
+                if !theirs.contains(&name) {
+                    continue;
+                }
+                out.push(SpecOverlap {
+                    capability: my_delta.capability.clone(),
+                    requirement: name,
+                    other_task: other_id.clone(),
+                    other_folded: *other_folded,
+                    other_newer: task_seq(other_id) > my_seq,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.capability, &a.requirement, &a.other_task).cmp(&(
+            &b.capability,
+            &b.requirement,
+            &b.other_task,
+        ))
+    });
+    Ok(out)
 }
 
 /// A task's delta specs, sorted by capability. No bundle dir = empty.
@@ -1029,6 +1218,13 @@ pub struct TaskSpecsReport {
     /// Early-synced edits the fold would skip (already applied by hand) —
     /// informational, neither a problem nor a style warning.
     pub already_synced: Vec<String>,
+    /// Requirements another task's delta also touches (D129).
+    ///
+    /// Reported here because this is where it is still cheap to fix: the agent
+    /// that just wrote the delta can fold both needs into one rewrite. By
+    /// archive time the only options left are re-writing it or dropping it.
+    /// Entries whose `blocks_fold()` is true are ALSO in `problems`.
+    pub overlaps: Vec<SpecOverlap>,
     pub added: usize,
     pub modified: usize,
     pub removed: usize,
@@ -1046,17 +1242,39 @@ pub struct TaskSpecsReport {
 /// is "does this bundle fold" — the doctor reports those two as different
 /// findings.
 pub fn plan_task_fold(paths: &WorkspacePaths, deltas: &[DeltaFile]) -> Result<FoldPlan> {
+    plan_task_fold_skipping(paths, deltas, &[])
+}
+
+/// [`plan_task_fold`] with named requirements dropped first (D129 escape
+/// hatch). `skip` is `(capability, requirement)` pairs; anything not named
+/// folds as usual.
+pub fn plan_task_fold_skipping(
+    paths: &WorkspacePaths,
+    deltas: &[DeltaFile],
+    skip: &[(String, String)],
+) -> Result<FoldPlan> {
     let currents = deltas
         .iter()
         .map(|d| read_current_spec(paths, &d.capability))
         .collect::<Result<Vec<_>>>()?;
+    let per_capability: Vec<Vec<String>> = deltas
+        .iter()
+        .map(|d| {
+            skip.iter()
+                .filter(|(cap, _)| *cap == d.capability)
+                .map(|(_, req)| req.clone())
+                .collect()
+        })
+        .collect();
     let items: Vec<FoldInput<'_>> = deltas
         .iter()
         .zip(currents.iter())
-        .map(|(d, c)| FoldInput {
+        .zip(per_capability.iter())
+        .map(|((d, c), skip)| FoldInput {
             capability: &d.capability,
             current: c.as_deref(),
             delta: &d.content,
+            skip,
         })
         .collect();
     Ok(fold_batch(&items))
@@ -1073,6 +1291,7 @@ pub fn dry_run_task_specs(paths: &WorkspacePaths, task_id: &str) -> Result<TaskS
         problems: Vec::new(),
         warnings: Vec::new(),
         already_synced: Vec::new(),
+        overlaps: Vec::new(),
         added: 0,
         modified: 0,
         removed: 0,
@@ -1080,6 +1299,20 @@ pub fn dry_run_task_specs(paths: &WorkspacePaths, task_id: &str) -> Result<TaskS
     };
     if deltas.is_empty() {
         return Ok(report);
+    }
+    let others: Vec<(String, bool)> = crate::workspace::tasks::TaskStore::new(paths.tasks_dir())
+        .list()?
+        .into_iter()
+        .map(|t| (t.id, t.spec_folded_at.is_some()))
+        .collect();
+    report.overlaps = cross_task_overlaps(paths, task_id, &others)?;
+    for o in &report.overlaps {
+        if o.blocks_fold() {
+            report.ok = false;
+            report.problems.push(overlap_block_message(o));
+        } else {
+            report.warnings.push(overlap_warning(o));
+        }
     }
     match plan_task_fold(paths, &deltas)? {
         Ok(outcomes) => {
@@ -1546,8 +1779,8 @@ mod tests {
         let good = "## ADDED Requirements\n\n### Requirement: A\nMUST.\n\n#### Scenario: s\n- **WHEN** x\n";
         let bad = "## MODIFIED Requirements\n\n### Requirement: Ghost\nMUST.\n\n#### Scenario: s\n- **WHEN** x\n";
         let items = [
-            FoldInput { capability: "alpha", current: None, delta: good },
-            FoldInput { capability: "beta", current: Some(SPEC), delta: bad },
+            FoldInput { capability: "alpha", current: None, delta: good, skip: &[] },
+            FoldInput { capability: "beta", current: Some(SPEC), delta: bad, skip: &[] },
         ];
         let errs = fold_batch(&items).unwrap_err();
         assert!(errs.iter().all(|e| e.starts_with("[beta]")), "prefixed by capability: {errs:?}");
@@ -1559,7 +1792,7 @@ mod tests {
     #[test]
     fn batch_rejects_invalid_capability_name() {
         let good = "## ADDED Requirements\n\n### Requirement: A\nMUST.\n\n#### Scenario: s\n- **WHEN** x\n";
-        let errs = fold_batch(&[FoldInput { capability: "Bad Name", current: None, delta: good }])
+        let errs = fold_batch(&[FoldInput { capability: "Bad Name", current: None, delta: good, skip: &[] }])
             .unwrap_err();
         assert!(errs[0].contains("must be"), "{errs:?}");
     }

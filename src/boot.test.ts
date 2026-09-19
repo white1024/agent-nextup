@@ -5,14 +5,17 @@ import { describe, expect, it } from "vitest";
 // space to serve one test file.
 import html from "../index.html?raw";
 import themeSource from "./theme.ts?raw";
+import zoomSource from "./zoom.ts?raw";
 import iconSource from "./components/icons.tsx?raw";
 // Extensionless subpath: the package's exports map is the wildcard `"./*" ->
 // "./*.js"`, so `window.js` would resolve to `window.js.js` and fail.
 import tauriWindowSource from "@tauri-apps/api/window?raw";
+import tauriWebviewSource from "@tauri-apps/api/webview?raw";
 // Not `./styles.css?raw` — vitest stubs .css imports to "" whatever the query.
 // The virtual module is defined in vitest.config.ts; see the note there.
 import css from "virtual:styles-source";
 import { BOOT_HOLD_MS, BOOT_MIN_VISIBLE_MS, BOOT_SLOW_MS } from "./lib/boot";
+import { ZOOM_STEPS } from "./zoom";
 
 /** The boot splash in index.html must be self-contained — styles.css only
  *  arrives with the bundle it exists to cover — so a handful of token values
@@ -86,6 +89,35 @@ describe("boot splash", () => {
     // Tauri internals change.
     expect(html).toContain("window.__TAURI_INTERNALS__");
     expect(html.slice(html.indexOf("__TAURI_INTERNALS__"))).toContain(".catch(");
+  });
+
+  it("reads the zoom from the same storage key as zoom.ts", () => {
+    // Same failure as the theme one layer over, with a different symptom: a
+    // disagreement here means the splash paints at 1.0 and the app snaps to the
+    // stored factor a beat later — a size step on every launch.
+    const key = /const STORAGE_KEY = "([^"]+)"/.exec(zoomSource)?.[1];
+    expect(key).toBeDefined();
+    expect(html).toContain(`localStorage.getItem("${key}")`);
+  });
+
+  it("honours only the steps zoom.ts offers", () => {
+    // index.html cannot import ZOOM_STEPS, so it restates them. Left to drift,
+    // the splash would happily pin a factor no button in Settings can undo —
+    // and at a large enough one, the button is off screen.
+    const restated = /var steps = \[([^\]]+)\]; \/\* ZOOM_STEPS \*\//.exec(html)?.[1];
+    expect(restated, "the splash no longer restates ZOOM_STEPS").toBeDefined();
+    expect((restated ?? "").split(",").map((s) => Number(s.trim()))).toEqual([...ZOOM_STEPS]);
+  });
+
+  it("pins the zoom through the same command setZoom() uses", () => {
+    // Held to the command the installed API actually calls, for the same reason
+    // as set_theme above: a Tauri rename must not leave a silent no-op here.
+    const command = /invoke\('(plugin:webview\|set_webview_zoom)'/.exec(tauriWebviewSource)?.[1];
+    expect(command, "@tauri-apps/api no longer calls a set_webview_zoom command").toBeDefined();
+    expect(html).toContain(`"${command}"`);
+    // The label comes from metadata, as getCurrentWebview() does — hard-coding
+    // "main" would silently zoom the wrong surface in a pop-out window.
+    expect(html).toContain("metadata.currentWebview.label");
   });
 
   it("states the hold that bootSplashDelays() offsets against", () => {

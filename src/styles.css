@@ -896,6 +896,15 @@ code {
   opacity: 1;
 }
 
+/* The remainder row ("N more projects…"). Muted and dot-less: it is a way out
+   of the menu, not one more project to pick — the dot is what marks a row as a
+   workspace, so it would read as a seventh one. */
+.switcher-more {
+  padding-left: calc(var(--s-2) + 6px + var(--s-2));
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
 .switcher-divider {
   height: 1px;
   margin: var(--s-1) var(--s-1);
@@ -1459,6 +1468,21 @@ select {
 
 .field-row input {
   flex: 1;
+}
+
+/* The requirements a fold conflict names (D129). A plain list: the dialog's
+   job is to make the collision readable, and each row is one requirement plus
+   where it came from. */
+.fold-conflict-list {
+  margin: 0;
+  padding-left: var(--s-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.fold-conflict-list code {
+  font-family: var(--mono);
 }
 
 .form-actions {
@@ -2835,8 +2859,19 @@ select {
   font-size: 14.5px;
   font-weight: 650;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The name truncates here rather than on .ci-title, which is a flex container
+   and so could never run the `text-overflow` it used to declare — a long member
+   name was cut mid-glyph instead of ellipsised. Found by the guard in
+   styles.test.ts on its first run, alongside the .wf-pill case it was written
+   for. `flex: 0 1 auto` so the chip beside it keeps its full width. */
+.ci-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ci-path {
@@ -3263,18 +3298,46 @@ select {
 }
 
 /* ── Dashboard: workflow ────────────────────────────────────────────────────── */
+/* Reported 2026-08-12 while testing the interface scale: a six-phase template
+   in a narrow panel cut phase names mid-glyph, so step 3 of Research read
+   "3 S". Two causes, and the scale only made them easy to reach — the strip
+   never had a rule for running out of room at all.
+
+   Running out of room is answered by scrolling, and the phase names are never
+   dropped or shortened to buy that room. Both of the alternatives were built
+   and rejected by the user on sight: shrinking the steps shredded the names,
+   and hiding the names below a width threshold left a row of bare numbers that
+   says almost nothing — a stepper's labels *are* its content, so trading them
+   away to avoid a scrollbar trades away the thing itself. */
 .wf-strip {
   display: flex;
   align-items: center;
   gap: 0;
-  margin-bottom: var(--s-4);
   position: relative;
+  overflow-x: auto;
+  /* Said out loud rather than left to the cascade. `overflow-x: auto` computes
+     `overflow-y` to `auto` too, which makes this a vertical scroll container
+     with nothing to scroll vertically — and a scroller that *can* take an axis
+     it has no content for is free to swallow input meant for the other one,
+     which is the shape of "the wheel and middle-click do nothing here"
+     (reported 2026-08-12). Pinning it to `hidden` costs nothing: there has
+     never been vertical overflow to reach. */
+  overflow-y: hidden;
+  /* The clipping is unchanged by that, so the trap .table-scroll documents
+     still applies (invariant 9e): the box clips on BOTH axes, which would
+     shave the current pill's `scale(1.03)` and its shadow along the top and
+     bottom edges. Pad, then pull the padding back out of the layout; the
+     bottom margin is the original --s-4 with that padding subtracted. */
+  padding-block: var(--s-1);
+  margin-top: calc(-1 * var(--s-1));
+  margin-bottom: calc(var(--s-4) - var(--s-1));
 }
 
-/* Width follows content (flex-basis auto); shrink only when space runs
-   short, and let the connector lines absorb any surplus. */
+/* Steps do not shrink: shrinking is what cut the names mid-glyph, and once the
+   names are staying at full length there is nothing for shrinking to buy. The
+   connectors still absorb any surplus — they keep `flex: 1 1`. */
 .wf-step {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -3282,6 +3345,23 @@ select {
   position: relative;
   padding: 0 var(--s-2);
   min-width: 0;
+}
+
+/* Truncation lives here, not on .wf-pill: `text-overflow` applies to a block
+   container's inline content, and the pill is a flex container, so the
+   declaration it used to carry never ran. Caps a pathologically long single
+   name; the container query below handles "many names at once". */
+.wf-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  /* The cap is what lets the ellipsis run at all: nothing else constrains this
+     box now that the steps hold their width, and an unconstrained
+     `text-overflow` is precisely the dead declaration G068 is about. It sits
+     past every built-in phase name, so in practice it only ever meets a custom
+     template with a sentence for a phase title — which would otherwise push
+     the strip into scrolling on its own. */
+  max-width: 14ch;
 }
 
 .wf-pill {
@@ -3296,9 +3376,17 @@ select {
   background: var(--surface-1);
   color: var(--text-3);
   white-space: nowrap;
-  max-width: 100%;
+  /* No `max-width: 100%` either, and that is not an oversight: .wf-step is a
+     *column* flex with `align-items: center`, so this pill is sized by its
+     content rather than stretched to the step — with the step no longer
+     shrinking, a percentage cap here resolves against a width this pill itself
+     produced and constrains nothing. .wf-title carries an absolute cap instead
+     (G068: a limit that cannot bite is the same species of dead declaration as
+     the `text-overflow` that used to sit here). */
+  /* No `text-overflow` here — it needs a block container with inline content,
+     and this is a flex container, so the one that used to sit here was dead
+     from the day it was written (G068). Truncation is .wf-title's job. */
   overflow: hidden;
-  text-overflow: ellipsis;
   transition: color var(--dur-state) var(--ease-std),
     background var(--dur-state) var(--ease-std),
     border-color var(--dur-state) var(--ease-std),
@@ -3700,6 +3788,24 @@ select {
 
 .event-item:last-child {
   border-bottom: none;
+}
+
+/* A decision that a later decision overturned. Struck through and dimmed,
+   never hidden: it really was made, and a decision that silently disappeared
+   would read as one that was never taken. The marker spells it out in words
+   as well, so nothing here rests on colour alone (D64). It has to name its
+   own grid column — as the row's fourth child it would otherwise land in
+   column 1 of a second implicit row and drag the whole list out of line. */
+.event-item--superseded .event-msg {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  color: var(--text-3);
+}
+
+.event-superseded {
+  grid-column: 3;
+  font-size: 11px;
+  color: var(--text-3);
 }
 
 .event-time {
@@ -5121,6 +5227,182 @@ select {
   padding-bottom: 8px;
 }
 
+/* ── Agent console (D132) ─────────────────────────────────────────────────── */
+/* Same full-height contract as the terminal view, and for the same reason: a
+   live pane lives here, so the page itself must not scroll — the list column
+   scrolls, and xterm scrolls inside the stage. */
+.view--agents {
+  max-width: none;
+  height: 100%;
+  overflow: hidden;
+  /* `.view`'s 96px bottom padding is scroll runway for a page that scrolls.
+     This one does not, so it would just be dead space under a live pane. */
+  padding: var(--s-8) var(--s-6) var(--s-4);
+  gap: var(--s-3);
+}
+
+.agents-launcher {
+  flex-wrap: wrap;
+}
+
+.agents-launch-project {
+  max-width: 220px;
+}
+
+/* List left, stage right. The terminal gets the wide half because a rich TUI
+   is what usually runs in it — D67 ② rejected tiling precisely because those
+   break below a certain width, and a list column that grew with the window
+   would walk the pane back toward that edge. Hence a fixed-width list. */
+.agents-split {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) 1fr;
+  gap: var(--s-4);
+  flex: 1;
+  min-height: 0;
+}
+
+/* Folded: the pane takes the whole width. The list is how you reach a session,
+   not how you use one, and a rich TUI wants every column it can get. */
+.agents-split--wide {
+  grid-template-columns: 1fr;
+}
+
+.agents-split--wide .agents-list {
+  display: none;
+}
+
+.agents-list {
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.agents-stage {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* The stage's own child carries the pane geometry (.term-pane-host); an empty
+   state instead of a pane should fill the same box rather than sit at its top. */
+.agents-stage > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* A session row in a column that is never wider than 320px.
+   Two things here are the fix for the first walkthrough report of this page
+   (the pop-out and × sat on top of the status chip):
+   - `align-items: flex-start`, so a row whose chips wrapped keeps its actions
+     beside the title instead of floating to the vertical middle;
+   - `.key-item`'s own padding, replaced. Its 16px sides are sized for a
+     full-width panel row and were most of the space the actions needed. */
+.agents-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+}
+
+/* The title gets a line to itself and ellipsises. It used to share an
+   `inline-flex` with the chips (`.tpl-row-name`, borrowed from the template
+   rows) — that class does not wrap, which is fine across a whole panel and is
+   exactly what overflowed a 240px column. */
+/* `.panel-head` is a nowrap row sized for a full-width panel; in a column that
+   is never wider than 320px, a project name plus two buttons does not fit on
+   one line. So the group head wraps and the buttons take their own line —
+   the same narrow-column mistake as the session row above, caught before it
+   reached a screenshot this time. */
+.agents-group .panel-head {
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-bottom: var(--s-2);
+}
+
+.agents-group .panel-title {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agents-group-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex-wrap: wrap;
+}
+
+/* The in-group launch row. Same toolbar as the one at the top of the page, so
+   it inherits its wrapping and spacing; only the inset differs, to read as
+   belonging to this group rather than to the page. */
+.agents-group-launch {
+  margin-bottom: var(--s-2);
+}
+
+.agents-row-title {
+  font-weight: var(--h-row-w);
+  font-size: var(--h-row);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agents-row-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.agents-row.selected {
+  background: var(--surface-2);
+}
+
+/* The row's body is the select control; the actions beside it are their own
+   buttons, so this one may not be a button *containing* buttons. */
+.agents-row-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.agents-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.agents-confirm {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+/* Narrow windows: the pane needs the width more than the list needs to be
+   beside it, so they stack and the list keeps its own scroll. */
+@media (max-width: 900px) {
+  .agents-split {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(120px, 30%) 1fr;
+  }
+}
+
 /* ── Terminal view (D50) ───────────────────────────────────────────────────── */
 /* The terminal takes the full visible height: the page itself doesn't
    scroll, scrolling happens inside xterm.
@@ -5725,10 +6007,10 @@ tr.task-marked td:first-child {
 }
 
 /* ── Shared primitives (D61)─────────────────────────────────────────────────────── */
-/* Long paths: elide the middle, show the full text on hover, copy in one
-   click (product review §4-4). The elision happens in JS — CSS's
-   text-overflow only trims the tail, and the tail is exactly the most
-   recognisable part of a path. */
+/* Long paths: elide the middle, show the full text on hover, and offer the two
+   things one is ever wanted for — open the folder, copy the text (product
+   review §4-4). The elision happens in JS — CSS's text-overflow only trims the
+   tail, and the tail is exactly the most recognisable part of a path. */
 .path-label {
   display: inline-flex;
   align-items: center;
@@ -5743,15 +6025,15 @@ tr.task-marked td:first-child {
   white-space: nowrap;
 }
 
-.path-copy {
+.path-action {
   flex: none;
   padding: 3px;
   opacity: 0;
   transition: opacity var(--dur-micro) var(--ease-std);
 }
 
-.path-label:hover .path-copy,
-.path-copy:focus-visible {
+.path-label:hover .path-action,
+.path-action:focus-visible {
   opacity: 1;
 }
 

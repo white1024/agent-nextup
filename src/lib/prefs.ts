@@ -142,6 +142,45 @@ export function markConnected(root: string): void {
   writeJson(CONNECTED_KEY, [...list, root]);
 }
 
+const TERMINAL_FONT_KEY = "nextup-terminal-font-size";
+
+/** What every terminal rendered at before this preference existed, and what
+ *  Ctrl/⌘ 0 puts one back to. */
+export const TERMINAL_FONT_DEFAULT = 13;
+export const TERMINAL_FONT_MIN = 8;
+export const TERMINAL_FONT_MAX = 32;
+
+/**
+ * Kept inside the range on *read* as well as write. The stored value is one
+ * hand-edit away from being a size at which FitAddon computes zero rows, and a
+ * terminal that opens with no rows looks broken rather than misconfigured.
+ */
+export function clampTerminalFontSize(px: number): number {
+  if (!Number.isFinite(px)) return TERMINAL_FONT_DEFAULT;
+  return Math.min(TERMINAL_FONT_MAX, Math.max(TERMINAL_FONT_MIN, Math.round(px)));
+}
+
+/**
+ * Terminal font size in px, adjusted with Ctrl/⌘ +/− on the terminal itself.
+ *
+ * App-level rather than per-workspace: this is a fact about this person's eyes,
+ * not about a project, so it follows them into every workspace and every
+ * pop-out window — the same reasoning as theme and language.
+ */
+export function terminalFontSize(): number {
+  const raw = readJson<unknown>(TERMINAL_FONT_KEY, TERMINAL_FONT_DEFAULT);
+  return clampTerminalFontSize(typeof raw === "number" ? raw : TERMINAL_FONT_DEFAULT);
+}
+
+/** Returns what was actually stored, which is the clamped value — callers apply
+ *  that rather than what they asked for, so a keypress at the limit is a no-op
+ *  instead of a silent drift between screen and storage. */
+export function setTerminalFontSize(px: number): number {
+  const next = clampTerminalFontSize(px);
+  writeJson(TERMINAL_FONT_KEY, next);
+  return next;
+}
+
 const TERMINAL_ACTIVE_KEY = "nextup-terminal-active";
 
 /**
@@ -164,4 +203,40 @@ export function rememberActiveTerminal(root: string, id: number): void {
   const map = readJson<Record<string, number>>(TERMINAL_ACTIVE_KEY, {});
   if (map[root] === id) return;
   writeJson(TERMINAL_ACTIVE_KEY, { ...map, [root]: id });
+}
+
+const CONSOLE_SESSION_KEY = "nextup-console-session";
+
+/**
+ * The session the agent console had selected (D133). Not per-root, unlike
+ * `lastActiveTerminal` above: the console's whole point is that the selection
+ * crosses projects, so keying it by workspace would be keying it by the one
+ * thing it deliberately ignores.
+ *
+ * Machine-local and forgettable — a stale id simply loses the race against
+ * "pick the first running session", which is where the page started anyway.
+ */
+export function lastConsoleSession(): number | null {
+  const id = readJson<number | null>(CONSOLE_SESSION_KEY, null);
+  return typeof id === "number" ? id : null;
+}
+
+export function rememberConsoleSession(id: number): void {
+  if (lastConsoleSession() === id) return;
+  writeJson(CONSOLE_SESSION_KEY, id);
+}
+
+const CONSOLE_WIDE_KEY = "nextup-console-wide";
+
+/**
+ * Whether the console hides its session list to give the pane the full width
+ * (D133). A rich TUI is the usual occupant and they need columns; the list is
+ * how you get to a session, not how you use one, so it is foldable.
+ */
+export function consoleWide(): boolean {
+  return readJson<boolean>(CONSOLE_WIDE_KEY, false) === true;
+}
+
+export function setConsoleWide(wide: boolean): void {
+  writeJson(CONSOLE_WIDE_KEY, wide);
 }

@@ -31,6 +31,13 @@ Write the artifacts (proposal and design as free prose, which the engine does no
 
 **Folding is the engine's job — do not edit the main spec yourself to "keep it in sync".** If a human edited the main spec first that is fine too; the engine treats an already-synced edit as a no-op.
 
+**Someone else may be editing the same requirement.** `validate_task_specs` also reports `overlaps` — requirements another task's delta changes too. Two shapes, and the difference matters:
+
+- The other task **has already folded**: your delta rewrites text that is no longer current, and archiving will be refused. MODIFIED is a full rewrite, so folding it anyway would silently discard their wording. Re-read `specs/<capability>/spec.md`, then rewrite your block so it carries **both** needs — theirs is already the truth, yours is the change being added to it.
+- The other task **has not folded yet**: nothing is broken, but whoever archives first sets the text and the other will then be refused. Settle it now while both deltas are still being written: agree on one wording, put it in one of the two deltas, and drop it from the other. This is much cheaper than discovering it at archive time, which is why the dry-run says so here.
+
+**Do not route this to the user.** Deltas are yours to write; a person being asked to hand-edit one is a sign something went wrong upstream. The app does offer them a way to give up a contested requirement outright, but that is a last resort and it throws your work away.
+
 **Where your reach ends: the delta.** Writing it is the whole of your job here, and nothing you do will change `specs/` — folding is triggered by archiving, archiving follows the user's verification, and neither is a tool you hold. (`specs/` can still change *around* you: a human may archive a task, or the app's auto-archive sweep may fold one when the workspace is opened. Re-read with `get_spec` rather than assuming it is as you last saw it.) So a session that finishes its delta and reports "the delta is written and ready to fold" has finished; do not go looking for a way to make `specs/` reflect it, and do not edit the main spec by hand to close the gap. `validate_task_specs` is how you confirm the delta will fold cleanly when the time comes — that is the strongest statement available to you, and it is enough.
 
 When a fold is refused for conflicts: fix the delta (comparing against the current state with `get_spec` where needed) and ask the user to archive again. `workspace_doctor` lists every task that will not fold and why.

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -15,10 +15,13 @@ import EmptyState from "../components/EmptyState";
 import TeachingHint from "../components/TeachingHint";
 import { IconPopout, IconStopSquare, IconX } from "../components/icons";
 import {
+  TERMINAL_FONT_DEFAULT,
   lastActiveTerminal,
   recentIdentities,
   rememberActiveTerminal,
   rememberIdentity,
+  setTerminalFontSize,
+  terminalFontSize,
 } from "../lib/prefs";
 import { getThemeMode } from "../theme";
 import type {
@@ -31,6 +34,16 @@ import type {
 const OUTPUT_EVENT = "terminal://output";
 const EXIT_EVENT = "terminal://exit";
 const SESSIONS_EVENT = "terminal://sessions";
+
+/** Cross-window broadcast for the terminal font size, mirroring THEME_EVENT:
+ *  the size is machine-wide, so changing it in one pane must resize the other
+ *  tabs and every pop-out too. Carries no payload — listeners re-read the
+ *  preference themselves, so there is one source of truth and no ordering
+ *  question between the stored value and the message.
+ *
+ *  Unlike its `terminal://` siblings above this one is emitted by the frontend,
+ *  never by Rust: no PTY is involved in how large the glyphs are. */
+const FONT_EVENT = "terminal://font-size";
 
 /**
  * How long the two-step close stays armed (2026-08-01 UI review, P2 2-1).
@@ -227,10 +240,9 @@ export default function TerminalView({
       // flips to running and the card → live-pane swap (a different element at
       // the same key) remounts a fresh xterm. `attemptedRevive` guards the
       // on-view auto-fire; a manual retry re-enters here directly.
-      attemptedRevive.add(s.id);
       setReviving((cur) => ({ ...cur, [s.id]: "loading" }));
       try {
-        const meta = await api.terminalRevive(s.id);
+        const meta = await reviveSession(s.id);
         setSessions((cur) => (cur ?? []).map((x) => (x.id === meta.id ? meta : x)));
         setReviving((cur) => {
           const next = { ...cur };
@@ -261,49 +273,15 @@ export default function TerminalView({
   }, [activeSession, agents, doRevive]);
 
   async function popOut(s: TerminalSessionMeta) {
-    // Render this session in its own OS window (B16-C). The session lives in
-    // Rust and its output is broadcast to every window, so the pop-out is just
-    // another renderer. Move semantics: mark it popped out so the main window
-    // shows a placeholder rather than a second live pane (which would
-    // double-feed the PTY).
-    const label = `terminal-popout-${s.id}`;
     try {
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        await existing.setFocus();
-        return;
-      }
-      await api.terminalSetPoppedOut(s.id, true);
-      // Pin the native title bar from birth when the app theme is explicit —
-      // boot-time applyThemeMode repaints it anyway, this only avoids a flash.
-      const mode = getThemeMode();
-      // Project first: the taskbar and alt-tab truncate from the *end*, and
-      // every other part of this string is shared by every pop-out of the same
-      // agent — a title that starts with "Claude Code" tells the user which
-      // app the window belongs to and nothing they didn't already know.
-      const project = projectName || baseName(root);
-      const win = new WebviewWindow(label, {
-        url: `index.html?popout=${s.id}`,
-        title: `${project} · ${s.title} — Agent NextUp`,
-        width: 900,
-        height: 640,
-        ...(mode === "system" ? {} : { theme: mode }),
-      });
-      void win.once("tauri://error", (e) => setError(String(e.payload)));
+      await popOutSession(s, projectName || baseName(root), setError);
     } catch (e) {
       setError(errorMessage(e));
     }
   }
 
   async function dockBack(s: TerminalSessionMeta) {
-    // Bring the session back into the main window by closing its pop-out
-    // (whose close handler clears the flag); fall back to clearing it directly.
-    const win = await WebviewWindow.getByLabel(`terminal-popout-${s.id}`);
-    if (win) {
-      await win.close();
-    } else {
-      await api.terminalSetPoppedOut(s.id, false).catch(() => {});
-    }
+    await dockBackSession(s.id);
   }
 
   // Disarm on a timer, and on moving to another tab. Both are the same rule:
@@ -584,22 +562,122 @@ export default function TerminalView({
   );
 }
 
+/**
+ * Render a session in its own OS window (B16-C), or focus the window it
+ * already has.
+ *
+ * Move semantics: the session is marked popped out so whichever surface listed
+ * it shows a placeholder rather than a second live pane — two panes on one
+ * session would double-feed the PTY.
+ *
+ * Exported alongside `TerminalPane` because the cross-project agent overview
+ * raises the same windows (D132). It takes the project name rather than
+ * looking it up: the workspace terminal already knows it, and the overview
+ * resolves it from the registry the way the pop-out window itself does.
+ */
+export async function popOutSession(
+  s: TerminalSessionMeta,
+  projectName: string,
+  onWindowError?: (message: string) => void,
+): Promise<void> {
+  const label = `terminal-popout-${s.id}`;
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) {
+    await existing.setFocus();
+    return;
+  }
+  await api.terminalSetPoppedOut(s.id, true);
+  // Pin the native title bar from birth when the app theme is explicit —
+  // boot-time applyThemeMode repaints it anyway, this only avoids a flash.
+  const mode = getThemeMode();
+  // Project first: the taskbar and alt-tab truncate from the *end*, and
+  // every other part of this string is shared by every pop-out of the same
+  // agent — a title that starts with "Claude Code" tells the user which
+  // app the window belongs to and nothing they didn't already know.
+  const win = new WebviewWindow(label, {
+    url: `index.html?popout=${s.id}`,
+    title: `${projectName} · ${s.title} — Agent NextUp`,
+    width: 900,
+    height: 640,
+    ...(mode === "system" ? {} : { theme: mode }),
+  });
+  void win.once("tauri://error", (e) => onWindowError?.(String(e.payload)));
+}
+
+/** Bring a popped-out session back into the app window by closing its window
+ *  (whose close handler clears the flag); falls back to clearing it directly
+ *  if the window is already gone. */
+/**
+ * Relaunch the agent into the SAME session id, reattaching its conversation
+ * (D69). Exported so the agent console can offer it too (D133) — and exported
+ * *with* the `attemptedRevive` bookkeeping rather than beside it, so the
+ * console's manual retry and this view's on-view auto-fire share one record of
+ * "already tried". Two independent records is how the same dead session gets
+ * relaunched twice.
+ *
+ * The console only ever calls this from a button. The automatic firing stays
+ * here, where "the tab is in view" is what the mount means.
+ */
+export async function reviveSession(id: number): Promise<TerminalSessionMeta> {
+  attemptedRevive.add(id);
+  return api.terminalRevive(id);
+}
+
+export async function dockBackSession(id: number): Promise<void> {
+  const win = await WebviewWindow.getByLabel(`terminal-popout-${id}`);
+  if (win) {
+    await win.close();
+  } else {
+    await api.terminalSetPoppedOut(id, false).catch(() => {});
+  }
+}
+
 /** One xterm instance bound to one session for this mount's lifetime.
  *  Inactive panes stay laid out (visibility:hidden) so xterm always has
  *  real dimensions and keeps rendering incoming output. Exported because the
  *  pop-out window (B16-C) reuses it — the session lives in Rust and its output
  *  is broadcast to every window, so this renderer is window-agnostic. */
-export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; active: boolean }) {
+export function TerminalPane({
+  meta,
+  active,
+  role = "tabpanel",
+  label,
+}: {
+  meta: TerminalSessionMeta;
+  active: boolean;
+  /** `tabpanel` where the pane really is one of a tablist's panels (the
+   *  workspace terminal's tabs). The agent overview selects from a list of
+   *  sessions, not a tablist, so it passes `region` and a label — claiming a
+   *  tabpanel with no tablist above it is a lie a screen reader acts on. */
+  role?: "tabpanel" | "region";
+  label?: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+
+  /** Put a font size on screen and tell the PTY what it did to the geometry.
+   *
+   *  The cell size changes, so the row and column counts change with it —
+   *  fit() emits onResize, which is already wired to terminalResize. The
+   *  zero-size guard is the same one fitNow() carries and for the same reason:
+   *  fitting a collapsed box pins the terminal to FitAddon's 2x1 minimum, and
+   *  growing back does not undo what the PTY was already told. */
+  const applyFontSize = useCallback((px: number) => {
+    const term = termRef.current;
+    const node = containerRef.current;
+    if (!term || term.options.fontSize === px) return;
+    term.options.fontSize = px;
+    if (!node || node.clientHeight === 0 || node.clientWidth === 0) return;
+    fitRef.current?.fit();
+  }, []);
 
   useEffect(() => {
     const node = containerRef.current;
     if (!node) return;
     const term = new XTerm({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: terminalFontSize(),
       fontFamily: "'Cascadia Mono', Consolas, 'Courier New', monospace",
       scrollback: 5000,
       theme: TERM_THEME,
@@ -614,6 +692,38 @@ export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; acti
     term.open(node);
     termRef.current = term;
     fitRef.current = fit;
+
+    // Ctrl/⌘ +/− resizes the font, Ctrl/⌘ 0 restores it — the binding every
+    // terminal emulator uses, and the one the webview does not provide: Tauri
+    // ships with zoom hotkeys off (`zoomHotkeysEnabled` defaults to false), so
+    // before this the gesture did nothing anywhere in the app.
+    //
+    // It goes through xterm's own handler rather than a window listener because
+    // xterm binds keydown on its hidden textarea in the *capture* phase and
+    // stops propagation (the same reason App.tsx's Ctrl+K is bound on bubble) —
+    // a listener outside would never see these. Returning false is what keeps
+    // the keystroke from also going down the PTY.
+    //
+    // Plain `-` only, never `_`: with shift that key is readline's undo
+    // (Ctrl+_), and shadowing an editing command to reach a display preference
+    // is a bad trade. `=` and `+` both zoom in, since `+` needs shift on most
+    // layouts and typing it unshifted is the common case.
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== "keydown" || ev.altKey || !(ev.ctrlKey || ev.metaKey)) return true;
+      const size = term.options.fontSize ?? TERMINAL_FONT_DEFAULT;
+      let next: number | null = null;
+      if (ev.key === "+" || ev.key === "=") next = size + 1;
+      else if (ev.key === "-") next = size - 1;
+      else if (ev.key === "0") next = TERMINAL_FONT_DEFAULT;
+      if (next === null) return true;
+      ev.preventDefault();
+      // Apply what storage clamped to, not what we asked for, so holding the
+      // key at either limit changes nothing rather than drifting the stored
+      // value away from what is on screen.
+      applyFontSize(setTerminalFontSize(next));
+      void emit(FONT_EVENT).catch(() => {});
+      return false;
+    });
 
     // The one and only input path: focused-terminal keystrokes. Writes to an
     // exited session fail with kind "terminal" — expected, swallowed.
@@ -670,6 +780,20 @@ export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; acti
       fitRef.current = null;
     };
   }, [meta.id]);
+
+  // Follow the size when another pane changes it. Every mounted pane listens,
+  // so the other tabs in this window and every pop-out resize together — the
+  // preference is machine-wide, and two terminals side by side at different
+  // sizes would read as a bug.
+  //
+  // Not gated on `active`: an inactive pane stays laid out and keeps rendering,
+  // so it has to be correct before it is looked at, not when.
+  useEffect(() => {
+    const un = listen(FONT_EVENT, () => applyFontSize(terminalFontSize()));
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [applyFontSize]);
 
   // Fit on activation and on container resizes (only while visible: a
   // hidden pane keeps its last geometry, and fitting a 0-size box is what
@@ -765,7 +889,8 @@ export function TerminalPane({ meta, active }: { meta: TerminalSessionMeta; acti
     <div
       ref={containerRef}
       className={`term-pane ${active ? "" : "term-pane-hidden"}`}
-      role="tabpanel"
+      role={role}
+      aria-label={label}
     />
   );
 }

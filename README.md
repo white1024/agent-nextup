@@ -41,6 +41,7 @@ Any body of work — software, research, a side business, life planning — into
 
 - **Files are the whole product.** No database. Snapshots and search indexes are rebuildable derivatives; the ledger is append-only and is the audit record. If Agent NextUp vanished tomorrow, your project would still be readable.
 - **Gates you cannot mark yourself.** `min_tasks(n)`, `all_tasks_done`, `artifact_exists(path)` and the rest are computed from disk, never self-reported. `manual_confirm` is the inverse — only a human can satisfy it, and no tool exists for an agent to do so. Forcing any gate demands a reason and is written to the ledger. ([the full set](https://white1024.github.io/agent-nextup/gates/))
+- **A reversed decision says so.** Decisions carry ids, and one that overturns an earlier decision names it. The old decision is kept and shown struck through as `SUPERSEDED` — never edited, never removed, because the ledger is append-only and a decision that quietly vanished would read as one that was never made. The next session can see both what was decided and that it no longer holds.
 - **A handoff that is never stale.** The snapshot regenerates on task, decision, milestone, and phase changes, so it is never older than your last action.
 - **Claimed done is not done.** Completing a task records a claim; verification is a separate mark that *requires* evidence, and the bulk archive sweep collects only verified work, deliberately leaving the rest on the list where you can see it.
 - **Agent reach is an allowlist.** One master switch decides whether agents reach the hub at all; with it on, read-only tools need no further setup, and writes are authorised per tool, with the gatekeeping ones off by default. Every call — including denied ones — lands in the ledger.
@@ -194,7 +195,7 @@ See [reference/building](https://white1024.github.io/agent-nextup/reference/buil
 
 ## Status
 
-In active development. The [releases page](https://github.com/white1024/agent-nextup/releases) carries unsigned pre-release builds for three platforms, with no auto-update yet — take the newest. On macOS, do not take `v0.1.0`: that build predates the ad-hoc signature and will not open at all.
+In active development. The [releases page](https://github.com/white1024/agent-nextup/releases) carries unsigned pre-release builds for three platforms, with no auto-update yet — take the newest.
 
 **Working** — the workspace engine and disk contract; the phase/gate harness and its built-in templates; the handoff layer; the hub MCP server with per-tool authorisation; the embedded agent terminal, including custom CLI entries carrying environment variables, which is how you point one at a local model; adopting an existing project through a wizard that analyses read-only and never overwrites; milestones; full-text search; portable backups. As opt-in modules: collaboration, teams and cross-project delivery, team coordination, and the spec layer.
 

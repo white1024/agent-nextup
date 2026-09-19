@@ -7,6 +7,7 @@
 //! readers skip).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -119,6 +120,26 @@ pub struct LedgerEvent {
     pub from: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<TaskStatus>,
+    /// ── Decision identity and supersession ──
+    /// Stable id for a `Decision` line (`D-0001` family, workspace-local like
+    /// tasks and milestones). Only decisions carry one: a decision is the one
+    /// ledger line a later line needs to be able to point *at*. Optional and
+    /// absent on pre-feature lines, same zero-migration shape as the D75
+    /// fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The decision id this decision overturns. Set on the NEW line, never on
+    /// the old one — the ledger is append-only, so supersession is recorded
+    /// the way every other fact here is recorded: by appending. Readers
+    /// project the set of superseded ids with [`superseded_ids`].
+    ///
+    /// This is deliberately not the delivery-envelope shape (D87), where the
+    /// engine stamps `superseded_by` onto the old envelope in the same lock.
+    /// An envelope is a mutable JSON file; a ledger line is history, and
+    /// going back to edit one would break the audit property that makes the
+    /// ledger worth having.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 /// How a hub tool attempt ended (D75) — structured mirror of the
@@ -312,6 +333,8 @@ impl LedgerEvent {
             reason: None,
             from: None,
             to: None,
+            id: None,
+            supersedes: None,
         }
     }
 
@@ -349,6 +372,50 @@ impl LedgerEvent {
         self.to = Some(to);
         self
     }
+
+    /// Stamp a decision's own id.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Stamp the id of the decision this one overturns.
+    pub fn superseding(mut self, target: Option<String>) -> Self {
+        self.supersedes = target;
+        self
+    }
+}
+
+/// Prefix of the workspace-local decision id family (`D-0001`), alongside
+/// `T-` for tasks, `M-` for milestones and `L-` for lessons.
+pub const DECISION_ID_PREFIX: &str = "D-";
+
+/// Which decisions have been overturned, and by which later decisions.
+///
+/// Projected from the append-only lines rather than stored, because the ledger
+/// cannot be edited in place. This is the read side of
+/// [`LedgerEvent::supersedes`], and it is NOT the mistake D87 ⑦ warns about
+/// ("可算不代表該算，算出來的東西會在來源消失時一起消失"): a ledger line never
+/// disappears, which is the whole contract of the file. The envelope case
+/// computed from a mutable outbox, where the source really could vanish.
+///
+/// Values keep every superseding decision, not just the newest: two sessions
+/// can each overturn the same decision for different reasons, and dropping one
+/// would hide a real event. Chronological order, like the ledger itself.
+pub fn supersession<'a>(
+    events: impl IntoIterator<Item = &'a LedgerEvent>,
+) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for e in events {
+        if e.kind != LedgerKind::Decision {
+            continue;
+        }
+        let (Some(target), Some(by)) = (e.supersedes.as_deref(), e.id.as_deref()) else {
+            continue;
+        };
+        map.entry(target.to_string()).or_default().push(by.to_string());
+    }
+    map
 }
 
 /// Per-entry display cap on takeover surfaces (D78). Lenses render at most
@@ -391,6 +458,16 @@ pub struct LedgerPage {
     /// Matches under the active filter across the whole ledger (not just
     /// this page), so callers know whether more remain.
     pub total: usize,
+    /// For each decision ON THIS PAGE that a later decision overturned, the
+    /// ids that overturned it.
+    ///
+    /// Computed by the engine over the whole ledger, and it has to be: a
+    /// superseding decision is NEWER than the one it supersedes, so on a
+    /// newest-first page 2 the reversal sits back on page 1. A consumer
+    /// projecting over the rows it can see would show a dead decision as
+    /// live — the failure would look like nothing at all, which is the worst
+    /// kind. Restricted to this page's ids so the payload stays page-sized.
+    pub superseded: HashMap<String, Vec<String>>,
 }
 
 /// One tail read from a caller-held line cursor (D62), for surfaces that must
@@ -494,16 +571,25 @@ impl Ledger {
         limit: usize,
     ) -> Result<LedgerPage> {
         let limit = limit.min(HISTORY_LIMIT_MAX);
-        let matches: Vec<LedgerEvent> = self
-            .read_all()?
+        let all = self.read_all()?;
+        // Free: this read is already the whole file, so the projection costs
+        // nothing beyond the walk it would take anyway.
+        let overturned = supersession(&all);
+        let matches: Vec<LedgerEvent> = all
             .into_iter()
             .rev()
             .filter(|e| !e.kind.is_noise())
             .filter(|e| kinds.is_none_or(|ks| ks.contains(&e.kind)))
             .collect();
         let total = matches.len();
-        let events = matches.into_iter().skip(offset).take(limit).collect();
-        Ok(LedgerPage { events, total })
+        let events: Vec<LedgerEvent> = matches.into_iter().skip(offset).take(limit).collect();
+        let superseded = events
+            .iter()
+            .filter_map(|e| e.id.as_deref())
+            .filter_map(|id| overturned.get_key_value(id))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Ok(LedgerPage { events, total, superseded })
     }
 
     /// Last `limit` events of the given kind, chronological order.
@@ -524,6 +610,28 @@ impl Ledger {
     /// the recent tail.
     pub fn all(&self) -> Result<Vec<LedgerEvent>> {
         self.read_all()
+    }
+
+    /// Every decision line, chronological.
+    pub fn decisions(&self) -> Result<Vec<LedgerEvent>> {
+        Ok(self.read_all()?.into_iter().filter(|e| e.kind == LedgerKind::Decision).collect())
+    }
+
+    /// The decision carrying `id`, if there is one.
+    pub fn decision(&self, id: &str) -> Result<Option<LedgerEvent>> {
+        Ok(self.decisions()?.into_iter().find(|e| e.id.as_deref() == Some(id)))
+    }
+
+    /// Allocate the next `D-` id. Reads the whole file, like every other read
+    /// here — recording a decision is a rare, human-paced act, and the same
+    /// `mutate` that appends it already regenerates the snapshot from the
+    /// ledger anyway.
+    pub fn next_decision_id(&self) -> Result<String> {
+        let ids: Vec<String> = self.decisions()?.into_iter().filter_map(|e| e.id).collect();
+        Ok(crate::workspace::ids::next_seq_id(
+            DECISION_ID_PREFIX,
+            ids.iter().map(String::as_str),
+        ))
     }
 
     /// Events appended after a caller-held line cursor (D62).

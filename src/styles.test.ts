@@ -63,6 +63,51 @@ describe("styles.css token references", () => {
 });
 
 /**
+ * `text-overflow: ellipsis` must not sit on a flex or grid container.
+ *
+ * It applies to a block container's *inline* content. Put it on a flex
+ * container and the children are flex items, not inline content, so it does
+ * nothing at all — no error, no warning, and the rule reads as if truncation is
+ * handled. `.wf-pill` carried one from the day it was written; what actually
+ * happened when the workflow strip ran out of room was that phase names were
+ * cut mid-glyph, so step 3 of a six-phase template read "3 S" (reported
+ * 2026-08-12 while testing the interface scale).
+ *
+ * The same shape as the token guard above: a declaration that silently does
+ * nothing, invisible to the browser, tsc and the build alike — so it is checked
+ * rather than left to be spotted.
+ */
+describe("styles.css truncation", () => {
+  /** Every `selector { body }` in the sheet, comments stripped so a commented
+   *  example cannot be mistaken for a live declaration. */
+  function rules(sheet: string): { selector: string; body: string }[] {
+    const clean = sheet.replace(/\/\*[\s\S]*?\*\//g, "");
+    return [...clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({
+      selector: m[1].trim().split("\n").pop()!.trim(),
+      body: m[2],
+    }));
+  }
+
+  it("finds rules to check", () => {
+    // The guard is only meaningful while the parse still works.
+    const all = rules(css);
+    expect(all.length).toBeGreaterThan(200);
+    expect(all.some((r) => /text-overflow:\s*ellipsis/.test(r.body))).toBe(true);
+  });
+
+  it("no rule declares text-overflow on a flex or grid container", () => {
+    const dead = rules(css)
+      .filter(
+        (r) =>
+          /text-overflow:\s*ellipsis/.test(r.body) &&
+          /display:\s*(inline-)?(flex|grid)/.test(r.body),
+      )
+      .map((r) => r.selector);
+    expect(dead, "text-overflow is inert on a flex/grid container").toEqual([]);
+  });
+});
+
+/**
  * The element handed to `term.open()` must carry no padding of its own.
  *
  * FitAddon sizes the terminal from `getComputedStyle(parentElement).height`,

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { api, errorMessage } from "../api";
+import { api, errorKind, errorMessage } from "../api";
 import { useFlash, useGuardedMutation, useWorkspaceData } from "../hooks";
 import { setVerifyNudgeEnabled, verifyNudgeEnabled } from "../lib/prefs";
 import { useFreshKeys } from "../hooks/anim";
@@ -18,7 +18,7 @@ import {
   IconTrash,
   IconWarn,
 } from "../components/icons";
-import type { Task, TaskStatus, WorkspaceSettings } from "../types";
+import type { SpecOverlap, Task, TaskStatus, TaskUpdate, WorkspaceSettings } from "../types";
 import ConfirmDanger from "../components/ConfirmDanger";
 
 interface Props {
@@ -136,6 +136,13 @@ export default function Tasks({
 
   // Inline "verification evidence" prompt for one done task at a time
   const [verifyTarget, setVerifyTarget] = useState<string | null>(null);
+  // The archive was refused because a newer task already folded the same
+  // requirement (D129). Held here rather than shown as an error, because the
+  // user has a real choice to make.
+  const [foldConflict, setFoldConflict] = useState<{
+    id: string;
+    overlaps: SpecOverlap[];
+  } | null>(null);
   const [verifyNote, setVerifyNote] = useState("");
 
   // The done≠verified teaching moment: shown once per completion, inline on the
@@ -341,20 +348,46 @@ export default function Tasks({
       setNudgeTarget(null);
     });
 
+  function announceFold(updated: TaskUpdate) {
+    // Archiving may fold delta specs (D79) — surface the outcome so the
+    // spec-layer write is never silent.
+    if (!updated.specFold) return;
+    const s = updated.specFold;
+    showFlash(
+      t("tasks.foldedHint", {
+        caps: s.capabilities.join(", "),
+        counts: `+${s.added} ~${s.modified} -${s.removed} →${s.renamed}`,
+      }),
+    );
+    // What was given up is louder than what was applied: it is the one part
+    // of the fold nobody asked the engine to do (D129).
+    if (s.skipped?.length) {
+      showFlash(t("tasks.foldSkippedHint", { names: s.skipped.join(", ") }));
+    }
+  }
+
   const applyArchived = (id: string, archived: boolean) =>
     guarded(async () => {
-      const updated = await api.setTaskArchived(id, archived);
-      // Archiving may fold delta specs (D79) — surface the outcome so the
-      // spec-layer write is never silent.
-      if (updated.specFold) {
-        const s = updated.specFold;
-        showFlash(
-          t("tasks.foldedHint", {
-            caps: s.capabilities.join(", "),
-            counts: `+${s.added} ~${s.modified} -${s.removed} →${s.renamed}`,
-          }),
-        );
+      try {
+        announceFold(await api.setTaskArchived(id, archived));
+      } catch (e) {
+        if (errorKind(e) !== "spec_fold_conflict") throw e;
+        // A fold conflict is the one archive failure with a real choice behind
+        // it, so it gets a dialog instead of the error strip. The structured
+        // overlaps come from the dry-run rather than being parsed back out of
+        // the message — the message is for reading, not for machines.
+        const report = (await api.pendingSpecFolds()).find((r) => r.taskId === id);
+        const blocking = (report?.overlaps ?? []).filter((o) => o.otherFolded && o.otherNewer);
+        if (blocking.length === 0) throw e;
+        setFoldConflict({ id, overlaps: blocking });
       }
+    });
+
+  const archiveGivingUp = (id: string, overlaps: SpecOverlap[]) =>
+    guarded(async () => {
+      const skip: [string, string][] = overlaps.map((o) => [o.capability, o.requirement]);
+      announceFold(await api.archiveTaskSkippingSpecs(id, skip));
+      setFoldConflict(null);
     });
 
   const sweepArchive = () =>
@@ -930,6 +963,46 @@ export default function Tasks({
                 onClick={() => void saveEdit()}
               >
                 {saving ? t("tasks.saving") : t("tasks.save")}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {foldConflict && (
+        <Modal label={t("tasks.foldConflictTitle")} onClose={() => setFoldConflict(null)}>
+          <div className="form">
+            <h2 className="form-heading">{t("tasks.foldConflictTitle")}</h2>
+            <p className="muted">{t("tasks.foldConflictHint")}</p>
+            <ul className="fold-conflict-list">
+              {foldConflict.overlaps.map((o) => (
+                <li key={`${o.capability}/${o.requirement}`}>
+                  <code>{o.requirement}</code>
+                  <span className="muted">
+                    {" "}
+                    {t("tasks.foldConflictRow", {
+                      capability: o.capability,
+                      task: o.otherTask,
+                    })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {/* Two real options, and the recommended one is first: the agent
+                that wrote the delta is the one that can merge both needs. The
+                second is here so deciding "this task's wording is obsolete"
+                never requires hand-editing a delta file. */}
+            <p>{t("tasks.foldConflictAsk")}</p>
+            <div className="form-actions">
+              <button className="btn" onClick={() => setFoldConflict(null)}>
+                {t("tasks.foldConflictLeave")}
+              </button>
+              <button
+                className="btn danger-trigger"
+                disabled={mutating}
+                onClick={() => void archiveGivingUp(foldConflict.id, foldConflict.overlaps)}
+              >
+                {t("tasks.foldConflictGiveUp")}
               </button>
             </div>
           </div>

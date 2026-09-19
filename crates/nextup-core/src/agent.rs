@@ -118,6 +118,12 @@ pub const TOOLS: &[ToolMeta] = &[
     read("post_mortem_candidates", None),
     read("list_deliveries", Some(MODULE_TEAM)),
     read("get_delivery", Some(MODULE_TEAM)),
+    // Bound to the TEAM module, not prime, despite sitting next to the
+    // `team_*` family below — that prefix marks the coordinator's tools. This
+    // one answers "who is downstream of me", which every member needs in order
+    // to write a delivery note for its receiver (D128), and it is read-only:
+    // knowing the roster is still not permission to route anything.
+    read("list_teammates", Some(MODULE_TEAM)),
     read("team_overview", Some(MODULE_PRIME)),
     read("team_member_status", Some(MODULE_PRIME)),
     read("team_list_deliveries", Some(MODULE_PRIME)),
@@ -569,8 +575,9 @@ mod tests {
         assert_eq!(
             READ_TOOLS.join(" "),
             "workspace_status list_tasks get_task workflow_status search_workspace build_index \
-             workspace_doctor post_mortem_candidates list_deliveries get_delivery team_overview \
-             team_member_status team_list_deliveries list_specs get_spec validate_task_specs"
+             workspace_doctor post_mortem_candidates list_deliveries get_delivery list_teammates \
+             team_overview team_member_status team_list_deliveries list_specs get_spec \
+             validate_task_specs"
         );
         assert_eq!(
             WRITE_TOOLS.join(" "),
