@@ -229,6 +229,11 @@ pub enum LedgerKind {
     /// A delivery envelope arrived in this workspace's inbox, routed from a
     /// team upstream (D48). Written on the downstream side.
     DeliveryReceived,
+    /// A person edited the project's description, goals, boundaries or domain
+    /// from the GUI (D142). Which fields changed live in the message. Goals and
+    /// boundaries are the rules agents work under, so a change to them is
+    /// worth a line the next session reads.
+    ContextEdited,
 }
 
 impl LedgerKind {
@@ -268,6 +273,7 @@ impl LedgerKind {
         LedgerKind::DeliveryPublished,
         LedgerKind::DeliveryRouted,
         LedgerKind::DeliveryReceived,
+        LedgerKind::ContextEdited,
     ];
 
     /// The wire name (serde snake_case) — kept honest by a test that compares
@@ -305,6 +311,7 @@ impl LedgerKind {
             LedgerKind::DeliveryPublished => "delivery_published",
             LedgerKind::DeliveryRouted => "delivery_routed",
             LedgerKind::DeliveryReceived => "delivery_received",
+            LedgerKind::ContextEdited => "context_edited",
         }
     }
 

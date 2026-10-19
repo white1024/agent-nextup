@@ -231,6 +231,44 @@ fn save(path: &Path, mut file: TeamsFile) -> Result<()> {
     atomic_write_json(path, &file)
 }
 
+/// Why `given` names no member of `team`, worded for the agent that sent it.
+///
+/// The usual mistake is a project *name* where a workspace id belongs — the
+/// prime-e2e run (2026-08) hit it on `team_set_edge` and `team_route`. The old
+/// wording, "is not a member", reads as a membership problem and points at the
+/// wrong fix; this names the parameter and hands back the id. Otherwise it
+/// lists who *is* in the team, so the next call can be right.
+pub fn not_a_member_message(team: &Team, given: &str) -> String {
+    let wanted = given.trim();
+    if let Some(m) = team.members.iter().find(|m| m.name.trim().eq_ignore_ascii_case(wanted)) {
+        return format!(
+            "\"{wanted}\" is a project name, but this parameter takes a workspace id — \
+             {} in team \"{}\" has workspace id {}",
+            m.name, team.name, m.workspace_id
+        );
+    }
+    let members = if team.members.is_empty() {
+        "none yet".to_string()
+    } else {
+        team.members
+            .iter()
+            .map(|m| format!("{} ({})", m.name, m.workspace_id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("workspace {wanted} is not a member of team \"{}\" — members: {members}", team.name)
+}
+
+/// `/` → `\` on Windows; untouched elsewhere, where a backslash is an ordinary
+/// file-name character and must not be rewritten.
+fn native_separators(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
 fn team_mut<'a>(file: &'a mut TeamsFile, team_id: &str) -> Result<&'a mut Team> {
     file.teams
         .iter_mut()
@@ -406,10 +444,7 @@ pub fn add_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<()> 
         }
         for endpoint in [from, to] {
             if !team.members.iter().any(|m| m.workspace_id == endpoint) {
-                return Err(NextUpError::InvalidInput(format!(
-                    "workspace {endpoint} is not a member of team \"{}\"",
-                    team.name
-                )));
+                return Err(NextUpError::InvalidInput(not_a_member_message(team, endpoint)));
             }
         }
         if team.edges.iter().any(|e| e.from == from && e.to == to) {
@@ -563,7 +598,12 @@ pub fn create_member(
     params.create_root = true;
 
     let context = crate::workspace::init::initialize_project(&params, keys, app_version)?;
-    let root = params.root.trim().to_string();
+    // Stored the way the platform writes paths. The hub passes through whatever
+    // the agent typed — forward slashes on Windows in the prime-e2e run — while
+    // the GUI's folder dialog returns native ones, so the registry and the team
+    // graph showed one kind of thing two ways. Registry dedupe already compares
+    // normalised roots; this is the copy every surface displays.
+    let root = native_separators(params.root.trim());
     let workspace_id = context.workspace_id.clone().ok_or_else(|| {
         NextUpError::Workspace("the new workspace was created without a stable id".into())
     })?;
@@ -705,6 +745,27 @@ mod tests {
         assert_eq!(b_sees, vec![("a", false), ("c", false)], "the edge does not run backwards");
     }
 
+    /// A project name where a workspace id belongs gets told so, with the id —
+    /// the prime-e2e run's coordinator read "is not a member" as a membership
+    /// problem and had to dig the id out of `team_overview` itself.
+    #[test]
+    fn a_name_in_place_of_an_id_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        let team = create_team(&path, "site").unwrap();
+        for (id, name) in [("1111", "Designer"), ("2222", "Builder")] {
+            add_member(&path, &team.id, TeamMember { workspace_id: id.into(), root: format!("C:/ws/{id}"), name: name.into() })
+                .unwrap();
+        }
+
+        let err = add_edge(&path, &team.id, "designer", "2222").unwrap_err().to_string();
+        assert!(err.contains("is a project name") && err.contains("workspace id 1111"), "{err}");
+
+        // Not a name either: list who is in the team instead.
+        let err = add_edge(&path, &team.id, "9999", "2222").unwrap_err().to_string();
+        assert!(err.contains("is not a member") && err.contains("Builder (2222)"), "{err}");
+    }
+
     /// A workspace is never its own teammate, and it only ever sees teams it is
     /// actually on — a member of one team learns nothing about another's
     /// existence (D128 scope).
@@ -789,6 +850,28 @@ mod tests {
             ))
             .unwrap();
         assert!(modules.is_enabled(crate::workspace::modules::MODULE_TEAM));
+    }
+
+    /// An agent typing forward slashes on Windows gets the same stored root
+    /// the GUI's folder dialog would have produced.
+    #[cfg(windows)]
+    #[test]
+    fn create_member_stores_the_root_with_native_separators() {
+        let (dir, path, team) = seeded();
+        let reg = dir.path().join("registry.json");
+        let typed = dir.path().join("slashed").to_string_lossy().replace('\\', "/");
+        let made = create_member(
+            &path,
+            &reg,
+            &team.id,
+            &InitProjectParams { root: typed, ..new_params(Path::new("unused")) },
+            &StaticKeyProvider([7u8; 32]),
+            "0.1.0",
+        )
+        .unwrap();
+        assert!(!made.root.contains('/'), "{}", made.root);
+        let listed = &crate::workspace::registry::load_registry(&reg).unwrap().workspaces[0].root;
+        assert!(!listed.contains('/'), "{listed}");
     }
 
     /// The refusal is not the point — leaving the target untouched is. An

@@ -508,6 +508,13 @@ pub fn adopt(
         }
         let workflow = instantiate(template)?;
         save_workflow(&paths.workflow_file(), &workflow)?;
+        // The template's phases may call a skill pack (D148): ship it now, the
+        // same moment the instructions that name it arrive, and fingerprint it
+        // so a later engine change can still upgrade it untouched.
+        if !crate::workspace::bootstrap::ensure_skills(paths)?.is_empty() {
+            let ctx = crate::workspace::context::load_context(&paths.context_file())?;
+            crate::workspace::assets::record_pristine(paths, &ctx)?;
+        }
         ledger_for(paths).append(&LedgerEvent::new(
             LedgerKind::WorkflowAdopted,
             format!("workflow template \"{}\" adopted", template.name),

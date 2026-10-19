@@ -13,6 +13,7 @@
     "core:webview:allow-set-webview-focus",
     "core:webview:allow-set-webview-zoom",
     "opener:default",
-    "dialog:default"
+    "dialog:default",
+    "updater:default"
   ]
 }

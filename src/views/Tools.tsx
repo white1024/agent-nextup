@@ -142,6 +142,15 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled }: Props) 
     });
   }
 
+  // Grants a restored backup parked (D143): applying them is granting write
+  // access on this machine, so it takes this click — never the restore itself.
+  function resolveRestored(accept: boolean) {
+    return runAccess(async () => {
+      setError(null);
+      applyAgentAccess(await api.agentAccessResolveRestored(accept));
+    });
+  }
+
   function setAllAgentTools(allowed: boolean) {
     return runAccess(async () => {
       setError(null);
@@ -174,6 +183,10 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled }: Props) 
     agentAccess?.access.allowedTools.includes(tool),
   ).length;
   const allWriteAllowed = writeTools.length > 0 && allowedCount === writeTools.length;
+  const restored = agentAccess?.restoredAccess ?? null;
+  // What accepting would actually grant: the parked tools this workspace
+  // exposes now. A tool whose module is off is skipped, as select-all skips it.
+  const restorable = restored === null ? [] : restored.allowedTools.filter((tool) => writeTools.includes(tool));
 
   const mcpVariant = mcp === null ? null : mcp.healthy ? "ready" : mcp.resolvedPath ? "repair" : "missing";
 
@@ -408,6 +421,35 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled }: Props) 
                 {unexposedTool !== null && (
                   <div className="alert alert-info">
                     {t("tools.unexposedTool", { tool: unexposedTool })}
+                  </div>
+                )}
+                {restored !== null && (
+                  <div className="alert alert-info restored-grants">
+                    <p>
+                      {t("tools.restoredGrants", {
+                        date: restored.exportedAt.slice(0, 10),
+                        n: restored.allowedTools.length,
+                      })}
+                      {restorable.length < restored.allowedTools.length &&
+                        ` ${t("tools.restoredSomeHidden", { m: restored.allowedTools.length - restorable.length })}`}
+                    </p>
+                    {restorable.length > 0 && (
+                      <div className="rg-tools">
+                        {restorable.map((tool) => (
+                          <code key={tool}>{tool}</code>
+                        ))}
+                      </div>
+                    )}
+                    <div className="rg-actions">
+                      {restorable.length > 0 && (
+                        <button className="btn btn-primary" onClick={() => void resolveRestored(true)}>
+                          {t("tools.restoredAccept", { n: restorable.length })}
+                        </button>
+                      )}
+                      <button className="btn" onClick={() => void resolveRestored(false)}>
+                        {t("tools.restoredDrop")}
+                      </button>
+                    </div>
                   </div>
                 )}
                 <div className="selectall-row">

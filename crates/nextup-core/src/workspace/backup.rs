@@ -7,6 +7,7 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+use crate::agent::{save_access, save_restored_access, AgentAccess, RestoredAccess};
 use crate::error::{NextUpError, Result};
 use crate::security::crypto;
 use crate::security::keystore::KeyProvider;
@@ -23,6 +24,11 @@ const MANIFEST_NAME: &str = "nextup-backup-manifest.json";
 /// the local envelope is sealed by *this machine's* keystore and would be
 /// unreadable anywhere else.
 const PORTABLE_SECRETS_NAME: &str = ".nextup/secrets.portable.enc";
+/// The agent allowlist travels at the archive root, outside `.nextup/`, so no
+/// extraction can ever land it at the live path (D143). Import reads it and
+/// parks the grants for a person to accept; only a restriction (agent access
+/// switched off) is applied without asking.
+const ACCESS_NAME: &str = "nextup-backup-access.json";
 const MIN_PASSPHRASE: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +78,12 @@ pub fn export_backup(
     let portable = crypto::encrypt_with_passphrase(passphrase, &serde_json::to_vec(&secret_map)?)?;
     zip.start_file(PORTABLE_SECRETS_NAME, options).map_err(zip_err)?;
     zip.write_all(&portable)?;
+
+    let access_file = paths.agent_access_file();
+    if access_file.is_file() {
+        zip.start_file(ACCESS_NAME, options).map_err(zip_err)?;
+        zip.write_all(&std::fs::read(&access_file)?)?;
+    }
 
     // Individual config files (+ the AI-session bootstrap entry points).
     for file_path in [
@@ -191,17 +203,36 @@ pub fn import_backup(
         serde_json::from_slice(&plain)?
     };
 
+    // Absent in backups made before D143; unreadable is treated the same —
+    // a damaged allowlist is no reason to refuse a restore, and the worst it
+    // costs is grants nobody re-applies.
+    let carried_access: Option<AgentAccess> = match archive.by_name(ACCESS_NAME) {
+        Ok(mut entry) => {
+            let mut raw = Vec::new();
+            entry.read_to_end(&mut raw)?;
+            serde_json::from_slice(&raw).ok()
+        }
+        Err(_) => None,
+    };
+
     std::fs::create_dir_all(dest_root)?;
+    let live_access = dest_paths.agent_access_file();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(zip_err)?;
         let name = entry.name().to_string();
-        if name == MANIFEST_NAME || name == PORTABLE_SECRETS_NAME {
+        if name == MANIFEST_NAME || name == PORTABLE_SECRETS_NAME || name == ACCESS_NAME {
             continue;
         }
         // Zip-slip guard: only extract paths that stay inside dest_root.
         let Some(relative) = entry.enclosed_name() else {
             return Err(NextUpError::Backup(format!("archive contains unsafe path: {name}")));
         };
+        // Grants arrive only through the prompt below. A backup this app wrote
+        // never has either file at these paths; one that does was made by hand,
+        // and extracting it would hand an agent write access with no one asked.
+        if is_grant_file(&relative) {
+            continue;
+        }
         let target = dest_root.join(relative);
         if entry.is_dir() {
             std::fs::create_dir_all(&target)?;
@@ -228,6 +259,21 @@ pub fn import_backup(
     // Seal secrets under this machine's master key.
     save_secrets(&dest_paths.secrets_file(), keys, &secret_map)?;
 
+    // Narrowing applies itself; widening waits for a person (D143). A backup
+    // with agent access switched off restores switched off — restoring it on
+    // would open the read tier the user had shut.
+    if let Some(access) = carried_access {
+        if !access.enabled {
+            save_access(&live_access, &AgentAccess { allowed_tools: Vec::new(), ..access.clone() })?;
+        }
+        if !access.allowed_tools.is_empty() {
+            save_restored_access(
+                &dest_paths,
+                &RestoredAccess { allowed_tools: access.allowed_tools, exported_at: manifest.exported_at.clone() },
+            )?;
+        }
+    }
+
     ledger_for(&dest_paths).append(&LedgerEvent::new(
         LedgerKind::BackupImported,
         format!(
@@ -238,6 +284,27 @@ pub fn import_backup(
     ))?;
 
     open_workspace(dest_root)
+}
+
+/// Whether an archive path names one of the two grant files. Compared the
+/// way Windows resolves names — case-insensitively, trailing dots and spaces
+/// dropped, an alternate-stream suffix ignored — because a plain equality
+/// check would let `.NEXTUP/Agent_Access.json.` through and land on the very
+/// file it was meant to keep out.
+fn is_grant_file(relative: &Path) -> bool {
+    use crate::workspace::layout::{AGENT_ACCESS_FILE, NEXTUP_DIR, RESTORED_ACCESS_FILE};
+    let parts: Vec<String> = relative
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(p) => {
+                let p = p.to_string_lossy();
+                let p = p.split(':').next().unwrap_or_default();
+                Some(p.trim_end_matches(['.', ' ']).to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
+    parts.len() == 2 && parts[0] == NEXTUP_DIR && (parts[1] == AGENT_ACCESS_FILE || parts[1] == RESTORED_ACCESS_FILE)
 }
 
 fn validate_passphrase(passphrase: &str) -> Result<()> {
@@ -403,5 +470,124 @@ mod tests {
         make_workspace(dst.path());
         let err = import_backup(&zip_path, dst.path(), &machine_b(), PASS).unwrap_err();
         assert_eq!(err.kind(), "workspace");
+    }
+
+    fn export_to(paths: &WorkspacePaths, dir: &Path) -> PathBuf {
+        let zip_path = dir.join("backup.zip");
+        export_backup(paths, &machine_a(), &zip_path, PASS, false, "0.1.0").unwrap();
+        zip_path
+    }
+
+    #[test]
+    fn grants_travel_but_wait_for_a_person() {
+        let src = tempfile::tempdir().unwrap();
+        let paths = make_workspace(src.path());
+        let granted = crate::agent::get_access(&paths).unwrap().allowed_tools;
+        assert!(!granted.is_empty(), "init grants the day-one set (D63), so there is something to carry");
+
+        let zip_dir = tempfile::tempdir().unwrap();
+        let zip_path = export_to(&paths, zip_dir.path());
+        let dst = tempfile::tempdir().unwrap();
+        import_backup(&zip_path, dst.path(), &machine_b(), PASS).unwrap();
+        let dst_paths = WorkspacePaths::new(dst.path());
+
+        // Nothing applied: the live allowlist is the no-file default.
+        assert!(!dst_paths.agent_access_file().exists());
+        assert!(crate::agent::get_access(&dst_paths).unwrap().allowed_tools.is_empty());
+        // ...but nothing lost either: the grants are parked for the prompt.
+        let parked = crate::agent::restored_access(&dst_paths).unwrap().expect("parked");
+        assert_eq!(parked.allowed_tools, granted);
+
+        // Accepting applies them and clears the prompt.
+        let access = crate::agent::resolve_restored_access(&dst_paths, true).unwrap();
+        let mut got = access.allowed_tools.clone();
+        let mut want = granted.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(crate::agent::restored_access(&dst_paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn dropping_parked_grants_grants_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        let paths = make_workspace(src.path());
+        let zip_dir = tempfile::tempdir().unwrap();
+        let zip_path = export_to(&paths, zip_dir.path());
+        let dst = tempfile::tempdir().unwrap();
+        import_backup(&zip_path, dst.path(), &machine_b(), PASS).unwrap();
+        let dst_paths = WorkspacePaths::new(dst.path());
+
+        let access = crate::agent::resolve_restored_access(&dst_paths, false).unwrap();
+        assert!(access.allowed_tools.is_empty());
+        assert!(crate::agent::restored_access(&dst_paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_switched_off_hub_restores_switched_off() {
+        let src = tempfile::tempdir().unwrap();
+        let paths = make_workspace(src.path());
+        crate::agent::set_enabled(&paths, false).unwrap();
+        let zip_dir = tempfile::tempdir().unwrap();
+        let zip_path = export_to(&paths, zip_dir.path());
+        let dst = tempfile::tempdir().unwrap();
+        import_backup(&zip_path, dst.path(), &machine_b(), PASS).unwrap();
+        let dst_paths = WorkspacePaths::new(dst.path());
+
+        // Narrowing applies itself — restoring it on would reopen the read tier.
+        let access = crate::agent::get_access(&dst_paths).unwrap();
+        assert!(!access.enabled);
+        assert!(access.allowed_tools.is_empty(), "the grants still wait for a person");
+    }
+
+    #[test]
+    fn a_hand_made_archive_cannot_plant_grants() {
+        let src = tempfile::tempdir().unwrap();
+        let paths = make_workspace(src.path());
+        let zip_dir = tempfile::tempdir().unwrap();
+        let real = export_to(&paths, zip_dir.path());
+
+        // Copy the real backup and add allowlists at the live paths, in the
+        // spellings Windows would resolve to the same file.
+        let crafted = zip_dir.path().join("crafted.zip");
+        {
+            let mut src_zip = ZipArchive::new(File::open(&real).unwrap()).unwrap();
+            let mut out = ZipWriter::new(File::create(&crafted).unwrap());
+            let options = SimpleFileOptions::default();
+            for i in 0..src_zip.len() {
+                let entry = src_zip.by_index(i).unwrap();
+                out.raw_copy_file(entry).unwrap();
+            }
+            let planted = br#"{"schemaVersion":1,"enabled":true,"allowedTools":["create_task"]}"#;
+            for name in [".nextup/agent_access.json", ".NEXTUP/Agent_Access.json.", ".nextup/agent_access.restored.json"] {
+                out.start_file(name, options).unwrap();
+                out.write_all(planted).unwrap();
+            }
+            out.finish().unwrap();
+        }
+
+        let dst = tempfile::tempdir().unwrap();
+        import_backup(&crafted, dst.path(), &machine_b(), PASS).unwrap();
+        let dst_paths = WorkspacePaths::new(dst.path());
+        assert!(!dst_paths.agent_access_file().exists());
+        // The parked list is the one export wrote, not the planted one.
+        let parked = crate::agent::restored_access(&dst_paths).unwrap().expect("parked");
+        assert_eq!(parked.allowed_tools, crate::agent::get_access(&paths).unwrap().allowed_tools);
+    }
+
+    #[test]
+    fn grant_file_check_matches_the_way_windows_resolves_names() {
+        for hit in [
+            ".nextup/agent_access.json",
+            ".NEXTUP/AGENT_ACCESS.JSON",
+            ".nextup/agent_access.json. ",
+            ".nextup/agent_access.json::$DATA",
+            "./.nextup/agent_access.restored.json",
+        ] {
+            assert!(is_grant_file(Path::new(hit)), "{hit} lands on a grant file");
+        }
+        for miss in ["agent_access.json", ".nextup/tasks/agent_access.json", ".nextup/context.json"] {
+            assert!(!is_grant_file(Path::new(miss)), "{miss} is not a grant file");
+        }
     }
 }

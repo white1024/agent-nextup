@@ -149,8 +149,8 @@ function fail(msg) {
  * Every `include_str!` / `include_bytes!` target must exist inside the
  * exported tree. This is the check that catches the .gitattributes mistake
  * that would otherwise only surface as a broken `cargo build` in the public
- * repo — bootstrap.rs reaches up into `.claude/skills/` for every skill in
- * WORKSPACE_SKILLS, so excluding that directory wholesale silently breaks the
+ * repo — bootstrap.rs reaches up into `.claude/skills/` for the generic
+ * skills in WORKSPACE_SKILLS, so excluding that directory wholesale silently breaks the
  * build. The check reads the actual `include_str!` targets, so it stays right
  * as that list grows; only this sentence would go stale, never the guard.
  */

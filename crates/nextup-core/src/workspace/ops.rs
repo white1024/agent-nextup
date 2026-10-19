@@ -13,7 +13,7 @@
 //! a session that only recorded decisions still hands off fresh.
 //! (generate_handoff refreshes the CLAUDE.md state block and manifest itself.)
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{NextUpError, Result};
 use crate::security::keystore::KeyProvider;
@@ -745,6 +745,97 @@ pub fn add_rejected(
         let event = LedgerEvent::new(
             LedgerKind::AlternativeRejected,
             format!("rejected alternative: \"{proposal}\" — {reason}"),
+            None,
+        );
+        Ok((ctx, event))
+    })
+    .map(|(ctx, _)| ctx)
+}
+
+/// The part of context.json a person may change after creation (D142): the
+/// four fields that *describe* the project. `None` leaves a field alone.
+///
+/// Deliberately not here: the name (four copies — team graph, sent envelopes,
+/// rendered curriculum, registry — each needing its own answer), the workspace
+/// id (teams resolve members by it), milestones and the rejected list (their
+/// own ops own them; agents append to `rejected` at any time), and the
+/// timestamps. A partial edit is the point: the editor never writes a whole
+/// `ProjectContext` back, so a field it does not know about cannot be lost.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEdit {
+    pub domain: Option<String>,
+    pub description: Option<String>,
+    pub goals: Option<Vec<String>>,
+    pub boundaries: Option<Vec<String>>,
+}
+
+/// Apply a [`ContextEdit`]: read-modify-write under the workspace lock, one
+/// `context_edited` ledger line naming what changed. Human-only — there is no
+/// hub tool for this, because goals and boundaries are the rules an agent
+/// works under, and an agent rewriting its own rules is the thing the ledger
+/// line is there to make visible, not to enable.
+///
+/// Normalised the way init normalises them, so an edited project and a fresh
+/// one cannot disagree about shape: trimmed text, one entry per non-empty
+/// line, and a blank domain written as `general` — the one word for "nobody
+/// said" (D137). An edit that changes nothing writes nothing.
+pub fn edit_context(paths: &WorkspacePaths, app_version: &str, edit: ContextEdit) -> Result<ProjectContext> {
+    let domain = edit.domain.map(|d| match d.trim() {
+        "" => "general".to_string(),
+        d => d.to_string(),
+    });
+    let description = edit.description.map(|d| d.trim().to_string());
+    let goals = edit.goals.map(|g| crate::workspace::init::clean_lines(&g));
+    let boundaries = edit.boundaries.map(|b| crate::workspace::init::clean_lines(&b));
+
+    let apply = |ctx: &mut ProjectContext| -> Vec<String> {
+        let mut changed = Vec::new();
+        if let Some(d) = &domain {
+            if *d != ctx.domain {
+                changed.push(format!("domain ({} → {d})", ctx.domain));
+                ctx.domain = d.clone();
+            }
+        }
+        if let Some(d) = &description {
+            if *d != ctx.description {
+                ctx.description = d.clone();
+                changed.push("description".into());
+            }
+        }
+        if let Some(g) = &goals {
+            if *g != ctx.goals {
+                ctx.goals = g.clone();
+                changed.push("goals".into());
+            }
+        }
+        if let Some(b) = &boundaries {
+            if *b != ctx.boundaries {
+                ctx.boundaries = b.clone();
+                changed.push("boundaries".into());
+            }
+        }
+        changed
+    };
+
+    // A no-op save is not an event: answer from disk without taking the lock
+    // or touching the ledger.
+    let mut current = load_context(&paths.context_file())?;
+    if apply(&mut current).is_empty() {
+        return load_context(&paths.context_file());
+    }
+    mutate(paths, app_version, || {
+        let mut ctx = load_context(&paths.context_file())?;
+        let changed = apply(&mut ctx);
+        if changed.is_empty() {
+            // Someone else wrote the same values between the check and the lock.
+            return Err(NextUpError::InvalidInput("nothing to change".into()));
+        }
+        ctx.updated_at = now_rfc3339();
+        save_context(&paths.context_file(), &ctx)?;
+        let event = LedgerEvent::new(
+            LedgerKind::ContextEdited,
+            format!("project context edited: {}", changed.join(", ")),
             None,
         );
         Ok((ctx, event))
@@ -1492,6 +1583,69 @@ mod tests {
         let md = generate_handoff(&paths, "0.1.0").unwrap();
         assert!(md.contains("Rejected alternatives"));
         assert!(md.contains("switch the index to sled — unmaintained"));
+    }
+
+    #[test]
+    fn edit_context_changes_only_named_fields_and_ledgers_them() {
+        let (_g, paths) = workspace();
+        // Things the editor must never drop, because it never writes them.
+        add_rejected(&paths, "0.1.0", "use sled", "unmaintained").unwrap();
+        add_milestone(&paths, "0.1.0", "beta").unwrap();
+        let before = load_context(&paths.context_file()).unwrap();
+
+        let ctx = edit_context(
+            &paths,
+            "0.1.0",
+            ContextEdit {
+                domain: Some("  research ".into()),
+                goals: Some(vec!["  read papers ".into(), "".into(), "write it up".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ctx.domain, "research");
+        assert_eq!(ctx.goals, vec!["read papers", "write it up"]);
+        // Untouched fields, and everything outside the four, survive as they were.
+        assert_eq!(ctx.description, before.description);
+        assert_eq!(ctx.boundaries, before.boundaries);
+        assert_eq!(ctx.name, before.name);
+        assert_eq!(ctx.workspace_id, before.workspace_id);
+        assert_eq!(ctx.rejected, before.rejected);
+        assert_eq!(ctx.milestones, before.milestones);
+        assert_eq!(ctx.created_at, before.created_at);
+        assert_eq!(load_context(&paths.context_file()).unwrap(), ctx, "what came back is what is on disk");
+
+        let ledger = Ledger::new(paths.ledger_file());
+        let lines = ledger.recent_of_kind(LedgerKind::ContextEdited, 5).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].message, "project context edited: domain (coding → research), goals");
+
+        // The takeover surface follows: the snapshot is regenerated by mutate.
+        let md = generate_handoff(&paths, "0.1.0").unwrap();
+        assert!(md.contains("read papers"));
+    }
+
+    #[test]
+    fn edit_context_without_a_change_writes_nothing() {
+        let (_g, paths) = workspace();
+        let before = load_context(&paths.context_file()).unwrap();
+        // Same values, differently padded, are the same values.
+        let ctx = edit_context(
+            &paths,
+            "0.1.0",
+            ContextEdit { domain: Some(" coding ".into()), goals: Some(vec![" ".into()]), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(ctx, before, "updatedAt untouched too");
+        let ledger = Ledger::new(paths.ledger_file());
+        assert!(ledger.recent_of_kind(LedgerKind::ContextEdited, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_context_blank_domain_is_general() {
+        let (_g, paths) = workspace();
+        let ctx = edit_context(&paths, "0.1.0", ContextEdit { domain: Some("   ".into()), ..Default::default() }).unwrap();
+        assert_eq!(ctx.domain, "general", "the word the UI hides, same as init (D137)");
     }
 
     #[test]

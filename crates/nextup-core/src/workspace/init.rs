@@ -200,7 +200,7 @@ pub fn open_workspace(root: &Path) -> Result<ProjectContext> {
     crate::workspace::context::load_context(&paths.context_file())
 }
 
-fn clean_lines(lines: &[String]) -> Vec<String> {
+pub(crate) fn clean_lines(lines: &[String]) -> Vec<String> {
     lines
         .iter()
         .map(|l| l.trim().to_string())

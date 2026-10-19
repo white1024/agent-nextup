@@ -54,9 +54,10 @@ cargo test --workspace  # Rust tests — the bulk of the suite
 
 All three should be green, and **running them locally is the only evidence you
 will get**: no CI runs on pull requests. `release.yml` is the only workflow in
-this repository, it triggers on a `v*` tag or a manual dispatch, and even then
-its test steps are `continue-on-error` — a red test does not fail the job, so a
-green job is not evidence that tests passed either.
+this repository and it triggers only on a `v*` tag or a manual dispatch. Its
+tests do gate a release — a red test on any platform stops the release from
+being published — but that happens after your change is merged, not on your
+pull request.
 
 So a reviewer has only your word and their own checkout. Say in the PR what you
 ran and on which OS.
@@ -141,9 +142,10 @@ modules in `lib/` plus six cross-cutting guards:
 - `i18n.test.ts` — every static `t("…")` call site names a key that exists. A
   missing key does not throw at runtime, it renders the key itself, so nothing
   else would catch it
-- `navigation.test.ts` — where a project change leaves you. Entering a project
-  and switching between two of them end in the same state, so the landing has
-  to be decided by the action rather than read back off the result; and every
+- `navigation.test.ts` — where a project change leaves you. Entering a project,
+  switching between two of them and re-reading the open one after a save all end
+  in the same state, so the landing has to be decided by the action rather than
+  read back off the result; and every
   workspace-scoped view has to render inside the keyed block, or one project's
   open envelope and loaded spec stay on screen under the next one's name
 - `domainChip.test.ts` — the rule for an unset domain lives in one module and

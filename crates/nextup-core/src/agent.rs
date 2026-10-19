@@ -472,6 +472,61 @@ pub fn set_all_tools_allowed(paths: &WorkspacePaths, allowed: bool) -> Result<Ag
     })
 }
 
+// ── Grants carried by a restored backup (D143) ──────────────────────────────
+
+/// Write-tool grants a backup carried across, parked until a person decides.
+/// A restore never applies them by itself: carrying a grant to a new machine
+/// is granting an agent write access *on that machine*, and that takes a
+/// human click — the same rule a fresh grant follows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredAccess {
+    pub allowed_tools: Vec<String>,
+    /// When the backup was made, so the prompt can say how old the grants are.
+    pub exported_at: String,
+}
+
+pub fn restored_access(paths: &WorkspacePaths) -> Result<Option<RestoredAccess>> {
+    let path = paths.restored_access_file();
+    if !path.is_file() {
+        return Ok(None);
+    }
+    crate::workspace::atomic::read_json_file(&path).map(Some)
+}
+
+pub fn save_restored_access(paths: &WorkspacePaths, restored: &RestoredAccess) -> Result<()> {
+    atomic_write_json(&paths.restored_access_file(), restored)
+}
+
+/// Accept or drop the parked grants; either way the prompt is gone after.
+/// Accepting grants only what this workspace exposes *now*: a grant for a
+/// module that is off is dropped, the same canonical rule select-all follows
+/// (`set_all_tools_allowed`) — and a tool name this version no longer knows is
+/// dropped rather than written into an allowlist nothing reads.
+pub fn resolve_restored_access(paths: &WorkspacePaths, accept: bool) -> Result<AgentAccess> {
+    with_mutation_lock(paths, || {
+        let mut access = load_access(&paths.agent_access_file())?;
+        if accept {
+            if let Some(restored) = restored_access(paths)? {
+                let modules = crate::workspace::modules::get_modules(paths)?;
+                let exposed = exposed_write_tools(&modules);
+                for tool in restored.allowed_tools {
+                    if exposed.contains(&tool.as_str()) && !access.tool_allowed(&tool) {
+                        access.allowed_tools.push(tool);
+                    }
+                }
+                save_access(&paths.agent_access_file(), &access)?;
+            }
+        }
+        match std::fs::remove_file(paths.restored_access_file()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(access)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

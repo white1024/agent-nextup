@@ -18,9 +18,9 @@ What it is for: not tied to any particular feature — a way to confirm **at any
 - **Does the record match reality?** Everything this session did — is it in the project's source of truth? Task statuses advanced? Settled decisions recorded? Pitfalls written down? Anything missing gets **recorded right now**, using the project's own record mechanism.
 - **Spot-check the claims**: verifiable facts in the documents (counts, lists, commands) should match reality. If the project has a list of what to check against, follow it item by item — numbers hard-coded in prose are the usual drift point.
 
-## 2. Substantial document changes -> delegate to `/adversarial-review` (skip if none)
+## 2. Substantial document changes -> adversarial review (skip if none)
 
-If this round wrote a new document or rewrote a whole section, send a fresh-context agent to check it against reality item by item. Skip for small edits.
+If this round wrote a new document or rewrote a whole section, call the Skill tool with `adversarial-review` on those files: it sends a fresh-context agent to check them against reality item by item. Skip for small edits.
 
 ## 3. Cold-read acceptance (the heart of this skill)
 
@@ -31,7 +31,7 @@ If this round wrote a new document or rewrote a whole section, send a fresh-cont
 ## 4. Close out
 
 - Fix each break the cold read reported. The usual ones: broken links, stale claims, counts in prose that have drifted, and formatting that truncates the latest record.
-- Write the outcome into the project's record afterwards, or go straight into `/wrap-up` to close the session (commit and push).
+- Write the outcome into the project's record afterwards, or call the Skill tool with `wrap-up` to close the session (commit and push).
 
 ## Cost
 

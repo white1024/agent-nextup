@@ -88,6 +88,8 @@ impl ProjectRules {
                 post_mortem_prompts: vec![
                     "Which steps produced friction or rework this cycle?".into(),
                     "Which guideline, if added or changed, would have prevented it?".into(),
+                    "Which mistake could a machine have caught, and does a check for it exist now?"
+                        .into(),
                     "What should the next session do differently first?".into(),
                 ],
                 revision_history: vec![RuleRevision {

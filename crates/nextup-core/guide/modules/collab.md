@@ -22,6 +22,8 @@ A task cannot start or complete until every entry in `dependsOn` is `done` (main
 
 When planning parallel work, make tasks within a wave independent of each other and dependent only on the previous wave. When a dependency blocks you, look at that task's status first rather than routing around the check.
 
+To find work you can take, call `list_tasks { ready: true }`: todo tasks whose dependencies are all done and that nobody is assigned to — the current wave's open edge. It applies the same rule as the notes on "Next steps", so a task it returns is one you can claim and start. Work already dispatched to you is `list_tasks { assignee: "<your identity>" }`.
+
 ## Where source-level parallelism ends
 
 The Agent NextUp mutex only guarantees consistency for `.nextup` and task state. **Conflicts in source files are not its concern.** The convention for several agents editing code at once: one git worktree or branch each, `NEXTUP_AGENT` set in each environment, integration through git merge, and conflict resolution is git's job.

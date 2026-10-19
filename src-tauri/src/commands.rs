@@ -24,7 +24,7 @@ use nextup_core::workspace::init::{self, InitProjectParams};
 use nextup_core::workspace::layout::WorkspacePaths;
 use nextup_core::workspace::ledger::{Ledger, LedgerEvent, LedgerKind, LedgerPage, LedgerTail};
 use nextup_core::workspace::modules::{self, WorkspaceModules};
-use nextup_core::workspace::ops::{self, TaskUpdate};
+use nextup_core::workspace::ops::{self, ContextEdit, TaskUpdate};
 use nextup_core::workspace::registry::{self, WorkspaceOverview};
 use nextup_core::workspace::settings::{self, WorkspaceSettings};
 use nextup_core::workspace::tasks::{NewTask, Task, TaskEdit, TaskStatus, TaskStore};
@@ -718,6 +718,9 @@ pub struct AgentAccessView {
     /// acts, and a denial jump lands on an explanation rather than a bare
     /// toggle. Empty string values never occur — absence means "not guarded".
     pub guarded_reasons: BTreeMap<String, String>,
+    /// Grants a restored backup carried and parked for a person (D143);
+    /// absent once accepted or dropped, and on every workspace never restored.
+    pub restored_access: Option<agent::RestoredAccess>,
 }
 
 #[derive(serde::Serialize)]
@@ -755,6 +758,7 @@ fn agent_view(paths: &WorkspacePaths, access: agent::AgentAccess) -> CmdResult<A
         write_tools: exposed.iter().map(|s| s.to_string()).collect(),
         write_tool_groups,
         guarded_reasons,
+        restored_access: agent::restored_access(paths)?,
     })
 }
 
@@ -777,6 +781,21 @@ pub async fn agent_access_set_enabled(
     blocking(move || {
         let paths = ws.paths();
         agent::set_enabled(&paths, enabled).and_then(|a| agent_view(&paths, a))
+    })
+    .await
+}
+
+/// Accept or drop the grants a restored backup parked (D143). Accepting
+/// grants only what this workspace exposes now; both answers clear the prompt.
+#[tauri::command]
+pub async fn agent_access_resolve_restored(
+    state: tauri::State<'_, AppState>,
+    accept: bool,
+) -> CmdResult<AgentAccessView> {
+    let ws = state.require_workspace()?;
+    blocking(move || {
+        let paths = ws.paths();
+        agent::resolve_restored_access(&paths, accept).and_then(|a| agent_view(&paths, a))
     })
     .await
 }
@@ -932,6 +951,21 @@ pub async fn get_context(state: tauri::State<'_, AppState>) -> CmdResult<Project
         nextup_core::workspace::context::load_context(&ws.paths().context_file())
     })
     .await
+}
+
+/// Edit the project's descriptive fields from the GUI (D142). The cached
+/// copy behind `system_status` is refreshed too — the dashboard's domain chip
+/// reads it, and would otherwise keep the old value until the next open.
+#[tauri::command]
+pub async fn edit_context(
+    state: tauri::State<'_, AppState>,
+    edit: ContextEdit,
+) -> CmdResult<ProjectContext> {
+    let ws = state.require_workspace()?;
+    let root = ws.root.clone();
+    let ctx = blocking(move || ops::edit_context(&ws.paths(), APP_VERSION, edit)).await?;
+    state.refresh_context(&root, ctx.clone());
+    Ok(ctx)
 }
 
 #[tauri::command]
@@ -1512,6 +1546,37 @@ pub fn quit_app(app: tauri::AppHandle) -> CmdResult<()> {
         app.exit(0);
     }
     Ok(())
+}
+
+/// What the update dialog needs to know before it offers an install (D144):
+/// portable build (no in-app install), hub held open (Windows install would
+/// fail), and how many terminal sessions installing would end.
+#[tauri::command]
+pub async fn update_preflight(
+    terminals: tauri::State<'_, TerminalState>,
+) -> CmdResult<crate::update::UpdatePreflight> {
+    let mgr = terminals.0.clone();
+    blocking(move || {
+        let running_terminals = mgr
+            .list()
+            .iter()
+            .filter(|s| s.status == crate::terminal::TerminalStatus::Running)
+            .count();
+        Ok(crate::update::UpdatePreflight {
+            portable: crate::update::is_portable(),
+            hub_busy: crate::update::hub_busy(),
+            running_terminals,
+        })
+    })
+    .await
+}
+
+/// After a macOS/Linux install: start the new version and quit this one
+/// (Windows' installer does both itself). See update.rs for why macOS cannot
+/// use the generic restart.
+#[tauri::command]
+pub fn update_relaunch(app: tauri::AppHandle) -> CmdResult<()> {
+    crate::update::relaunch(&app).map_err(|e| NextUpError::Ipc(format!("could not relaunch: {e}")))
 }
 
 /// Open a folder in the OS file manager (Explorer / Finder / the XDG handler).

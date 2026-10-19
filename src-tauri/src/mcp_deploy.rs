@@ -15,7 +15,7 @@ use serde::Serialize;
 /// Bare binary name (no extension) of the hub server.
 const HUB_BIN: &str = "nextup-mcp";
 
-fn hub_file_name() -> String {
+pub(crate) fn hub_file_name() -> String {
     format!("{HUB_BIN}{}", std::env::consts::EXE_SUFFIX)
 }
 

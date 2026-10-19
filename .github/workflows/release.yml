@@ -1,12 +1,15 @@
 name: release
 
-# B11 milestone one (D77): CI produces the multi-platform installers. This
-# round does no OS code signing and no auto-update (D77 decisions 4 and 5), so
-# the artifacts are unsigned trial builds.
+# B11 (D77): CI produces the multi-platform installers. No OS code signing
+# (D77 decision 4), so Windows and macOS still warn on first launch. Since D144
+# tag builds also sign the updater artifacts and publish latest.json, which is
+# what the in-app "Check for updates" reads.
 #
 # Trigger policy (D77 decision 1):
 #   - push tag v*        -> build all three platforms; tauri-action opens a
-#                           GitHub pre-release and attaches the installers.
+#                           GitHub release and attaches the installers, the
+#                           updater bundles with their .sig files, and
+#                           latest.json.
 #   - workflow_dispatch  -> manual test build: same three platforms, but no
 #                           release; installers go up as workflow artifacts.
 #
@@ -48,8 +51,14 @@ jobs:
           # To cover Intel again, add `- platform: macos-13` back: a native
           # build, nothing else needs to change.
     runs-on: ${{ matrix.platform }}
+    # Every action is pinned to a commit, not a tag (D145). The tauri-action
+    # step is handed the updater signing key, and every step before it runs in
+    # the same job and could leave something behind for it — so a tag that
+    # moves upstream is a way to the key that never touches this repository.
+    # The comment after each SHA is the tag it was taken from; bump by
+    # looking the tag up again, not by editing the comment.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Linux tauri deps
         if: matrix.platform == 'ubuntu-22.04'
@@ -67,17 +76,19 @@ jobs:
             file \
             wget
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ". -> target"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24 # matches .npmrc use-node-version=24.18.0, the version pnpm runs scripts with
           cache: pnpm
@@ -89,12 +100,12 @@ jobs:
       # — under a second, no Rust, no dist/ — so a broken pure function surfaces
       # without waiting for a bundle.
       #
-      # Non-blocking for the same reason as the cargo step below, and the two
-      # should be hardened into gates together rather than one at a time: a
+      # A gate since 0.2.0, together with the cargo step below — both were
+      # non-blocking through 0.1.x, and they were hardened as a pair: a
       # workflow where half the tests can stop a release and half cannot is
-      # harder to reason about than either policy on its own.
-      - name: Frontend unit tests (non-blocking)
-        continue-on-error: true
+      # harder to reason about than either policy on its own. While they were
+      # non-blocking, a red run still reported `conclusion: success` (G056).
+      - name: Frontend unit tests
         run: pnpm test
 
       # dist/ has to exist first: src-tauri's tauri-build script embeds
@@ -118,21 +129,34 @@ jobs:
       - name: Stage the sidecar (needed by the src-tauri build script)
         run: node scripts/prepare-sidecar.mjs
 
-      # B11 milestone one, item 4: cross-platform unit and integration tests.
-      # Non-blocking (continue-on-error) — this round's priority is producing
-      # trial installers, so a red cross-platform result surfaces in the log
-      # without stopping the build. Hardening it into a gate comes later.
-      - name: Cross-platform tests (non-blocking)
-        continue-on-error: true
+      # B11 milestone one, item 4: cross-platform unit and integration tests —
+      # a gate since 0.2.0 (see the frontend step). A red platform stops its own
+      # job before it bundles anything; the draft release below is what stops
+      # the *other* platforms from shipping without it.
+      - name: Cross-platform tests
         run: cargo test --workspace
 
       - name: Build app + bundle
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing (D144). The key lives only in the public mirror's
+          # secrets and offline with the maintainer; it has no password, so
+          # the password variable is set empty rather than left unset.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          # Updater artifacts on tag builds only. tauri.conf.json carries the
+          # public key and the endpoint for every build, but creating the
+          # signed bundles needs the private key — which a manual dispatch in
+          # the private repo, or a local `pnpm tauri build`, does not have.
+          # Turning it on here rather than in tauri.conf.json is what keeps
+          # those builds working. Inline JSON rather than an overlay file, so
+          # nothing depends on which directory the CLI resolves a relative
+          # path against.
+          args: ${{ startsWith(github.ref, 'refs/tags/') && '--config {"bundle":{"createUpdaterArtifacts":true}}' || '' }}
           # No "(trial)" suffix: the word came from the one occasion this
           # packaging work was built for (D77 — builds to hand to friends),
           # and in software "trial" reads as time- or feature-limited
@@ -143,9 +167,18 @@ jobs:
           # Point at a page that exists: the README has no "packaging" section,
           # and reference/building is where the per-OS dialogs are actually
           # written down.
-          releaseBody: "Unsigned build: no publisher certificate, no notarization, and nothing here updates itself. Windows and macOS both stop the first launch — SmartScreen needs \"More info\" then \"Run anyway\"; macOS needs System Settings → Privacy & Security → \"Open Anyway\". https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds has both click paths and the Linux notes. Windows also gets a portable zip that needs no installer at all."
-          releaseDraft: false
-          prerelease: true
+          releaseBody: "Unsigned build: no publisher certificate and no notarization. Windows and macOS both stop the first launch — SmartScreen needs \"More info\" then \"Run anyway\"; macOS needs System Settings → Privacy & Security → \"Open Anyway\". https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds has both click paths and the Linux notes. Once installed, later versions can be installed from Settings → About → Check for updates. Windows also gets a portable zip that needs no installer at all; it does not update itself."
+          # A draft until every platform has passed its tests and built (D145):
+          # with three independent jobs, a red platform would otherwise stop
+          # only itself while the other two published a release — and a
+          # latest.json — without it. Drafts are not "latest", so the updater
+          # cannot see one; the publish job below flips it once all three are in.
+          releaseDraft: true
+          # A full release since D144 (pre-release until 0.1.3). The updater's
+          # endpoint is releases/latest/download/latest.json, and GitHub's
+          # "latest" skips pre-releases — with every release marked pre-release
+          # that URL is a 404 and no installed copy would ever see an update.
+          prerelease: false
 
       # A no-install option for Windows, where an installer is the thing that
       # gets blocked on a locked-down work machine. Runs after the bundle step
@@ -171,7 +204,7 @@ jobs:
 
       - name: Upload artifacts (manual dispatch — no release)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nextup-${{ matrix.platform }}
           # Final installers only. `bundle/**/*` would also drag in the
@@ -188,3 +221,18 @@ jobs:
             target/release/bundle/rpm/*.rpm
             target/portable/*.zip
           if-no-files-found: warn
+
+  # Turns the draft into the release (D145) — only reached when every matrix
+  # job succeeded, which is the whole point of drafting. Tag builds in the
+  # public mirror only, same condition as the release itself.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && !github.event.repository.private
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false --latest

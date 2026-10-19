@@ -583,16 +583,85 @@ pub fn counts_for_dir(tasks_dir: &Path) -> Result<TaskCounts> {
     Ok(compute_counts(&tasks))
 }
 
-/// Open tasks in takeover order: in-progress first (finish what's started),
-/// then priority, then id. Every takeover surface (handoff §3, the CLAUDE.md
-/// state block) renders from this — the ordering rule lives here and nowhere
-/// else, so the two surfaces can never disagree on what comes next.
-pub fn next_steps(tasks: &[Task]) -> Vec<&Task> {
-    let mut next: Vec<&Task> = tasks
+/// One open task as a takeover surface lists it, with what stands between it
+/// and the next session (D147). Built only through [`NextStep::of`], so the
+/// state block, handoff §3 and `list_tasks { ready }` all apply one rule.
+pub struct NextStep<'a> {
+    pub task: &'a Task,
+    /// Dependencies not yet done, resolved against the same task list the
+    /// caller holds. A missing id counts as unmet — the same reading
+    /// [`TaskStore::update_status`] enforces, so a task listed as startable
+    /// is one the engine will actually let start.
+    pub waiting_on: Vec<String>,
+}
+
+impl<'a> NextStep<'a> {
+    /// `all` must be every task file, archived ones included: a dependency
+    /// may point at a task that has since been archived, and archived means
+    /// done.
+    pub fn of(task: &'a Task, all: &[Task]) -> Self {
+        let waiting_on = task
+            .depends_on
+            .iter()
+            .filter(|dep| !all.iter().any(|t| &t.id == *dep && t.status == TaskStatus::Done))
+            .cloned()
+            .collect();
+        Self { task, waiting_on }
+    }
+
+    /// Takeover grouping: in progress, then the frontier, then assigned but
+    /// not started, then waiting on dependencies. Waiting outranks assigned —
+    /// an assigned task whose dependencies are open cannot start for anyone.
+    fn group(&self) -> u8 {
+        if self.task.status == TaskStatus::InProgress {
+            0
+        } else if !self.waiting_on.is_empty() {
+            3
+        } else if self.task.assignee.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The frontier: todo, every dependency done, nobody assigned.
+    pub fn is_ready(&self) -> bool {
+        self.task.status == TaskStatus::Todo && self.group() == 1
+    }
+
+    /// The annotation both takeover surfaces print after the title. It is
+    /// the reason a listed task is not simply "take it" — open dependencies
+    /// (which the engine will refuse) and, for unstarted work, whose it is:
+    /// an assignee arrives by claiming or by dispatch (`assign_task`, or
+    /// `create_task` with one), and the surface carries no identity, so it
+    /// names the holder and the reader recognises their own name. An
+    /// in-progress task with a reopened dependency gets the note too: it
+    /// cannot be completed until that lands.
+    pub fn note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.waiting_on.is_empty() {
+            parts.push(format!("waits on {}", self.waiting_on.join(", ")));
+        }
+        if self.task.status == TaskStatus::Todo {
+            if let Some(who) = &self.task.assignee {
+                parts.push(format!("assigned to {who}"));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Open tasks in takeover order (see [`NextStep::group`]), then priority,
+/// then id. Every takeover surface (handoff §3, the AGENTS.md state block)
+/// renders from this — the ordering rule lives here and nowhere else, so the
+/// two surfaces can never disagree on what comes next.
+pub fn next_steps(tasks: &[Task]) -> Vec<NextStep<'_>> {
+    let mut next: Vec<NextStep> = tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Todo))
+        .map(|t| NextStep::of(t, tasks))
         .collect();
-    next.sort_by_key(|t| (t.status != TaskStatus::InProgress, t.priority, t.id.clone()));
+    next.sort_by_key(|s| (s.group(), s.task.priority, s.task.id.clone()));
     next
 }
 
@@ -802,6 +871,84 @@ mod tests {
         store.create(new_task("good", 0)).unwrap();
         std::fs::write(store.dir.join("T-9999.json"), b"{not json").unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// D147: the takeover list is the frontier first. A todo whose
+    /// dependencies are open is one the engine will refuse to start, so it
+    /// must not sit among the startable ones looking like the next pick.
+    #[test]
+    fn next_steps_lead_with_the_frontier() {
+        let (_g, store) = store();
+        let task = |title: &str, priority: u8, deps: &[&str]| {
+            store
+                .create(NewTask {
+                    title: title.into(),
+                    priority,
+                    depends_on: deps.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let base = task("base", 0, &[]);
+        let shelved = task("shelved", 0, &[]);
+        store.update_status(&shelved.id, TaskStatus::Done, None).unwrap();
+        store.set_archived(&shelved.id, true).unwrap();
+        let after_base = task("after base", 0, &[&base.id]);
+        task("after shelved", 1, &[&shelved.id]);
+        let held = task("held", 0, &[]);
+        store.set_assignee(&held.id, Some("alice".into())).unwrap();
+        let held_and_waiting = task("held and waiting", 1, &[&base.id]);
+        store.set_assignee(&held_and_waiting.id, Some("bob".into())).unwrap();
+        // create and delete both refuse a dangling edge, so only a hand edit
+        // leaves one behind — and the engine still reads it as unmet.
+        let dangling = task("dangling", 2, &[]);
+        let mut edited = store.get(&dangling.id).unwrap();
+        edited.depends_on = vec!["T-9999".into()];
+        atomic_write_json(&store.task_file(&dangling.id), &edited).unwrap();
+        let active = task("active", 3, &[]);
+        store.update_status(&active.id, TaskStatus::InProgress, None).unwrap();
+
+        let all = store.list().unwrap();
+        let next = next_steps(&all);
+        let order: Vec<&str> = next.iter().map(|s| s.task.title.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "active",           // in progress, whatever its priority
+                "base",             // frontier, by priority
+                "after shelved",    // an archived dependency counts as done
+                "held",             // assigned, not started
+                "after base",       // waiting, by priority
+                "held and waiting", // waiting outranks assigned
+                "dangling",         // a missing dependency is unmet
+            ]
+        );
+
+        let by_title = |t: &str| next.iter().find(|s| s.task.title == t).unwrap();
+        assert!(by_title("base").is_ready());
+        assert!(by_title("after shelved").is_ready());
+        assert!(!by_title("held").is_ready());
+        assert!(!by_title("after base").is_ready());
+        assert!(!by_title("active").is_ready(), "in progress is not the frontier");
+        assert_eq!(by_title("base").note(), None);
+        assert_eq!(by_title("held").note().as_deref(), Some("assigned to alice"));
+        assert_eq!(by_title("after base").note(), Some(format!("waits on {}", base.id)));
+        assert_eq!(
+            by_title("held and waiting").note(),
+            Some(format!("waits on {}; assigned to bob", base.id))
+        );
+        assert_eq!(by_title("dangling").note().as_deref(), Some("waits on T-9999"));
+
+        // The rule the list promises is the rule the engine enforces: every
+        // task marked ready really can start, and a waiting one really cannot.
+        for step in next.iter().filter(|s| s.is_ready()) {
+            assert!(store.update_status(&step.task.id, TaskStatus::InProgress, None).is_ok());
+        }
+        let err =
+            store.update_status(&after_base.id, TaskStatus::InProgress, None).unwrap_err();
+        assert_eq!(err.kind(), "dependencies_unmet");
+        let err = store.update_status(&dangling.id, TaskStatus::InProgress, None).unwrap_err();
+        assert_eq!(err.kind(), "dependencies_unmet");
     }
 
     // ── Collaboration fields (D31) ──────────────────────────────────────────

@@ -9,8 +9,8 @@
       "title": "Spec",
       "description": "Define requirements, acceptance criteria and key technical decisions.",
       "aiInstructions": [
-        "Read the handoff and context.json, then shape the requirements into a verifiable spec.",
-        "Break the implementation into atomic tasks (with acceptance criteria) under tasks/.",
+        "Read the handoff and context.json. If the requirements are still vague, call the Skill tool with align-scope and settle what done means first.",
+        "Turn the settled scope into vertical-slice tasks with their dependencies: call the Skill tool with slice-work.",
         "Record key technical choices (framework, data structures, boundaries) as decisions."
       ],
       "exitGates": [
@@ -23,10 +23,11 @@
       "title": "Implement",
       "description": "Complete the tasks one by one against the spec.",
       "aiInstructions": [
-        "Implement by priority and follow the execution guidelines in rules.json.",
-        "Logic before interface: core logic first, with tests.",
+        "Take work from the frontier: the highest-priority task in Next steps that you can take, or list_tasks { ready: true }. Follow the execution guidelines in rules.json.",
+        "Build each task test-first: call the Skill tool with test-first. For a bug whose cause is not obvious, call it with debug-loop.",
         "If validate_task_specs is in your tool list, a task that changes behaviour writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
-        "Mark done and commit after each atomic task."
+        "Mark done and commit after each atomic task.",
+        "When several independent tasks are ready at once, suggest the user run /work-the-frontier to build them in parallel."
       ],
       "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
     },
@@ -35,7 +36,8 @@
       "title": "Verify",
       "description": "Tests, checks and a real run.",
       "aiInstructions": [
-        "Run the full test suite and actually exercise the main flows.",
+        "Review the work on two axes — the project's conventions and what the tasks asked for: call the Skill tool with two-axis-review, then fix what it finds.",
+        "Run the full test suite and actually exercise the main flows; give the user the before-and-after evidence they need to mark tasks verified.",
         "Record the verification results and known limitations as decisions."
       ],
       "exitGates": [
@@ -49,7 +51,7 @@
       "description": "Assemble the deliverables and release notes.",
       "aiInstructions": [
         "Put the deliverables and usage instructions into artifacts/.",
-        "Write artifacts/release-notes.md: what changed, known limitations, follow-up suggestions."
+        "Write artifacts/release-notes.md: call the Skill tool with ship-notes — the smallest picture of the change, before-and-after evidence, and whether it can be undone."
       ],
       "exitGates": [
         { "kind": "artifact_exists", "path": "artifacts/release-notes.md" },
@@ -61,7 +63,7 @@
       "title": "Retrospect",
       "description": "Turn friction points into rule improvements.",
       "aiInstructions": [
-        "Answer flywheel.postMortemPrompts in rules.json.",
+        "Call the Skill tool with retrospect: it starts from post_mortem_candidates and the flywheel prompts, and turns mechanical mistakes into checks, the rest into lessons, boundaries or rejections.",
         "Write the improvements back into executionGuidelines and leave a revisionHistory entry."
       ],
       "exitGates": [{ "kind": "manual_confirm", "prompt": "Retrospective done and rules.json updated" }]

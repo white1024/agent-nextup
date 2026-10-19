@@ -271,15 +271,18 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
     if next.is_empty() {
         let _ = writeln!(md, "_No open tasks. Define the next atomic tasks in `tasks/`._");
     } else {
-        for task in next.iter().take(NEXT_STEPS) {
+        for step in next.iter().take(NEXT_STEPS) {
+            let task = step.task;
             let marker = if task.status == TaskStatus::InProgress { "▶" } else { "·" };
+            let note = step.note().map(|n| format!(" ({n})")).unwrap_or_default();
             let _ = writeln!(
                 md,
-                "- {} **[P{}] {}** — {}",
+                "- {} **[P{}] {}** — {}{}",
                 marker,
                 task.priority,
                 task.id,
-                lens_title(&task.title)
+                lens_title(&task.title),
+                note
             );
         }
     }
@@ -572,6 +575,27 @@ mod tests {
         let active = md.find("active work").unwrap();
         let todo = md.find("low prio todo").unwrap();
         assert!(active < todo, "in-progress task must be listed before todos");
+    }
+
+    /// D147: the snapshot's next steps carry the same annotation as the
+    /// state block — both call `NextStep::note`, so neither can drop it alone.
+    #[test]
+    fn next_steps_say_what_a_task_waits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let first = store
+            .create(NewTask { title: "lay the schema".into(), ..Default::default() })
+            .unwrap();
+        store
+            .create(NewTask {
+                title: "build on the schema".into(),
+                depends_on: vec![first.id.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let md = render(&store.list().unwrap(), &[], &[]);
+        assert!(md.contains(&format!("build on the schema (waits on {})", first.id)), "{md}");
     }
 
     #[test]

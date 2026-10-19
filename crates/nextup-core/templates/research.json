@@ -10,7 +10,7 @@
       "description": "把研究問題收斂成可回答的範圍。",
       "aiInstructions": [
         "把研究問題、子問題與排除範圍寫進 context.json 的 goals/boundaries。",
-        "為每個子問題建立蒐集任務（來源類型、關鍵字）。"
+        "用 slice-work 把子問題變成任務（呼叫 Skill 工具執行）：每個子問題一個蒐集任務（來源類型、關鍵字），並寫明彼此的相依。"
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]
     },
@@ -64,7 +64,7 @@
       "title": "復盤",
       "description": "改進研究流程本身。",
       "aiInstructions": [
-        "回答 flywheel 提問並把改進寫回 rules.json。"
+        "呼叫 Skill 工具執行 retrospect，再把改進寫回 rules.json。"
       ],
       "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
     }

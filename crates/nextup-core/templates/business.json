@@ -19,7 +19,7 @@
       "title": "策略",
       "description": "定方向並拆成可執行動作。",
       "aiInstructions": [
-        "把策略拆成可驗收的行動任務（負責範圍、完成定義）。",
+        "用 slice-work 把策略拆成可驗收的行動任務（呼叫 Skill 工具執行）：負責範圍、完成定義、相依。",
         "以「決策」記錄取捨（做什麼、不做什麼、為什麼）。"
       ],
       "exitGates": [
@@ -52,7 +52,7 @@
       "title": "復盤",
       "description": "沉澱可複用的方法。",
       "aiInstructions": [
-        "回答 flywheel 提問並把可複用的方法寫回 rules.json。"
+        "呼叫 Skill 工具執行 retrospect，並把可複用的方法寫回 rules.json。"
       ],
       "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]
     }

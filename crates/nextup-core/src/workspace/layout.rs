@@ -65,6 +65,7 @@ pub const SECRETS_FILE: &str = "secrets.enc";
 pub const LEDGER_FILE: &str = "ledger.jsonl";
 pub const MUTEX_FILE: &str = ".mutex";
 pub const AGENT_ACCESS_FILE: &str = "agent_access.json";
+pub const RESTORED_ACCESS_FILE: &str = "agent_access.restored.json";
 pub const MODULES_FILE: &str = "modules.json";
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const SHIPPED_ASSETS_FILE: &str = "shipped_assets.json";
@@ -169,6 +170,13 @@ impl WorkspacePaths {
     /// Hub-tool authorization registry for external agents (see crate::agent).
     pub fn agent_access_file(&self) -> PathBuf {
         self.nextup_dir().join(AGENT_ACCESS_FILE)
+    }
+
+    /// Write-tool grants a restored backup carried but did not apply (D143):
+    /// waiting for a person to accept or drop them on the Tools page. Absent
+    /// whenever there is nothing to decide.
+    pub fn restored_access_file(&self) -> PathBuf {
+        self.nextup_dir().join(RESTORED_ACCESS_FILE)
     }
 
     /// Enabled capability modules (see workspace::modules, D31).

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 // component, the other a `key` on a JSX block — there is nothing a unit test
 // can call, so they are held to the source that states them.
 import app from "./App.tsx?raw";
+import settings from "./views/ProjectSettings.tsx?raw";
 
 describe("changing project keeps the page", () => {
   it("re-homes you only when the action was entering or leaving a project", () => {
@@ -38,6 +39,24 @@ describe("changing project keeps the page", () => {
     );
     expect(app).toMatch(
       /applySwitched = useCallback\(\s*\(s: SystemStatus\) => applyStatus\(s, "switch"\)/,
+    );
+  });
+
+  it("has a save on project settings report a refresh, not an entry", () => {
+    // Saving project info (D142) re-reads system_status so the dashboard's
+    // domain chip catches up. Handed the entry landing, that read sent you to
+    // the dashboard in the middle of the save, and the "saved" flash went down
+    // with the page that showed it — nothing failed, the confirmation just
+    // never appeared (acceptance step 95 ⓑ). Closing the project from the same
+    // page still wants the entry landing, so the page takes both callbacks.
+    expect(app, "project settings lost its refresh callback").toContain(
+      "onStatusRefreshed={applyRefreshed}",
+    );
+    expect(app).toMatch(
+      /applyRefreshed = useCallback\(\s*\(s: SystemStatus\) => applyStatus\(s, "refresh"\)/,
+    );
+    expect(settings, "saving project info re-homes the app again").toContain(
+      "api.systemStatus().then(onStatusRefreshed)",
     );
   });
 });

@@ -79,15 +79,8 @@ pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<Stri
     // actually discovers them. Never a symlink — see layout::AGENT_CONFIG_DIR.
     // Each is write-if-missing on its own, so a user who edits one keeps that
     // edit; doctor::check_skill_mirrors is what stops the pair forking in
-    // silence.
-    for (name, content) in WORKSPACE_SKILLS {
-        for (rel, path) in paths.skill_files(name) {
-            if !path.exists() {
-                atomic_write(&path, content.as_bytes())?;
-                created.push(rel);
-            }
-        }
-    }
+    // silence. Which skills: the generic set plus the template's pack (D148).
+    created.extend(ensure_skills(paths)?);
     // Module guides: only for what this workspace enabled (D82). A corrupt
     // modules.json is a hard error here rather than a silent "nothing
     // enabled" — shipping an agent a workspace with its module contract
@@ -181,14 +174,19 @@ pub(crate) fn imports_agents_md(content: &str) -> bool {
     false
 }
 
-/// Generic process skills shipped into every workspace at init (D30).
+/// Process skills shipped into every workspace at init (D30).
 ///
-/// Single source = this repo's own `.claude/skills/` — the dev repo dogfoods
-/// the exact files it exports, so there is no template copy to drift. The
-/// skills must stay **generic** (they defer project specifics to the target
-/// project's own `CLAUDE.md`); `shipped_skills_stay_generic` guards that.
+/// Two sources, one file each — nothing is ever copied:
+/// - the generic process skills come from this repo's own `.claude/skills/`,
+///   so the dev repo dogfoods the exact files it exports;
+/// - the engine-wired ones (D148) come from `crates/nextup-core/skills/`.
+///   They speak in a managed workspace's hub tools (`create_task`,
+///   `post_mortem_candidates`, …), which this dev repo does not have, so
+///   dogfooding them here would advertise tools no session here can call.
+///
+/// Neither kind may name a fact of this repo (`shipped_skills_stay_generic`).
 /// Written only when missing, so user edits in a workspace survive.
-pub const WORKSPACE_SKILLS: [(&str, &str); 4] = [
+pub const WORKSPACE_SKILLS: [(&str, &str); 6] = [
     ("align-scope", include_str!("../../../../.claude/skills/align-scope/SKILL.md")),
     ("wrap-up", include_str!("../../../../.claude/skills/wrap-up/SKILL.md")),
     (
@@ -196,7 +194,74 @@ pub const WORKSPACE_SKILLS: [(&str, &str); 4] = [
         include_str!("../../../../.claude/skills/adversarial-review/SKILL.md"),
     ),
     ("handoff-check", include_str!("../../../../.claude/skills/handoff-check/SKILL.md")),
+    ("slice-work", include_str!("../../skills/slice-work/SKILL.md")),
+    ("retrospect", include_str!("../../skills/retrospect/SKILL.md")),
 ];
+
+/// The coding domain pack (D148): engine-wired adaptations of the coding
+/// disciplines, shipped only where they apply.
+pub const CODING_SKILLS: [(&str, &str); 5] = [
+    ("test-first", include_str!("../../skills/test-first/SKILL.md")),
+    ("debug-loop", include_str!("../../skills/debug-loop/SKILL.md")),
+    ("two-axis-review", include_str!("../../skills/two-axis-review/SKILL.md")),
+    ("ship-notes", include_str!("../../skills/ship-notes/SKILL.md")),
+    ("work-the-frontier", include_str!("../../skills/work-the-frontier/SKILL.md")),
+];
+
+/// Skill packs, keyed by the workflow template whose phases call them (D148).
+/// The key is the template and not `context.json`'s domain: the domain is a
+/// free-form label nothing branches on (context.rs), and only the template's
+/// own phase instructions name these skills — keying on anything else would
+/// let a workspace be told to call skills it was never given.
+pub const TEMPLATE_SKILLS: [(&str, &[(&str, &str)]); 1] = [("coding-v1", &CODING_SKILLS)];
+
+/// Every skill this workspace should carry: the generic set plus the pack its
+/// workflow template calls. The one answer scaffold, the upgrade curriculum and
+/// adopting a template all share, so they can never disagree about what a
+/// workspace is owed. No `workflow.json` means no pack; a corrupt one is an
+/// error rather than a silent "no pack", which would drop live skills out of
+/// upgrades (the same stance as modules.json in the curriculum).
+pub fn shipped_skills(paths: &WorkspacePaths) -> Result<Vec<(&'static str, &'static str)>> {
+    let mut skills = WORKSPACE_SKILLS.to_vec();
+    if paths.workflow_file().is_file() {
+        let template_id =
+            crate::workspace::workflow::load_workflow(&paths.workflow_file())?.template_id;
+        for (pack_template, pack) in TEMPLATE_SKILLS {
+            if template_id == pack_template {
+                skills.extend_from_slice(pack);
+            }
+        }
+    }
+    Ok(skills)
+}
+
+/// Every skill the engine can ship, whatever the template — for checks that
+/// only compare what is already on disk.
+pub fn all_known_skills() -> Vec<(&'static str, &'static str)> {
+    let mut skills = WORKSPACE_SKILLS.to_vec();
+    for (_, pack) in TEMPLATE_SKILLS {
+        skills.extend_from_slice(pack);
+    }
+    skills
+}
+
+/// Write every skill this workspace is owed and lacks, to both roots (D82).
+/// Each copy is write-if-missing on its own, so a user's edit survives; returns
+/// the workspace-relative paths it created. Callers outside `scaffold` must
+/// follow with `assets::record_pristine`, or the files land without a
+/// fingerprint and the next engine change reads them as needing a human.
+pub(crate) fn ensure_skills(paths: &WorkspacePaths) -> Result<Vec<String>> {
+    let mut created = Vec::new();
+    for (name, content) in shipped_skills(paths)? {
+        for (rel, path) in paths.skill_files(name) {
+            if !path.exists() {
+                atomic_write(&path, content.as_bytes())?;
+                created.push(rel);
+            }
+        }
+    }
+    Ok(created)
+}
 
 /// Per-module guides, shipped **only for the modules a workspace enabled**
 /// (D82). Same single-source discipline as the main guide: prose lives in its
@@ -509,14 +574,17 @@ fn render_state_block(
     if next.is_empty() {
         md.push_str("- (no open tasks; break new ones out of this phase's instructions)\n");
     } else {
-        for task in next.iter().take(5) {
+        for step in next.iter().take(5) {
+            let task = step.task;
             let marker = if task.status == TaskStatus::InProgress { "▶" } else { "·" };
+            let note = step.note().map(|n| format!(" ({n})")).unwrap_or_default();
             md.push_str(&format!(
-                "- {} [P{}] {} — {}\n",
+                "- {} [P{}] {} — {}{}\n",
                 marker,
                 task.priority,
                 task.id,
-                state_title(&task.title)
+                state_title(&task.title),
+                note
             ));
         }
     }
@@ -782,7 +850,7 @@ mod tests {
         assert!(paths.mcp_discovery_file().is_file());
         // D82: both skill roots are real files with identical bytes. The
         // mirror is what Claude Code reads; the `.agents/` copy is canonical.
-        for (name, _) in WORKSPACE_SKILLS {
+        for (name, _) in shipped_skills(&paths).unwrap() {
             let [(_, canonical), (_, mirror)] = paths.skill_files(name);
             assert!(canonical.is_file(), "skill '{name}' shipped to .agents/skills/");
             assert!(mirror.is_file(), "skill '{name}' mirrored into .claude/skills/");
@@ -845,9 +913,12 @@ mod tests {
         // what agents actually execute each session, so it must promote every
         // shipped skill. Field evidence: a managed workspace with all three
         // skills on disk logged 289 ledger events and zero skill activations,
-        // because the trigger lived only in skill descriptions.
+        // because the trigger lived only in skill descriptions. D147: it names
+        // them as Skill tool calls, not `/name` slash prose — naming the tool
+        // is what gets a skill fired, and the name alone ties to no harness.
+        assert!(protocol.contains("call the Skill tool"), "the protocol says how to invoke them");
         for (name, _) in WORKSPACE_SKILLS {
-            assert!(protocol.contains(&format!("/{name}")), "the protocol must promote '/{name}'");
+            assert!(protocol.contains(&format!("`{name}`")), "the protocol must promote '{name}'");
         }
         // D19 seed sections: anti-re-pitch + judgment rubric + delegation
         // contract + environment facts + revision-authority tiers.
@@ -1234,6 +1305,38 @@ mod tests {
         assert!(claude.contains(&format!("`{blocked_at}` reason: 等 API 金鑰")), "{claude}");
     }
 
+    /// D147: a task the engine would refuse to start says why, right where
+    /// the next session picks from. The ordering itself is pinned in
+    /// `tasks::next_steps_lead_with_the_frontier`; this pins that the state
+    /// block prints the annotation rather than just the title.
+    #[test]
+    fn state_block_marks_tasks_that_cannot_start_yet() {
+        let (_g, paths) = workspace();
+        let first = create_task(
+            &paths,
+            "0.1.0",
+            NewTask { title: "lay the schema".into(), ..Default::default() },
+        )
+        .unwrap();
+        create_task(
+            &paths,
+            "0.1.0",
+            NewTask {
+                title: "build on the schema".into(),
+                depends_on: vec![first.id.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let claude = std::fs::read_to_string(paths.agents_md_file()).unwrap();
+        assert!(
+            claude.contains(&format!("build on the schema (waits on {})", first.id)),
+            "{claude}"
+        );
+        assert!(!claude.contains("lay the schema ("), "a ready task carries no note: {claude}");
+    }
+
     /// Rejections have their own home (the do-not-revisit list) and must not
     /// crowd the decision window, which shows only a handful: a session that
     /// dutifully records what it turned down would otherwise push every real
@@ -1306,7 +1409,9 @@ mod tests {
             "cargo",
             "pnpm",
         ];
-        for (name, content) in WORKSPACE_SKILLS {
+        // Domain packs too (D148): a coding pack may talk about tests and
+        // commits, but never about this repo's toolchain.
+        for (name, content) in all_known_skills() {
             assert!(
                 content.contains(&format!("name: {name}")),
                 "skill '{name}' frontmatter name matches its directory"

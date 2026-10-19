@@ -10,8 +10,7 @@
       "description": "Break the goal into atomic tasks completable within a single session.",
       "aiInstructions": [
         "Read .nextup/snapshots/latest_handoff.md and context.json first to calibrate goals and boundaries.",
-        "Break the work into atomic tasks under tasks/; each task title must be independently verifiable.",
-        "Write acceptance criteria and priority into each task description."
+        "Break the work into tasks with slice-work (call the Skill tool with it): each one deliverable and verifiable on its own, with its acceptance criteria, priority and dependencies."
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]
     },
@@ -46,7 +45,7 @@
       "title": "Retrospect",
       "description": "The self-improvement flywheel: write what this cycle taught you back into the rules.",
       "aiInstructions": [
-        "Answer each question in flywheel.postMortemPrompts of rules.json.",
+        "Call the Skill tool with retrospect: it starts from post_mortem_candidates, answers flywheel.postMortemPrompts, and turns mechanical mistakes into checks.",
         "Write actionable improvements back into executionGuidelines of rules.json and leave a revisionHistory entry.",
         "Refresh the handoff snapshot once via the generate_handoff tool (or ask the user to click it in the GUI) so the next cycle starts from a clean snapshot."
       ],

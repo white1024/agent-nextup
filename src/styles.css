@@ -1739,6 +1739,35 @@ select {
   line-height: 1.55;
 }
 
+/* Grants a restored backup parked for a click (D143). */
+.restored-grants p {
+  margin: 0;
+}
+
+.restored-grants .rg-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-2);
+  margin-top: var(--s-2);
+}
+
+.restored-grants .rg-actions {
+  display: flex;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+
+/* In-app update messages that carry their own buttons (D144). */
+.update-box p {
+  margin: 0;
+}
+
+.update-box .ub-actions {
+  display: flex;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+
 /* "You might be looking for →" line linking the two settings pages
    (product review §5-10). */
 .scope-hint {

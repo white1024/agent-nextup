@@ -89,11 +89,27 @@ First launch
   The build is not code-signed, so SmartScreen shows an unknown-publisher
   warning. Choose "More info", then "Run anyway".
 
+Updating
+  The installed app can update itself from Settings; this build cannot,
+  because its installer would put a second, installed copy beside this one.
+  Download the next portable zip from the releases page and unzip it over
+  this folder (or anywhere else).
+
 If it still will not run
   AppLocker and WDAC block by execution policy rather than by installation,
   so a portable build does not get past them either. That one needs your IT
   administrator.
 `.replace(/\n/g, "\r\n"),
+);
+
+// The marker that turns off in-app install (D144, src-tauri/src/update.rs).
+// Without it the updater cannot tell this exe from the installed one and
+// would run the NSIS installer — a second copy in Program Files, not an
+// update of this folder. Named after the exe so the app finds it with one
+// with_extension() call; its content is only a note for whoever opens it.
+writeFileSync(
+  join(stage, "agent-nextup.portable"),
+  "This file marks a portable build: Settings offers the download page instead of installing an update. Keep it beside agent-nextup.exe.\r\n",
 );
 
 const zip = join(outDir, `Agent NextUp_${version}_${arch}_portable.zip`);

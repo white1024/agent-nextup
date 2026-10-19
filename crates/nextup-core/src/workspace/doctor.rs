@@ -95,6 +95,7 @@ pub fn run_doctor_at(root: &Path, now: DateTime<Utc>) -> Result<DoctorReport> {
 
     if mode == DoctorMode::Managed {
         check_entry_shell(&paths, &mut findings);
+        check_hub_discovery(&paths, &mut findings);
         check_marker_block(&paths, &mut findings);
         check_skill_mirrors(&paths, &mut findings);
         check_context(&paths, &mut findings);
@@ -203,6 +204,56 @@ fn check_entry_shell(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) 
     }
 }
 
+/// The root `.mcp.json` must point the agent host at a hub that exists *here*.
+///
+/// The app writes the absolute path of its own `nextup-mcp` into the file so
+/// nobody has to set up PATH (D25). That path belongs to one machine, while the
+/// file often travels with the project — through git or a synced folder — so a
+/// second machine pulls the first one's path and every agent there fails to
+/// connect, with nothing on the agent's side saying why (seen 2026-07-25 on a
+/// managed project; 04 lists the case). Only the "a path that is not here"
+/// shape is reported: a bare `nextup-mcp` is the portable default and resolves
+/// through PATH, which this crate cannot judge for the agent host.
+///
+/// Reports, never repairs. Opening a workspace is a read (D41); the fix is one
+/// press on the Tools page, where the person can see what it changes.
+fn check_hub_discovery(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) {
+    let file = paths.mcp_discovery_file();
+    let Ok(raw) = std::fs::read(&file) else { return };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        findings.push(finding(
+            "hub_discovery",
+            DoctorSeverity::Warning,
+            ".mcp.json",
+            ".mcp.json is not valid JSON, so agent hosts cannot read it and will not \
+             connect to the hub — fix the file by hand (it may hold other servers you added)",
+        ));
+        return;
+    };
+    let Some(command) = value
+        .get("mcpServers")
+        .and_then(|s| s.get("nextup"))
+        .and_then(|n| n.get("command"))
+        .and_then(|c| c.as_str())
+    else {
+        return;
+    };
+    let looks_like_path =
+        command.contains('/') || command.contains('\\') || Path::new(command).is_absolute();
+    if looks_like_path && !Path::new(command).is_file() {
+        findings.push(finding(
+            "hub_discovery",
+            DoctorSeverity::Warning,
+            ".mcp.json",
+            format!(
+                "the hub command in .mcp.json ({command}) does not exist on this machine, so \
+                 agents here cannot connect — usually the path another machine wrote, carried \
+                 over by git or a synced folder. Press \"Repair connection\" on the Tools page"
+            ),
+        ));
+    }
+}
+
 /// The two skill copies must stay byte-identical (D82).
 ///
 /// A single compiled-in source guarantees the engine *writes* the same bytes
@@ -213,7 +264,9 @@ fn check_entry_shell(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) 
 /// is not hypothetical: a reference repo in the same survey had already drifted
 /// its two copies apart by a few hundred bytes.
 fn check_skill_mirrors(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) {
-    for (name, _) in crate::workspace::bootstrap::WORKSPACE_SKILLS {
+    // Every skill the engine knows, not just this template's pack (D148): any
+    // pair that exists on disk must agree, whoever put it there.
+    for (name, _) in crate::workspace::bootstrap::all_known_skills() {
         let [(canon_rel, canon), (mirror_rel, mirror)] = paths.skill_files(name);
         // Missing files are the shipped-asset check's business, not ours; we
         // only speak up when both exist and disagree.
@@ -837,6 +890,31 @@ mod tests {
 
     fn checks_of(report: &DoctorReport) -> Vec<&str> {
         report.findings.iter().map(|f| f.check.as_str()).collect()
+    }
+
+    /// Another machine's hub path in `.mcp.json` is the cross-machine failure
+    /// this check exists for; the portable bare name and a path that exists
+    /// here must both stay quiet.
+    #[test]
+    fn a_hub_path_from_another_machine_is_reported() {
+        let (dir, paths) = managed_workspace();
+        let here = dir.path().join("nextup-mcp-here.exe");
+        std::fs::write(&here, b"").unwrap();
+        let gone = dir.path().join("elsewhere").join("nextup-mcp.exe");
+
+        for (command, reported) in [
+            ("nextup-mcp".to_string(), false),
+            (here.to_string_lossy().into_owned(), false),
+            (gone.to_string_lossy().into_owned(), true),
+        ] {
+            crate::workspace::bootstrap::set_mcp_discovery_command(&paths, &command).unwrap();
+            let report = run_doctor(paths.root()).unwrap();
+            assert_eq!(checks_of(&report).contains(&"hub_discovery"), reported, "{command}");
+        }
+
+        std::fs::write(paths.mcp_discovery_file(), b"{ not json").unwrap();
+        let report = run_doctor(paths.root()).unwrap();
+        assert!(checks_of(&report).contains(&"hub_discovery"), "an unreadable file is reported too");
     }
 
     /// A prime workspace is keyed on its stable id, so one without an id has a

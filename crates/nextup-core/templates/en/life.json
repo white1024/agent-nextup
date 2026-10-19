@@ -19,7 +19,7 @@
       "title": "Plan",
       "description": "Break it into steps small enough to finish.",
       "aiInstructions": [
-        "Break the focus into small tasks finishable within a week — smaller is better."
+        "Break the focus into small tasks finishable within a week — smaller is better. The slice-work skill walks the breakdown with the user (call the Skill tool with it)."
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]
     },
@@ -37,6 +37,7 @@
       "title": "Reflect",
       "description": "Keep a record and decide the next cycle.",
       "aiInstructions": [
+        "Call the Skill tool with retrospect to collect what got in the way and where each fix belongs.",
         "Review what worked and what did not, and write it up as a decision.",
         "Decide the next cycle's focus and return to Clarify (start a new project or adjust the goals)."
       ],

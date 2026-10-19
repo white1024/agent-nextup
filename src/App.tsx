@@ -92,11 +92,12 @@ type View =
   | "projectSettings";
 
 /**
- * What a `system_status` change was: going into a project (or out of one), or
- * trading one open project for another. `applyStatus` below is the only
- * reader, and the distinction is the whole reason it takes an argument.
+ * What a `system_status` change was: going into a project (or out of one),
+ * trading one open project for another, or a newer read of the one already
+ * open. `applyStatus` below is the only reader, and the distinction is the
+ * whole reason it takes an argument.
  */
-type StatusChange = "enter" | "switch";
+type StatusChange = "enter" | "switch" | "refresh";
 
 const NAV: { view: View; icon: ComponentType<IconProps> }[] = [
   { view: "dashboard", icon: IconDashboard },
@@ -664,6 +665,10 @@ export default function App() {
     (s: SystemStatus) => applyStatus(s, "switch"),
     [applyStatus],
   );
+  const applyRefreshed = useCallback(
+    (s: SystemStatus) => applyStatus(s, "refresh"),
+    [applyStatus],
+  );
 
   const paletteCommands = useMemo<Command[]>(() => {
     if (status === null) return [];
@@ -1111,6 +1116,7 @@ export default function App() {
                 <ProjectSettings
                   status={status}
                   onStatusChange={applyStatus}
+                  onStatusRefreshed={applyRefreshed}
                   modules={modules}
                   onModulesChange={setModules}
                   onGoToAppSettings={() => setView("settings")}

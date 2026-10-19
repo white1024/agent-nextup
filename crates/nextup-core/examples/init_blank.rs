@@ -23,7 +23,9 @@ fn main() {
     let params = InitProjectParams {
         root: dir.clone(),
         name,
-        domain: "general".into(),
+        // Blank, as the GUI wizard leaves it: the domain then follows the
+        // template (D137), and with it the domain's skill pack (D148).
+        domain: String::new(),
         description: "E2E agent-takeover test workspace".into(),
         goals: vec![],
         boundaries: vec![],

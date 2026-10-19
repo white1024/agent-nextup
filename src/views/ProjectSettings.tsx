@@ -1,16 +1,20 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { save } from "@tauri-apps/plugin-dialog";
 
 import { api, errorMessage } from "../api";
 import { useFlash, useGuardedMutation } from "../hooks";
 import { Check, Switch } from "../components/controls";
+import { DOMAIN_SUGGESTIONS, formOf, isDirty, splitLines, type ContextForm } from "../lib/contextForm";
 import { MODULE_CATALOG } from "../lib/modules";
-import type { SystemStatus, WorkspaceModules } from "../types";
+import type { ProjectContext, SystemStatus, WorkspaceModules } from "../types";
 
 interface Props {
   status: SystemStatus;
+  /** Closing the project: the app re-homes to the projects page. */
   onStatusChange: (status: SystemStatus) => void;
+  /** A newer read of this same project: the shell catches up, the page stays. */
+  onStatusRefreshed: (status: SystemStatus) => void;
   /** Current workspace modules (loaded by App via modules_get; null while unknown). */
   modules: WorkspaceModules | null;
   /** Propagate a toggle up so the sidebar nav reflects it immediately. */
@@ -20,8 +24,8 @@ interface Props {
 }
 
 /**
- * Workspace-scoped settings (D55): modules, the AI takeover layer, backup and
- * closing the workspace. Split out of the app-level Settings page so project
+ * Workspace-scoped settings (D55): project info (D142), modules, the AI
+ * takeover layer, backup and closing the workspace. Split out of the app-level Settings page so project
  * settings live in the workspace nav rather than buried below the machine-wide
  * ones (D49's single page put them at the bottom of a long scroll). Only
  * mounted with a workspace open, so it always has one.
@@ -34,6 +38,7 @@ interface Props {
 export default function ProjectSettings({
   status,
   onStatusChange,
+  onStatusRefreshed,
   modules,
   onModulesChange,
   onGoToAppSettings,
@@ -155,6 +160,17 @@ export default function ProjectSettings({
       {error && <div className="alert alert-error">{error}</div>}
       {flash && <div className="alert alert-ok">{flash}</div>}
 
+      <ProjectInfoPanel
+        root={status.workspace?.root ?? ""}
+        onError={setError}
+        onSaved={() => {
+          showFlash(t("settings.projectInfoSaved"));
+          // The dashboard's domain chip reads system_status; the engine has
+          // already refreshed its cached copy, this just fetches it.
+          api.systemStatus().then(onStatusRefreshed).catch(() => {});
+        }}
+      />
+
       <section className="panel">
         <div className="panel-head">
           <h2 className="panel-title">{t("settings.modules")}</h2>
@@ -237,5 +253,137 @@ export default function ProjectSettings({
         </div>
       </section>
     </div>
+  );
+}
+
+/**
+ * The four context fields a person may edit after creation (D142). Loads from
+ * disk rather than from `status`, which carries only name/domain/description.
+ *
+ * Sends every field; the engine decides what changed and writes nothing when
+ * nothing did. The name is not here on purpose — it has four copies on disk
+ * (team graph, sent envelopes, rendered curriculum, registry) and each needs
+ * its own answer first.
+ */
+function ProjectInfoPanel({
+  root,
+  onError,
+  onSaved,
+}: {
+  root: string;
+  onError: (msg: string | null) => void;
+  onSaved: () => void;
+}) {
+  const { t } = useTranslation();
+  const [ctx, setCtx] = useState<ProjectContext | null>(null);
+  const [form, setForm] = useState<ContextForm>({ domain: "", description: "", goals: "", boundaries: "" });
+  const { busy, run } = useGuardedMutation(onError);
+
+  useEffect(() => {
+    let stale = false;
+    api
+      .getContext()
+      .then((c) => {
+        if (stale) return;
+        setCtx(c);
+        setForm(formOf(c));
+      })
+      .catch((e) => {
+        if (!stale) onError(errorMessage(e));
+      });
+    return () => {
+      stale = true;
+    };
+    // Re-read on project switch; onError is a stable setter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [root]);
+
+  const set = (field: keyof ContextForm) => (value: string) => setForm((f) => ({ ...f, [field]: value }));
+  const dirty = ctx !== null && isDirty(form, ctx);
+
+  function save() {
+    return run(async () => {
+      onError(null);
+      const saved = await api.editContext({
+        domain: form.domain,
+        description: form.description,
+        goals: splitLines(form.goals),
+        boundaries: splitLines(form.boundaries),
+      });
+      setCtx(saved);
+      setForm(formOf(saved));
+      onSaved();
+    });
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2 className="panel-title">{t("settings.projectInfo")}</h2>
+      </div>
+      <p className="section-hint" style={{ marginBottom: "var(--s-3)" }}>
+        {t("settings.projectInfoHint")}
+      </p>
+      <div className="form">
+        <label className="field">
+          <span>
+            {t("wizard.domain")} {t("common.optional")}
+          </span>
+          <input
+            value={form.domain}
+            onChange={(e) => set("domain")(e.target.value)}
+            placeholder={t("wizard.domainPlaceholder")}
+            list="project-domain-suggestions"
+            disabled={ctx === null}
+          />
+          <datalist id="project-domain-suggestions">
+            {DOMAIN_SUGGESTIONS.map((d) => (
+              <option key={d} value={d} />
+            ))}
+          </datalist>
+        </label>
+        <label className="field">
+          <span>
+            {t("wizard.description")} {t("common.optional")}
+          </span>
+          <textarea
+            value={form.description}
+            onChange={(e) => set("description")(e.target.value)}
+            placeholder={t("wizard.descriptionPlaceholder")}
+            rows={2}
+            disabled={ctx === null}
+          />
+        </label>
+        <label className="field">
+          <span>
+            {t("wizard.goals")} {t("common.optional")}
+          </span>
+          <textarea
+            value={form.goals}
+            onChange={(e) => set("goals")(e.target.value)}
+            placeholder={t("wizard.goalsPlaceholder")}
+            rows={3}
+            disabled={ctx === null}
+          />
+        </label>
+        <label className="field">
+          <span>
+            {t("wizard.boundaries")} {t("common.optional")}
+          </span>
+          <textarea
+            value={form.boundaries}
+            onChange={(e) => set("boundaries")(e.target.value)}
+            placeholder={t("wizard.boundariesPlaceholder")}
+            rows={3}
+            disabled={ctx === null}
+          />
+        </label>
+        <div className="form-actions">
+          <button className="btn btn-primary" onClick={() => void save()} disabled={!dirty || busy}>
+            {busy ? t("settings.projectInfoSaving") : t("settings.projectInfoSave")}
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }

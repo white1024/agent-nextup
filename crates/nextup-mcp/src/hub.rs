@@ -39,7 +39,7 @@ use nextup_core::workspace::ops;
 use nextup_core::workspace::prime;
 use nextup_core::workspace::specs;
 use nextup_core::workspace::teams;
-use nextup_core::workspace::tasks::{NewTask, Task, TaskStatus, TaskStore};
+use nextup_core::workspace::tasks::{NewTask, NextStep, Task, TaskStatus, TaskStore};
 use nextup_core::workspace::workflow;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -104,9 +104,9 @@ fn find_member<'a>(
     workspace_id: &str,
 ) -> nextup_core::Result<&'a nextup_core::workspace::teams::TeamMember> {
     team.members.iter().find(|m| m.workspace_id == workspace_id).ok_or_else(|| {
-        nextup_core::NextUpError::NotFound(format!(
-            "workspace {workspace_id} is not a member of team \"{}\"",
-            team.name
+        nextup_core::NextUpError::NotFound(nextup_core::workspace::teams::not_a_member_message(
+            team,
+            workspace_id,
         ))
     })
 }
@@ -424,6 +424,9 @@ pub struct ListTasksArgs {
     /// Include archived tasks (D40). Defaults to false: archived tasks are not listed, though the files remain and get_task can still read them
     #[serde(default)]
     pub include_archived: bool,
+    /// Only tasks you can start right now: todo, every dependsOn task done, and nobody assigned to it (by claim or by dispatch). Your own assigned work is assignee=<you>. The same rule the handoff's next steps apply (D147)
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -784,7 +787,7 @@ impl Hub {
 
     #[tool(
         name = "list_tasks",
-        description = "List tasks, optionally filtered by status or assignee. Archived tasks are excluded unless includeArchived is true."
+        description = "List tasks, optionally filtered by status or assignee, or with ready=true to get only the ones that can start now (todo, dependencies done, unassigned). Archived tasks are excluded unless includeArchived is true."
     )]
     async fn list_tasks(
         &self,
@@ -792,6 +795,16 @@ impl Hub {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("list_tasks", move |paths| {
             let mut tasks = TaskStore::new(paths.tasks_dir()).list()?;
+            // Readiness first, against every file: a dependency may point at
+            // an archived task, and archived means done.
+            if args.ready {
+                let ready: Vec<String> = tasks
+                    .iter()
+                    .filter(|t| NextStep::of(t, &tasks).is_ready())
+                    .map(|t| t.id.clone())
+                    .collect();
+                tasks.retain(|t| ready.contains(&t.id));
+            }
             // D40: archived = closed and shelved; agents get the working set
             // by default (the files stay readable via get_task).
             if !args.include_archived {
@@ -867,7 +880,7 @@ impl Hub {
 
     #[tool(
         name = "set_task_verification",
-        description = "Mark or clear a task as verified. done is only a claim of completion; mark it verified only after actually running it and observing correct behaviour, and note must carry the evidence (what you ran, what you saw). Any change to the task's status invalidates the verification automatically. Returns a compact result; call generate_handoff for the full snapshot."
+        description = "Mark or clear a task as verified. done is only a claim of completion; mark it verified only after actually running it and observing correct behaviour, and note must carry the evidence (what you ran, what you saw; where the work fixed or changed something, the failing run before as well as the passing run after). Any change to the task's status invalidates the verification automatically. Returns a compact result; call generate_handoff for the full snapshot."
     )]
     async fn set_task_verification(
         &self,
@@ -1517,8 +1530,8 @@ impl Hub {
                 if !reachable.contains(id) {
                     return Err(nextup_core::NextUpError::InvalidInput(if from_prime {
                         format!(
-                            "workspace {id} is not a member of team \"{}\" — add it first",
-                            team.name
+                            "{} — add it first",
+                            nextup_core::workspace::teams::not_a_member_message(&team, id)
                         )
                     } else {
                         format!(
@@ -1684,7 +1697,7 @@ impl Hub {
 
     #[tool(
         name = "upgrade_workspace_assets",
-        description = "Bring the engine material (the operating guide and the generic skills) up to the current engine version (D38). Only two states are touched: safe to upgrade, meaning the content is still exactly what the engine shipped and a newer version exists, and missing. Anything about to be overwritten is backed up to .nextup/asset_backups/ first. User-customised items and items needing human confirmation are never touched, only reported — relay that list to the user to handle on the app's tools page. dryRun=true returns the five-state listing without writing."
+        description = "Bring the engine material (the operating guide, module guides and the workflow skills, including a template's skill pack) up to the current engine version (D38). Only two states are touched: safe to upgrade, meaning the content is still exactly what the engine shipped and a newer version exists, and missing. Anything about to be overwritten is backed up to .nextup/asset_backups/ first. User-customised items and items needing human confirmation are never touched, only reported — relay that list to the user to handle on the app's tools page. dryRun=true returns the five-state listing without writing."
     )]
     async fn upgrade_workspace_assets(
         &self,
@@ -1797,7 +1810,7 @@ impl ServerHandler for Hub {
             "The Agent NextUp control hub. Route every task, decision, milestone and phase \
              advance through these tools rather than editing tasks/*.json or files under \
              .nextup/ by hand: the tools keep the ledger and the handoff layer in sync, \
-             and hand edits do not. Read-only tools are always available; write tools \
+             and hand edits do not. Read-only tools need no grant; write tools \
              require the user to grant access on the Agent NextUp tools page."
                 .into(),
         );
@@ -2843,6 +2856,11 @@ mod tests {
         assert_eq!(body["blockingTasks"][0]["id"], "T-0001");
         assert_eq!(body["blockingTasks"][0]["status"], "todo");
 
+        // The frontier (D147): T-0001 can start now; T-0002 waits on it.
+        let ready = call(&fe, "list_tasks", json!({ "ready": true })).await;
+        assert!(text_of(&ready).contains("T1 shell"), "got: {}", text_of(&ready));
+        assert!(!text_of(&ready).contains("T-0002"), "got: {}", text_of(&ready));
+
         // Claim CAS: fe takes T-0001 (slim result, D33), data cannot steal it —
         // and the refusal names the owner in a structured field (D32)…
         let claimed = call(&fe, "claim_task", json!({ "id": "T-0001" })).await;
@@ -2850,6 +2868,9 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&text_of(&claimed)).unwrap();
         assert_eq!(body["task"]["assignee"], "fe");
         assert_eq!(body["handoffRefreshed"], true);
+        // Claimed is off the frontier for everyone, the claimer included.
+        let ready = call(&data, "list_tasks", json!({ "ready": true })).await;
+        assert!(!text_of(&ready).contains("T1 shell"), "got: {}", text_of(&ready));
         // Re-claiming your own task is a no-op: nothing changed, nothing regenerated.
         let again = call(&fe, "claim_task", json!({ "id": "T-0001" })).await;
         assert_ne!(again.is_error, Some(true), "got: {}", text_of(&again));

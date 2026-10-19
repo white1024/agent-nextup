@@ -111,7 +111,8 @@ export type LedgerKind =
   | "workspace_id_assigned"
   | "delivery_published"
   | "delivery_routed"
-  | "delivery_received";
+  | "delivery_received"
+  | "context_edited";
 
 /** The three free-form ledger channels a session may write directly (D78) —
  * every other kind is engine-stamped by its own operation. */
@@ -381,6 +382,23 @@ export interface AgentAccessView {
   writeToolGroups: ToolGroupView[];
   /** Tool id → why it is off in a fresh workspace (D63). Absent = not guarded. */
   guardedReasons: Record<string, string>;
+  /** Grants a restored backup parked for a person to accept or drop (D143); null when none. */
+  restoredAccess: RestoredAccess | null;
+}
+
+/** What the update dialog checks before it offers an install (D144). */
+export interface UpdatePreflight {
+  /** Running from the Windows portable zip: no in-app install. */
+  portable: boolean;
+  /** The bundled hub is held open by another process (Windows only). */
+  hubBusy: boolean;
+  /** Embedded terminal sessions an install would end. */
+  runningTerminals: number;
+}
+
+export interface RestoredAccess {
+  allowedTools: string[];
+  exportedAt: string;
 }
 
 export interface AgentMcpStatus {
@@ -630,6 +648,14 @@ export interface ProjectContext {
   rejected: RejectedAlternative[];
   createdAt: string;
   updatedAt: string;
+}
+
+/** The four context fields a person may edit after creation (D142); omit to leave one alone. */
+export interface ContextEdit {
+  domain?: string;
+  description?: string;
+  goals?: string[];
+  boundaries?: string[];
 }
 
 export interface WorkspaceOverview {

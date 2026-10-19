@@ -11,6 +11,7 @@ import {
   verifyNudgeEnabled,
 } from "../../lib/prefs";
 import AgentCatalogManager from "./AgentCatalogManager";
+import UpdateSection from "./UpdateSection";
 import { Check } from "../../components/controls";
 import type { SystemStatus } from "../../types";
 
@@ -164,13 +165,7 @@ export default function Settings({ status, onGoToProjectSettings }: Props) {
         <div className="panel-head">
           <h2 className="panel-title">{t("settings.about")}</h2>
         </div>
-        <div className="settings-row">
-          <div className="sr-body">
-            <div className="sr-desc">
-              Agent NextUp · {t("common.version")} {status.appVersion}
-            </div>
-          </div>
-        </div>
+        <UpdateSection currentVersion={status.appVersion} />
       </section>
     </div>
   );

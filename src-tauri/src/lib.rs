@@ -2,6 +2,7 @@ mod commands;
 mod git;
 mod mcp_deploy;
 mod terminal;
+mod update;
 mod watcher;
 
 use std::sync::Arc;
@@ -19,6 +20,9 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // User-triggered in-app update (D144); the app-specific half lives in
+        // update.rs.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .manage(WatcherState::default())
         // The terminal manager needs an AppHandle for its event sink, so it
@@ -97,6 +101,7 @@ pub fn run() {
             // ── Agent hub access ──
             commands::agent_access_status,
             commands::agent_access_set_enabled,
+            commands::agent_access_resolve_restored,
             commands::agent_access_set_tool,
             commands::agent_access_set_tools,
             commands::agent_access_set_all_tools,
@@ -111,6 +116,7 @@ pub fn run() {
             commands::search_index_status,
             // ── Context & milestones ──
             commands::get_context,
+            commands::edit_context,
             commands::add_milestone,
             commands::set_milestone_done,
             commands::set_milestone_verified,
@@ -153,6 +159,8 @@ pub fn run() {
             commands::agent_catalog_save,
             commands::agent_catalog_delete,
             commands::quit_app,
+            commands::update_preflight,
+            commands::update_relaunch,
             commands::open_folder,
         ])
         .run(tauri::generate_context!());

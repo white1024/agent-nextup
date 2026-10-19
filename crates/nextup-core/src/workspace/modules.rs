@@ -167,6 +167,10 @@ fn set_module_enabled_locked(
             let path = paths.module_guide_file(module);
             if !path.exists() {
                 crate::workspace::atomic::atomic_write(&path, content.as_bytes())?;
+                // Fingerprint it as shipped, as scaffold does: without a record
+                // the next engine change reads an untouched guide as one that
+                // needs a human to decide (ManualReview), not as upgradable.
+                crate::workspace::assets::record_pristine(paths, &ctx)?;
             }
         }
     }

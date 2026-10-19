@@ -22,6 +22,8 @@ import type {
   LedgerPage,
   LedgerTail,
   NewTask,
+  ContextEdit,
+  UpdatePreflight,
   ProjectContext,
   SearchHit,
   RouteOutcome,
@@ -216,6 +218,10 @@ export const api = {
   /** Quit the app. Never destroy the window to quit — see quit_app's doc
    *  comment for the macOS crash that costs. */
   quitApp: () => invoke<void>("quit_app"),
+  /** Before offering an in-app install (D144): portable build, hub held open, running terminals. */
+  updatePreflight: () => invoke<UpdatePreflight>("update_preflight"),
+  /** After a macOS/Linux install: start the new version, quit this one. */
+  updateRelaunch: () => invoke<void>("update_relaunch"),
   terminalSetPoppedOut: (id: number, poppedOut: boolean) =>
     invoke<void>("terminal_set_popped_out", { id, poppedOut }),
   workflowStatus: () => invoke<WorkflowStatus>("workflow_status"),
@@ -248,6 +254,8 @@ export const api = {
   agentAccessStatus: () => invoke<AgentAccessView>("agent_access_status"),
   agentAccessSetEnabled: (enabled: boolean) =>
     invoke<AgentAccessView>("agent_access_set_enabled", { enabled }),
+  agentAccessResolveRestored: (accept: boolean) =>
+    invoke<AgentAccessView>("agent_access_resolve_restored", { accept }),
   agentAccessSetTool: (tool: string, allowed: boolean) =>
     invoke<AgentAccessView>("agent_access_set_tool", { tool, allowed }),
   agentAccessSetTools: (tools: string[], allowed: boolean) =>
@@ -265,6 +273,7 @@ export const api = {
   runDoctor: () => invoke<DoctorReport>("run_doctor"),
 
   getContext: () => invoke<ProjectContext>("get_context"),
+  editContext: (edit: ContextEdit) => invoke<ProjectContext>("edit_context", { edit }),
   addMilestone: (title: string) => invoke<ProjectContext>("add_milestone", { title }),
   setMilestoneDone: (id: string, done: boolean) =>
     invoke<ProjectContext>("set_milestone_done", { id, done }),

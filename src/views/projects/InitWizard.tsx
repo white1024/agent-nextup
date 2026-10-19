@@ -5,18 +5,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../../api";
 import { Check } from "../../components/controls";
 import { useGuardedMutation } from "../../hooks";
+import { DOMAIN_SUGGESTIONS, splitLines } from "../../lib/contextForm";
 import { shownDomain } from "../../lib/domain";
 import { MODULE_CATALOG } from "../../lib/modules";
 import type { InitTargetProbe, SystemStatus, TemplateSummary } from "../../types";
 import TemplatePicker from "./TemplatePicker";
-
-/** Textarea → one trimmed entry per non-empty line. */
-export function splitLines(value: string): string[] {
-  return value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "");
-}
 
 /** Windows-reserved device names can never be folder names. */
 const RESERVED_FOLDER_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
@@ -203,13 +196,9 @@ export default function InitWizard({
           </span>
         )}
         <datalist id="domain-suggestions">
-          <option value="coding" />
-          <option value="research" />
-          <option value="business" />
-          <option value="life" />
-          {/* No "general" suggestion: it is the word for "nobody said" (D137),
-              and picking it from a list is picking a value that renders as
-              nothing — offering it is offering a no-op. */}
+          {DOMAIN_SUGGESTIONS.map((d) => (
+            <option key={d} value={d} />
+          ))}
         </datalist>
       </label>
 

@@ -9,8 +9,8 @@
       "title": "規格",
       "description": "定義需求、驗收條件與關鍵技術決策。",
       "aiInstructions": [
-        "讀 handoff 與 context.json，把需求整理成可驗收的規格。",
-        "把實作工作拆成原子任務（含驗收條件）建立於 tasks/。",
+        "讀 handoff 與 context.json。需求還模糊時，先呼叫 Skill 工具執行 align-scope，把「完成」的意思定下來。",
+        "把定好的範圍切成帶相依的垂直切片任務：呼叫 Skill 工具執行 slice-work。",
         "用「決策」記錄關鍵技術選型（框架、資料結構、邊界）。"
       ],
       "exitGates": [
@@ -23,10 +23,11 @@
       "title": "實作",
       "description": "依規格逐一完成任務。",
       "aiInstructions": [
-        "依優先級實作，遵守 rules.json 的執行守則。",
-        "邏輯先於介面：核心邏輯先行並附測試。",
+        "從 frontier 拿工作：Next steps 裡你能拿的最高優先任務，或 list_tasks { ready: true }。遵守 rules.json 的執行守則。",
+        "每個任務都先寫測試：呼叫 Skill 工具執行 test-first。原因不明顯的 bug，改執行 diagnose。",
         "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
-        "每完成一個原子任務就標 done 並 commit。"
+        "每完成一個原子任務就標 done 並 commit。",
+        "同時有好幾個彼此獨立的任務可以開工時，建議使用者跑 /work-the-frontier 平行完成。"
       ],
       "exitGates": [{ "kind": "all_tasks_done" }, { "kind": "no_blocked_tasks" }]
     },
@@ -35,7 +36,8 @@
       "title": "驗證",
       "description": "測試、檢查與實際運行。",
       "aiInstructions": [
-        "跑完整測試套件並實際運行主要流程。",
+        "從兩個軸審查成果——專案慣例、任務要求的內容：呼叫 Skill 工具執行 two-axis-review，修掉它找到的問題。",
+        "跑完整測試套件並實際運行主要流程；把使用者標「已驗證」需要的前後對照證據交給他。",
         "以「決策」記錄驗證結果與已知限制。"
       ],
       "exitGates": [
@@ -49,7 +51,7 @@
       "description": "整理交付物與發佈說明。",
       "aiInstructions": [
         "把交付物與使用說明放進 artifacts/。",
-        "撰寫 artifacts/release-notes.md：變更內容、已知限制、後續建議。"
+        "撰寫 artifacts/release-notes.md：呼叫 Skill 工具執行 ship-notes——最小的變更示意、前後對照證據、能不能撤回。"
       ],
       "exitGates": [
         { "kind": "artifact_exists", "path": "artifacts/release-notes.md" },
@@ -61,7 +63,7 @@
       "title": "復盤",
       "description": "把摩擦點轉成規則改進。",
       "aiInstructions": [
-        "回答 rules.json flywheel.postMortemPrompts。",
+        "呼叫 Skill 工具執行 retrospect：從 post_mortem_candidates 與 flywheel 提問起手，機械性的錯變成自動檢查，其餘變成 lessons、boundaries 或已否決提案。",
         "把改進寫回 executionGuidelines 並留下 revisionHistory 紀錄。"
       ],
       "exitGates": [{ "kind": "manual_confirm", "prompt": "已完成復盤並更新 rules.json" }]

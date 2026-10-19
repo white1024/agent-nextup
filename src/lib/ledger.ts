@@ -45,6 +45,10 @@ export function eventCat(event: LedgerEvent): string {
     // "read this on takeover" tier, distinct from the plain default.
     case "progress":
       return "decision";
+    // D142: the project's goals and boundaries are the rules agents work
+    // under — same takeover-read tier as a decision.
+    case "context_edited":
+      return "decision";
     default:
       return "";
   }

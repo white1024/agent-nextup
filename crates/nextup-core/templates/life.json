@@ -19,7 +19,7 @@
       "title": "計畫",
       "description": "拆成做得完的小步驟。",
       "aiInstructions": [
-        "把主軸拆成一週內可完成的小任務，寧小勿大。"
+        "把主軸拆成一週內可完成的小任務，寧小勿大。slice-work skill 會和使用者一起過一遍拆法（呼叫 Skill 工具執行）。"
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]
     },
@@ -37,6 +37,7 @@
       "title": "回顧",
       "description": "留下紀錄，決定下一循環。",
       "aiInstructions": [
+        "呼叫 Skill 工具執行 retrospect，整理卡住的地方與每個改進該放哪裡。",
         "回顧哪些做法有效、哪些沒有，寫成「決策」。",
         "決定下一循環的主軸，回到釐清階段（可另開新專案或調整 goals）。"
       ],

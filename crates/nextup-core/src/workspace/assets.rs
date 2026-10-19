@@ -119,7 +119,10 @@ pub(crate) fn curriculum(
     // Both landing spots per skill (D82). Registering only one would leave the
     // other frozen at whatever the engine shipped first — the mirror would
     // never be upgraded and would drift apart from its twin without a word.
-    for (name, content) in super::bootstrap::WORKSPACE_SKILLS {
+    // A template's skill pack (D148) is owed for as long as the workspace runs
+    // that template — so a workspace created before the pack existed sees it
+    // as Missing and can add it in one press.
+    for (name, content) in super::bootstrap::shipped_skills(paths)? {
         for (rel_path, abs_path) in paths.skill_files(name) {
             assets.push(CurriculumAsset { rel_path, abs_path, current: content.to_string() });
         }
@@ -489,11 +492,86 @@ mod tests {
         let ctx = load_context(&paths.context_file()).unwrap();
         let rels: Vec<String> =
             curriculum(&paths, &ctx).unwrap().into_iter().map(|a| a.rel_path).collect();
-        for (name, _) in super::super::bootstrap::WORKSPACE_SKILLS {
+        for (name, _) in super::super::bootstrap::shipped_skills(&paths).unwrap() {
             for (rel, _) in paths.skill_files(name) {
                 assert!(rels.contains(&rel), "{rel} is registered for upgrades");
             }
         }
+    }
+
+    /// D148: a template's skill pack ships with the template — present, and
+    /// fingerprinted, in a coding workspace; absent from a research one; and
+    /// written (fingerprinted too) when a legacy workspace adopts the template.
+    #[test]
+    fn skill_pack_follows_the_workflow_template() {
+        let init = |template: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            initialize_project(
+                &InitProjectParams {
+                    root: dir.path().to_string_lossy().into_owned(),
+                    name: "pack".into(),
+                    template_id: Some(template.into()),
+                    ..Default::default()
+                },
+                &StaticKeyProvider([4u8; 32]),
+                "0.0.0-test",
+            )
+            .unwrap();
+            let paths = WorkspacePaths::new(dir.path());
+            (dir, paths)
+        };
+        let pack = super::super::bootstrap::CODING_SKILLS;
+        let fingerprinted = |paths: &WorkspacePaths, name: &str| {
+            let shipped = load_shipped(paths).unwrap();
+            paths.skill_files(name).iter().all(|(rel, _)| shipped.assets.contains_key(rel))
+        };
+
+        let (_a, coding) = init("coding-v1");
+        for (name, _) in pack {
+            assert!(coding.skill_file(name).is_file(), "{name} ships with coding-v1");
+            assert!(fingerprinted(&coding, name), "{name} fingerprinted at init");
+        }
+
+        let (_b, research) = init("research-v1");
+        let ctx = load_context(&research.context_file()).unwrap();
+        let rels: Vec<String> =
+            curriculum(&research, &ctx).unwrap().into_iter().map(|a| a.rel_path).collect();
+        for (name, _) in pack {
+            assert!(!research.skill_file(name).exists(), "{name} stays out of research-v1");
+            assert!(!rels.iter().any(|r| r.contains(&format!("/{name}/"))), "{name} not owed");
+        }
+
+        // A workspace without a harness adopts the coding template later: the
+        // pack arrives with the phases that call it, fingerprinted.
+        let (_c, legacy) = init("research-v1");
+        std::fs::remove_file(legacy.workflow_file()).unwrap();
+        let coding_template = crate::workspace::templates::resolve_template(
+            Some("coding-v1"),
+            None,
+            crate::workspace::templates::TemplateLang::En,
+        )
+        .unwrap();
+        crate::workspace::workflow::adopt(&legacy, &coding_template, "0.0.0-test").unwrap();
+        for (name, _) in pack {
+            assert!(legacy.skill_file(name).is_file(), "{name} shipped on adopt");
+            assert!(fingerprinted(&legacy, name), "{name} fingerprinted on adopt");
+        }
+    }
+
+    /// A module guide shipped by enabling the module after init carries a
+    /// fingerprint, like one shipped by scaffold. Without it, the next engine
+    /// change would read the untouched guide as needing a human.
+    #[test]
+    fn module_guide_enabled_later_is_fingerprinted() {
+        let (_g, paths) = workspace();
+        crate::workspace::modules::set_module_enabled(
+            &paths,
+            crate::workspace::modules::MODULE_TEAM,
+            true,
+        )
+        .unwrap();
+        let rel = WorkspacePaths::module_guide_rel(crate::workspace::modules::MODULE_TEAM);
+        assert!(load_shipped(&paths).unwrap().assets.contains_key(&rel), "{rel} fingerprinted");
     }
 
     #[test]

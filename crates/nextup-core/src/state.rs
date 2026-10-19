@@ -63,6 +63,20 @@ impl AppState {
         *self.inner.write() = Some(LoadedWorkspace { root, context });
     }
 
+    /// Swap in a freshly written context for the workspace at `root`, and only
+    /// that one. The dashboard's name and domain come from this cached copy,
+    /// so an edit that skips this keeps showing the old values until the next
+    /// open (D142); the root check keeps an edit that finishes after the user
+    /// switched projects from planting its context on the new one.
+    pub fn refresh_context(&self, root: &std::path::Path, context: ProjectContext) {
+        let mut guard = self.inner.write();
+        if let Some(ws) = guard.as_mut() {
+            if ws.root == root {
+                ws.context = context;
+            }
+        }
+    }
+
     pub fn clear_workspace(&self) {
         *self.inner.write() = None;
     }
@@ -175,6 +189,25 @@ mod tests {
 
         s.clear_workspace();
         assert!(s.workspace().is_none());
+    }
+
+    #[test]
+    fn refresh_context_only_lands_on_the_workspace_it_was_read_from() {
+        let s = state();
+        s.set_workspace(PathBuf::from("C:/tmp/a"), ProjectContext::new("a", "general", "", vec![], vec![]));
+
+        // The edit finished after the user switched to b: a's context stays out.
+        s.refresh_context(
+            std::path::Path::new("C:/tmp/b"),
+            ProjectContext::new("b-imposter", "coding", "", vec![], vec![]),
+        );
+        assert_eq!(s.status("0.1.0").workspace.unwrap().domain, "general");
+
+        s.refresh_context(
+            std::path::Path::new("C:/tmp/a"),
+            ProjectContext::new("a", "coding", "", vec![], vec![]),
+        );
+        assert_eq!(s.status("0.1.0").workspace.unwrap().domain, "coding", "the dashboard chip reads this");
     }
 
     #[test]
