@@ -245,6 +245,11 @@ impl WorkspacePaths {
 
     /// `tasks/<task-id>/` — optional per-task artifact bundle (D79):
     /// proposal.md, design.md, delta specs. Sibling of the task's JSON file.
+    ///
+    /// ⚠️ Joins `task_id` as given. An id from outside the engine (a hub
+    /// argument) must pass `tasks::validate_task_id` first — `../.` lands
+    /// this on the workspace root, which is how a delta once reached the
+    /// main spec (01 invariant 15).
     pub fn task_artifact_dir(&self, task_id: &str) -> PathBuf {
         self.tasks_dir().join(task_id)
     }

@@ -257,6 +257,8 @@ export interface InitProjectParams {
   modules?: string[];
   /** New-workspace flow (D44): core creates the root itself and refuses a pre-existing folder. */
   createRoot?: boolean;
+  /** Grant every exposed write tool at creation, guarded ones included (D150); omit for the D63 day-one grant. */
+  grantAllTools?: boolean;
 }
 
 /** Live collision check for the init wizard's target folder (D44). */

@@ -136,6 +136,14 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(busy, "a running image must read as in use");
+        // The image is not free the instant `wait` returns: an on-access
+        // scanner holds it a few ms after exit (G076). The install path polls
+        // for seconds (UpdateSection), so "released shortly after" is the
+        // contract; a lock that outlives the deadline still fails here.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while super::image_in_use(&exe) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!super::image_in_use(&exe), "released once the process is gone");
     }
 

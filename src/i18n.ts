@@ -212,6 +212,8 @@ const zhTW = {
     moduleHint_specs: "specs/ 存放系統現況規格，任務歸檔時折入 delta；之後可在設定隨時開關。",
     module_team: "啟用團隊模組",
     moduleHint_team: "可加入跨專案團隊、發布與接收交付物；之後可在設定隨時開關。",
+    grantAllTools: "一開始就授權 agent 使用全部寫入工具",
+    grantAllToolsHint: "包括平常預設關著的幾支：標記自己的工作已驗證、推進階段、跨專案送交、改寫教材。之後可在工具頁逐支收回；會記住你這次的選擇。",
     module_prime: "啟用團隊協調（prime）模組",
     moduleHint_prime:
       "讓本專案的代理協調它擔任 prime 的團隊：編輯流向、代成員送交、把專案加進團隊。還需要在團隊頁指定本專案為該團隊的 prime 才會生效。",
@@ -851,7 +853,7 @@ const zhTW = {
     heading: "工具（agent 中樞）",
     agentSubtitle: "外部 coding agent 經工作區根目錄的 .mcp.json 連上中樞，呼叫下方工具。",
     writeToolsHint:
-      "依能力分組授權，展開「逐項工具」可個別控制。新專案已預先授權日常記錄與流轉類；自我驗證、推進階段、跨工作區送出、改寫資產四類留給你自己開。",
+      "依能力分組授權，展開「逐項工具」可個別控制。新專案已預先授權日常記錄與流轉類；自我驗證、推進階段、跨工作區送出、改寫資產四類預設關著——除非建立專案時勾了「一開始就授權全部寫入工具」。",
     readToolsHint: "唯讀工具永遠可用，不需授權。",
     agentEnabled: "允許代理連上中樞",
     agentDisabledHint: "已全面關閉：代理連唯讀工具也無法使用。",
@@ -1219,6 +1221,8 @@ const en: typeof zhTW = {
     moduleHint_specs: "specs/ holds the current-state specification; task deltas fold in on archive. Can be toggled in Settings later.",
     module_team: "Enable the team module",
     moduleHint_team: "Join cross-project teams, publish and receive deliveries; can be toggled in Settings later.",
+    grantAllTools: "Let agents use every write tool from the start",
+    grantAllToolsHint: "Including the few that are normally off: marking their own work verified, advancing phases, delivering across projects, rewriting the guide. Each can be revoked on the Tools page later; your choice here is remembered.",
     module_prime: "Enable the team coordination (prime) module",
     moduleHint_prime:
       "Lets this project's agent coordinate teams it is the prime of: edit flows, route on a member's behalf, bring projects into the team. It also has to be named as that team's prime in the team view before anything is granted.",
@@ -1869,7 +1873,7 @@ const en: typeof zhTW = {
     agentSubtitle:
       "External coding agents reach the hub through this workspace's .mcp.json and call the tools below.",
     writeToolsHint:
-      "Granted by capability group; expand Per-tool for individual control. A new project starts with the everyday recording and flow tools already granted — self-verification, phase advancement, cross-workspace publishing and asset rewrites are left for you to allow.",
+      "Granted by capability group; expand Per-tool for individual control. A new project starts with the everyday recording and flow tools already granted — self-verification, phase advancement, cross-workspace publishing and asset rewrites stay off unless it was created with “Let agents use every write tool from the start”.",
     readToolsHint: "Read-only tools are always available and need no grant.",
     agentEnabled: "Allow agents to reach the hub",
     agentDisabledHint: "Fully shut: agents cannot use even the read-only tools.",

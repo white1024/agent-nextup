@@ -119,7 +119,9 @@ pub fn set_task_verification(
 ) -> Result<TaskUpdate> {
     // The regeneration (inside `mutate`) refreshes the bootstrap surfaces itself.
     mutate(paths, app_version, || {
-        let task = TaskStore::new(paths.tasks_dir()).set_verification(id, verified, note)?;
+        let specs_hash = if verified { attested_specs_hash(paths, id)? } else { None };
+        let task =
+            TaskStore::new(paths.tasks_dir()).set_verification(id, verified, note, specs_hash)?;
         let message = match task.verified_note.as_deref() {
             Some(evidence) => format!("\"{}\" verified: {evidence}", task.title),
             None => format!("\"{}\" verification cleared", task.title),
@@ -129,6 +131,26 @@ pub fn set_task_verification(
         Ok((task, event))
     })
     .map(|(task, handoff)| TaskUpdate { task, handoff: Some(handoff), spec_fold: None })
+}
+
+/// The delta-bundle hash a verification attests (D149).
+///
+/// Stamped whenever the spec module is on — including over an empty bundle,
+/// so a delta *added* after verification is caught as well as one edited. With
+/// the module off it is stamped only when a bundle exists: such a workspace has
+/// no use for deltas, and every verified task there would otherwise carry a
+/// hash of nothing.
+fn attested_specs_hash(paths: &WorkspacePaths, id: &str) -> Result<Option<String>> {
+    // Before the id is joined into a path below (the store checks it too,
+    // but only after this runs).
+    crate::workspace::tasks::validate_task_id(id)?;
+    let has_bundle = paths.task_delta_specs_dir(id).is_dir();
+    let specs_on = crate::workspace::modules::get_modules(paths)?
+        .is_enabled(crate::workspace::modules::MODULE_SPECS);
+    if !specs_on && !has_bundle {
+        return Ok(None);
+    }
+    specs::task_bundle_hash(paths, id).map(Some)
 }
 
 /// Rewrite a task's attributes (title / description / priority / tags). The
@@ -142,17 +164,73 @@ pub fn edit_task(
     id: &str,
     edit: TaskEdit,
 ) -> Result<TaskUpdate> {
+    edit_task_with(paths, app_version, id, |_| edit)
+}
+
+/// The fields an agent wants changed, and only those (the hub `edit_task`
+/// tool, D149). The GUI sends a whole form; an agent names what it means to
+/// change, and a missing field must mean "leave it", never "blank it".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub priority: Option<u8>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// [`edit_task`] for a partial change. The merge happens under the same lock
+/// as the write, so a GUI edit landing between an agent's read and its write
+/// is never overwritten with values read before it.
+pub fn patch_task(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    patch: TaskPatch,
+) -> Result<TaskUpdate> {
+    if patch.title.is_none()
+        && patch.description.is_none()
+        && patch.priority.is_none()
+        && patch.tags.is_none()
+    {
+        return Err(NextUpError::InvalidInput(
+            "nothing to change — pass at least one of title, description, priority, tags".into(),
+        ));
+    }
+    edit_task_with(paths, app_version, id, |before| TaskEdit {
+        title: patch.title.unwrap_or_else(|| before.title.clone()),
+        description: patch.description.unwrap_or_else(|| before.description.clone()),
+        priority: patch.priority.unwrap_or(before.priority),
+        tags: patch.tags.unwrap_or_else(|| before.tags.clone()),
+    })
+}
+
+fn edit_task_with(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    make: impl FnOnce(&Task) -> TaskEdit,
+) -> Result<TaskUpdate> {
     mutate(paths, app_version, || {
         let store = TaskStore::new(paths.tasks_dir());
         let before = store.get(id)?;
-        let task = store.edit(id, edit)?;
+        let task = store.edit(id, make(&before))?;
 
         let mut changes = Vec::new();
         if before.title != task.title {
             changes.push(format!("title \"{}\" → \"{}\"", before.title, task.title));
         }
         if before.description != task.description {
-            changes.push("description updated".to_string());
+            // The description is where acceptance criteria live, and once an
+            // agent can rewrite it unattended (edit_task, D149) "updated" alone
+            // leaves no way to tell which text a later verification was
+            // checked against. The full text stays out of the ledger (it can
+            // run long); the hashes tie the line to a copy in git history.
+            changes.push(format!(
+                "description updated (sha256 {} → {})",
+                short_sha256(before.description.as_bytes()),
+                short_sha256(task.description.as_bytes())
+            ));
         }
         if before.priority != task.priority {
             changes.push(format!("P{} → P{}", before.priority, task.priority));
@@ -174,6 +252,235 @@ pub fn edit_task(
         Ok((task, event))
     })
     .map(|(task, handoff)| TaskUpdate { task, handoff: Some(handoff), spec_fold: None })
+}
+
+/// Largest task artifact the hub writes (D149): twice the doctor's warning
+/// size for a main spec. A proposal may run longer than a spec, but a file
+/// past this is not an artifact anyone will read through.
+pub const TASK_FILE_MAX_BYTES: usize = 64 * 1024;
+
+/// Which artifact a `write_task_file` path names. The whole accepted set:
+/// anything else is refused before a path is ever joined, which is also what
+/// keeps `../` out (the capability goes through the slug rule).
+enum TaskFile {
+    Prose(&'static str),
+    Delta(String),
+}
+
+impl TaskFile {
+    fn parse(path: &str) -> Result<Self> {
+        let segments: Vec<&str> = path.split(['/', '\\']).collect();
+        match segments.as_slice() {
+            ["proposal.md"] => Ok(TaskFile::Prose("proposal.md")),
+            ["design.md"] => Ok(TaskFile::Prose("design.md")),
+            ["specs", capability, "spec.md"] => {
+                specs::validate_capability_name(capability)?;
+                Ok(TaskFile::Delta((*capability).to_string()))
+            }
+            _ => Err(NextUpError::InvalidInput(format!(
+                "path must be proposal.md, design.md or specs/<capability>/spec.md, relative to \
+                 the task's own folder — got '{path}'"
+            ))),
+        }
+    }
+
+    fn rel(&self) -> String {
+        match self {
+            TaskFile::Prose(name) => (*name).to_string(),
+            TaskFile::Delta(capability) => format!("specs/{capability}/spec.md"),
+        }
+    }
+}
+
+/// What `write_task_file` did, plus what the agent should know about it now
+/// rather than at archive time.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFileWrite {
+    pub task_id: String,
+    /// Workspace-relative, forward slashes: `tasks/T-0003/specs/auth/spec.md`.
+    pub path: String,
+    pub deleted: bool,
+    pub bytes: usize,
+    /// For a delta: the dry-run `validate_task_specs` would return for the
+    /// whole bundle as it stands after this write. A format problem does not
+    /// stop the write — drafts are written in pieces — it is reported here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specs: Option<specs::TaskSpecsReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Write or delete one file in a task's artifact bundle (`tasks/<id>/`) — the
+/// hub `write_task_file` tool (D149).
+///
+/// Exists so an agent running unattended needs no write access to `tasks/`
+/// at all: a caller fencing files can make `.nextup/`, `tasks/` and `specs/`
+/// read-only with plain folder rules, which every sandbox can express, instead
+/// of a wildcard separating `T-0001.json` from `T-0001/` that some cannot
+/// (Codex's Windows sandbox, 2026-11). Those three are not the whole fence —
+/// `.mcp.json`, `.claude/` and `.git/hooks/` decide what runs next time,
+/// outside any sandbox (2026-11-09 security review). Writing through here also
+/// leaves the audit line that a file edit never does. Interactive sessions may
+/// go on writing the files directly; nothing about the bundle's format changes.
+///
+/// Refused: an archived task (its bundle is closed); a delta for a task whose
+/// bundle was already folded (the edit would never fold — it needs the task
+/// reopened, which clears the marker, or a new task); a delta for a task that
+/// is verified but carries no record of what was verified (the fold could not
+/// tell the edit apart); and content with control characters other than tab
+/// and line breaks.
+pub fn write_task_file(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    task_id: &str,
+    path: &str,
+    content: Option<String>,
+) -> Result<TaskFileWrite> {
+    crate::workspace::modules::require_module(paths, crate::workspace::modules::MODULE_SPECS)?;
+    // The id is joined into the bundle path as much as `path` is, and checking
+    // only `path` is exactly what let `../.` through (2026-11-09 report). The
+    // store's `get` below checks again and also refuses a copied task file.
+    crate::workspace::tasks::validate_task_id(task_id)?;
+    let file = TaskFile::parse(path)?;
+    if let Some(text) = &content {
+        if text.len() > TASK_FILE_MAX_BYTES {
+            return Err(NextUpError::InvalidInput(format!(
+                "{} is {} KB — the limit is {} KB; split the change or trim it",
+                file.rel(),
+                text.len() / 1024,
+                TASK_FILE_MAX_BYTES / 1024
+            )));
+        }
+        // Artifacts are plain text. A NUL once let one delta impersonate two in
+        // the bundle hash (security review F1, fixed in the framing too), and
+        // nothing a person reads shows control characters — so text that can
+        // hide content from the reviewer is refused at the door.
+        if let Some(at) = text.find(|c: char| c.is_control() && !matches!(c, '\t' | '\n' | '\r')) {
+            let code = text[at..].chars().next().map(u32::from).unwrap_or_default();
+            return Err(NextUpError::InvalidInput(format!(
+                "{} contains the control character U+{code:04X} at byte {at} — task artifacts \
+                 are plain text",
+                file.rel()
+            )));
+        }
+    }
+    let is_delta = matches!(file, TaskFile::Delta(_));
+    let (mut out, _) = mutate(paths, app_version, || {
+        let task = TaskStore::new(paths.tasks_dir()).get(task_id)?;
+        if task.archived {
+            return Err(NextUpError::InvalidInput(format!(
+                "{task_id} is archived — its artifact bundle is closed; open a new task for new work"
+            )));
+        }
+        if is_delta && task.spec_folded_at.is_some() {
+            return Err(NextUpError::InvalidInput(format!(
+                "{task_id}'s delta specs were already folded into specs/, so an edit here would \
+                 never fold — reopen the task (which clears the fold) or open a new task"
+            )));
+        }
+        // Verified, but before the engine recorded what a verification covers
+        // (or while the spec module was off): the fold has nothing to compare,
+        // so a delta written now would be folded as if checked. A warning
+        // could not stop that — the archive sweep runs unattended (security
+        // review F2). The person clears the verification; then it can be
+        // written and verified again, which records the hash.
+        if is_delta && task.is_verified() && task.verified_specs_hash.is_none() {
+            return Err(NextUpError::InvalidInput(format!(
+                "{task_id} is verified, but its verification predates any record of which delta \
+                 it covered, so archiving could not tell this change was never checked — ask the \
+                 user to clear its verification first, then write the delta and have it verified \
+                 again"
+            )));
+        }
+        let rel = format!("tasks/{task_id}/{}", file.rel());
+        let abs = match &file {
+            TaskFile::Prose(name) => paths.task_artifact_dir(task_id).join(name),
+            TaskFile::Delta(capability) => paths
+                .task_delta_specs_dir(task_id)
+                .join(capability)
+                .join(crate::workspace::layout::SPEC_FILE),
+        };
+        let (deleted, bytes, what) = match &content {
+            Some(text) => {
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::workspace::atomic::atomic_write(&abs, text.as_bytes())?;
+                let what = format!(
+                    "wrote {rel} ({} bytes, sha256 {})",
+                    text.len(),
+                    short_sha256(text.as_bytes())
+                );
+                (false, text.len(), what)
+            }
+            None => {
+                if !abs.is_file() {
+                    return Err(NextUpError::NotFound(format!("{rel} does not exist")));
+                }
+                std::fs::remove_file(&abs)?;
+                // An empty capability folder is invisible to the fold (it
+                // lists folders holding a spec.md) but not to a person
+                // browsing the bundle; best effort, a leftover is harmless.
+                if is_delta {
+                    if let Some(parent) = abs.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
+                (true, 0, format!("deleted {rel}"))
+            }
+        };
+        let event = LedgerEvent::new(
+            LedgerKind::TaskEdited,
+            format!("\"{}\": {what}", task.title),
+            Some(task.id.clone()),
+        );
+        // Nothing after the write may fail: the file has already changed, and
+        // an error here would skip the ledger line while the hub records the
+        // call as failed — the audit trail saying the opposite of what
+        // happened (security review F5). A re-hash that cannot read the
+        // bundle becomes a warning instead.
+        let warnings = match &task.verified_specs_hash {
+            Some(attested) if is_delta && task.is_verified() => {
+                match specs::task_bundle_hash(paths, task_id) {
+                    Ok(now) if now == *attested => Vec::new(),
+                    Ok(_) => vec![format!(
+                        "{task_id} is verified, and its verification covers the bundle as it was: \
+                         archiving will refuse these delta specs until the task is verified again"
+                    )],
+                    Err(e) => vec![format!(
+                        "the write landed, but the bundle could not be re-read to compare it with \
+                         the verification ({e}); archiving will make that comparison itself"
+                    )],
+                }
+            }
+            _ => Vec::new(),
+        };
+        let out = TaskFileWrite {
+            task_id: task.id.clone(),
+            path: rel,
+            deleted,
+            bytes,
+            specs: None,
+            warnings,
+        };
+        Ok((out, event))
+    })?;
+    if is_delta {
+        // Read-only, after the lock: the write has landed either way, and a
+        // problem reading the main specs is something to report, not a
+        // reason to tell the agent its write failed.
+        match specs::dry_run_task_specs(paths, task_id) {
+            Ok(report) => out.specs = Some(report),
+            Err(e) => out.warnings.push(format!("could not dry-run the fold: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+fn short_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Delete a task file. Refused while other tasks depend on it (structured
@@ -256,6 +563,19 @@ fn fold_task_specs_skipping(
             task.id
         )));
     }
+    // The verification attested one version of the bundle; folding another
+    // would put text nobody checked into the source of truth — and the
+    // workspace-open sweep would do it unattended (D149). A task verified
+    // before the hash existed has nothing to compare and folds as it did.
+    let folding_hash = specs::delta_bundle_hash(&deltas);
+    if task.verified_specs_hash.as_deref().is_some_and(|attested| attested != folding_hash) {
+        return Err(NextUpError::InvalidInput(format!(
+            "{} delta specs changed after the task was verified — clear its verification and \
+             verify it again before archiving: archiving folds them into specs/, and the \
+             verification only covers the version that was checked",
+            task.id
+        )));
+    }
     // A newer task may have folded its own rewrite of the same requirement
     // while this one sat unarchived. `fold` cannot see that — a MODIFIED that
     // still matches by name looks exactly like a legitimate edit — so this
@@ -298,7 +618,19 @@ fn fold_task_specs_skipping(
         summary.renamed += out.renamed;
         summary.skipped.extend(out.skipped.iter().cloned());
     }
-    TaskStore::new(paths.tasks_dir()).set_spec_folded_at(&task.id, Some(now_rfc3339()))?;
+    // `specs/` has changed from here on, so the ledger says so before anything
+    // else can fail. It used to be written by the callers after the marker
+    // below — a task file held open by another process (a read handle that
+    // denies writes is enough) failed the marker and left the main spec
+    // rewritten with no ledger line at all (2026-11-09 security review, F4).
+    // If the marker does fail, the next archive re-folds as an already-synced
+    // no-op and the task catches up.
+    ledger_for(paths).append(&spec_folded_event(task, &summary))?;
+    TaskStore::new(paths.tasks_dir()).set_spec_folded(
+        &task.id,
+        Some(now_rfc3339()),
+        Some(folding_hash),
+    )?;
     Ok(Some(summary))
 }
 
@@ -406,12 +738,10 @@ fn archive_inner(
         let mut folded = None;
         if archived {
             let task = store.get(id)?;
-            folded = fold_task_specs_skipping(paths, &task, skip)?.map(|summary| (task, summary));
+            // The fold ledgers its own line, the moment specs/ changes.
+            folded = fold_task_specs_skipping(paths, &task, skip)?;
         }
         let task = store.set_archived(id, archived)?;
-        if let Some((pre_fold, summary)) = &folded {
-            ledger_for(paths).append(&spec_folded_event(pre_fold, summary))?;
-        }
         let verb = if archived { "archived" } else { "unarchived" };
         ledger_for(paths).append(&LedgerEvent::new(
             LedgerKind::TaskArchived,
@@ -419,7 +749,7 @@ fn archive_inner(
             Some(task.id.clone()),
         ))?;
         let handoff = Some(generate_handoff(paths, app_version)?);
-        Ok(TaskUpdate { task, handoff, spec_fold: folded.map(|(_, summary)| summary) })
+        Ok(TaskUpdate { task, handoff, spec_fold: folded })
     })
 }
 
@@ -467,10 +797,8 @@ pub fn archive_verified_done_tasks_at(
                 && old_enough(&task)
             {
                 match fold_task_specs(paths, &task) {
-                    Ok(None) => {}
-                    Ok(Some(summary)) => {
-                        ledger_for(paths).append(&spec_folded_event(&task, &summary))?;
-                    }
+                    // The fold ledgers its own line when it changes specs/.
+                    Ok(_) => {}
                     // Any fold failure — a conflict or an unreadable bundle
                     // — skips the whole task: archiving without folding
                     // would manufacture an orphan delta, and aborting
@@ -481,7 +809,15 @@ pub fn archive_verified_done_tasks_at(
                     // circle (invariant 3); the doctor names each cause.
                     Err(_) => continue,
                 }
-                store.set_archived(&task.id, true)?;
+                // Same rule for the archive write itself: one task file held
+                // open by another process used to abort the whole sweep here,
+                // after earlier tasks were already archived and before their
+                // summary line and the snapshot — the exact state the comment
+                // above exists to prevent (2026-11-09 security review, F4).
+                // Skipped tasks are retried on the next sweep.
+                if store.set_archived(&task.id, true).is_err() {
+                    continue;
+                }
                 archived.push(task.id);
             }
         }
@@ -2186,5 +2522,508 @@ mod tests {
         let reports = pending_spec_folds(&paths).unwrap();
         let ids: Vec<&str> = reports.iter().map(|r| r.task_id.as_str()).collect();
         assert_eq!(ids, vec![broken.id.as_str()], "folded task drops off the panel");
+    }
+
+    // ── D149: what a verification covers, and task contents after creation ──
+
+    fn enable_specs(paths: &WorkspacePaths) {
+        crate::workspace::modules::set_module_enabled(
+            paths,
+            crate::workspace::modules::MODULE_SPECS,
+            true,
+        )
+        .unwrap();
+    }
+
+    fn todo_task(paths: &WorkspacePaths, title: &str) -> Task {
+        create_task(paths, "0.1.0", NewTask { title: title.into(), priority: 1, ..Default::default() })
+            .unwrap()
+    }
+
+    const DELTA_EDITED: &str = "## ADDED Requirements\n\n### Requirement: 匯出\n必須支援匯出，且不得超過一秒。\n\n#### Scenario: s\n- **WHEN** x\n- **THEN** y\n";
+
+    /// The gap the loop-nextup proposal asked about: a delta edited after the
+    /// user verified the task used to fold unseen — through the archive
+    /// button and, worse, through the workspace-open sweep with nobody
+    /// pressing anything.
+    #[test]
+    fn a_delta_changed_after_verification_refuses_the_fold_until_verified_again() {
+        let (_g, paths) = workspace();
+        let t = done_task(&paths, "spec work", false);
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        let verified =
+            set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran it".into())).unwrap().task;
+        assert!(verified.verified_specs_hash.is_some(), "a bundle exists, so the hash is stamped");
+        write_delta(&paths, &t.id, "export", DELTA_EDITED);
+
+        let err = set_task_archived(&paths, "0.1.0", &t.id, true).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        assert!(err.to_string().contains("changed after the task was verified"), "{err}");
+        assert!(!paths.spec_file("export").exists(), "refusal writes nothing");
+
+        // The sweep skips it instead of folding the unseen text.
+        let swept = archive_verified_done_tasks(&paths, "0.1.0", None).unwrap();
+        assert!(swept.is_empty(), "{swept:?}");
+        assert!(!paths.spec_file("export").exists());
+
+        // Verifying again covers the new version, and it folds.
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("re-ran it".into())).unwrap();
+        let update = set_task_archived(&paths, "0.1.0", &t.id, true).unwrap();
+        assert!(update.spec_fold.is_some());
+        let spec = std::fs::read_to_string(paths.spec_file("export")).unwrap();
+        assert!(spec.contains("不得超過一秒"), "{spec}");
+        let folded = TaskStore::new(paths.tasks_dir()).get(&t.id).unwrap();
+        assert_eq!(
+            folded.spec_folded_hash.as_deref(),
+            Some(specs::task_bundle_hash(&paths, &t.id).unwrap().as_str()),
+            "the fold records what it folded"
+        );
+    }
+
+    /// With the spec module on, verifying a task with no bundle still records
+    /// what was verified — nothing — so a delta added afterwards is caught.
+    /// With it off nothing is stamped, and the fold behaves as it always did.
+    #[test]
+    fn a_delta_added_after_verifying_no_bundle_is_caught_only_where_specs_are_in_use() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = done_task(&paths, "verified first", true);
+        assert!(t.verified_specs_hash.is_some());
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        let err = set_task_archived(&paths, "0.1.0", &t.id, true).unwrap_err();
+        assert!(err.to_string().contains("changed after the task was verified"), "{err}");
+
+        let (_g2, plain) = workspace();
+        let t = done_task(&plain, "verified first", true);
+        assert_eq!(t.verified_specs_hash, None, "spec module off and no bundle: nothing stamped");
+        write_delta(&plain, &t.id, "export", DELTA_OK);
+        assert!(set_task_archived(&plain, "0.1.0", &t.id, true).unwrap().spec_fold.is_some());
+    }
+
+    /// The same text checked out with CRLF and a BOM (git on Windows, some
+    /// editors) is the same bundle — a hash that differed between machines
+    /// would refuse folds there for nothing. The parser drops the BOM as the
+    /// hash does (security review F3), so this folds.
+    #[test]
+    fn a_crlf_checkout_of_the_verified_bundle_still_folds() {
+        let (_g, paths) = workspace();
+        let t = done_task(&paths, "spec work", false);
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran it".into())).unwrap();
+        write_delta(&paths, &t.id, "export", &format!("\u{feff}{}", DELTA_OK.replace('\n', "\r\n")));
+        assert!(set_task_archived(&paths, "0.1.0", &t.id, true).unwrap().spec_fold.is_some());
+    }
+
+    /// A status change clears both hashes along with the marks they belong to.
+    #[test]
+    fn reopening_clears_the_verification_and_fold_hashes() {
+        let (_g, paths) = workspace();
+        let t = done_task(&paths, "spec work", false);
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran it".into())).unwrap();
+        set_task_archived(&paths, "0.1.0", &t.id, true).unwrap();
+        let reopened =
+            update_task_status(&paths, "0.1.0", &t.id, TaskStatus::InProgress, None).unwrap().task;
+        assert_eq!(reopened.verified_specs_hash, None);
+        assert_eq!(reopened.spec_folded_hash, None);
+        assert_eq!(reopened.spec_folded_at, None);
+    }
+
+    #[test]
+    fn write_task_file_writes_the_bundle_ledgers_it_and_reports_the_dry_run() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = todo_task(&paths, "export");
+
+        let out =
+            write_task_file(&paths, "0.1.0", &t.id, "proposal.md", Some("why\n".into())).unwrap();
+        assert_eq!(out.path, format!("tasks/{}/proposal.md", t.id));
+        assert!(out.specs.is_none(), "prose is not dry-run");
+        let proposal = paths.task_artifact_dir(&t.id).join("proposal.md");
+        assert_eq!(std::fs::read_to_string(proposal).unwrap(), "why\n");
+
+        // A delta that does not fold yet is still written; the problem comes back.
+        let out = write_task_file(
+            &paths,
+            "0.1.0",
+            &t.id,
+            "specs/billing/spec.md",
+            Some(DELTA_CONFLICT.into()),
+        )
+        .unwrap();
+        let report = out.specs.expect("a delta is dry-run");
+        assert!(!report.ok && !report.problems.is_empty(), "{report:?}");
+        // Backslashes from a Windows agent name the same file.
+        let out = write_task_file(
+            &paths,
+            "0.1.0",
+            &t.id,
+            "specs\\billing\\spec.md",
+            Some(DELTA_OK.into()),
+        )
+        .unwrap();
+        assert!(out.specs.unwrap().ok);
+
+        let lines =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 10).unwrap();
+        let wrote = format!("wrote tasks/{}/specs/billing/spec.md", t.id);
+        assert!(
+            lines.iter().any(|e| e.message.contains(&wrote)
+                && e.message.contains("sha256 ")
+                && e.task_id.as_deref() == Some(t.id.as_str())),
+            "{lines:?}"
+        );
+
+        // Deleting removes the file and the now-empty capability folder.
+        let out = write_task_file(&paths, "0.1.0", &t.id, "specs/billing/spec.md", None).unwrap();
+        assert!(out.deleted);
+        assert!(!paths.task_delta_specs_dir(&t.id).join("billing").exists());
+        let err =
+            write_task_file(&paths, "0.1.0", &t.id, "specs/billing/spec.md", None).unwrap_err();
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    #[test]
+    fn write_task_file_accepts_only_the_three_artifact_shapes() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = todo_task(&paths, "export");
+        for path in [
+            "../T-0001.json",
+            "notes.md",
+            "/proposal.md",
+            "Proposal.md",
+            "specs/../../../evil/spec.md",
+            "specs/a/b/spec.md",
+            "specs/Not A Slug/spec.md",
+            "specs/export/notes.md",
+            "",
+        ] {
+            let err = write_task_file(&paths, "0.1.0", &t.id, path, Some("x".into())).unwrap_err();
+            assert_eq!(err.kind(), "invalid_input", "{path}: {err}");
+        }
+        assert!(!paths.task_artifact_dir(&t.id).exists(), "no refusal created anything");
+        let too_big = "x".repeat(TASK_FILE_MAX_BYTES + 1);
+        let err = write_task_file(&paths, "0.1.0", &t.id, "design.md", Some(too_big)).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        let err =
+            write_task_file(&paths, "0.1.0", "T-0404", "design.md", Some("x".into())).unwrap_err();
+        assert_eq!(err.kind(), "not_found");
+
+        let (_g2, plain) = workspace();
+        let t = todo_task(&plain, "export");
+        let err = write_task_file(&plain, "0.1.0", &t.id, "design.md", Some("x".into())).unwrap_err();
+        assert!(err.to_string().contains("'specs' module"), "{err}");
+    }
+
+    #[test]
+    fn write_task_file_refuses_closed_bundles_and_warns_on_verified_tasks() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = done_task(&paths, "spec work", false);
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran it".into())).unwrap();
+
+        // Verified: written, with the warning that archiving will now refuse.
+        let out = write_task_file(
+            &paths,
+            "0.1.0",
+            &t.id,
+            "specs/export/spec.md",
+            Some(DELTA_EDITED.into()),
+        )
+        .unwrap();
+        assert!(out.warnings.iter().any(|w| w.contains("verified again")), "{:?}", out.warnings);
+        // Prose is not folded, so it carries no such warning.
+        let out = write_task_file(&paths, "0.1.0", &t.id, "design.md", Some("d\n".into())).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        // Folded, then un-archived: a delta edit would never fold again.
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("re-ran".into())).unwrap();
+        set_task_archived(&paths, "0.1.0", &t.id, true).unwrap();
+        let err =
+            write_task_file(&paths, "0.1.0", &t.id, "design.md", Some("x".into())).unwrap_err();
+        assert!(err.to_string().contains("archived"), "{err}");
+        set_task_archived(&paths, "0.1.0", &t.id, false).unwrap();
+        let err = write_task_file(
+            &paths,
+            "0.1.0",
+            &t.id,
+            "specs/export/spec.md",
+            Some(DELTA_OK.into()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already folded"), "{err}");
+        assert!(write_task_file(&paths, "0.1.0", &t.id, "design.md", Some("x".into())).is_ok());
+    }
+
+    /// Reported 2026-11-09 against 3e9432c: the task id was joined into paths
+    /// unchecked. `tasks/{id}.json` with id `../.` reads `<ws>/..json`, while
+    /// `tasks/{id}/specs/…` resolves to `<ws>/specs/…` — the main spec. An
+    /// agent fenced off `tasks/` and `specs/` but free to write the workspace
+    /// root could plant a copied task file there and have the hub (which runs
+    /// outside the agent's sandbox) overwrite or delete a main spec, ledgered
+    /// under the copied task's title.
+    #[test]
+    fn a_task_id_cannot_steer_write_task_file_out_of_the_tasks_folder() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = todo_task(&paths, "export");
+        std::fs::create_dir_all(paths.spec_file("export").parent().unwrap()).unwrap();
+        std::fs::write(paths.spec_file("export"), "ORIGINAL").unwrap();
+        std::fs::copy(
+            paths.tasks_dir().join(format!("{}.json", t.id)),
+            paths.root().join("..json"),
+        )
+        .unwrap();
+
+        for id in ["../.", "..\\.", "../T-0001", "T-0001/..", "", "t-0001", "T-", "T-12a"] {
+            for content in [Some("PWNED".to_string()), None] {
+                let err = write_task_file(&paths, "0.1.0", id, "specs/export/spec.md", content)
+                    .unwrap_err();
+                assert_eq!(err.kind(), "invalid_input", "{id:?}: {err}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(paths.spec_file("export")).unwrap(), "ORIGINAL");
+    }
+
+    #[test]
+    fn patch_task_changes_only_what_it_names_and_keeps_the_verification() {
+        let (_g, paths) = workspace();
+        let t = create_task(
+            &paths,
+            "0.1.0",
+            NewTask {
+                title: "export".into(),
+                description: "csv".into(),
+                priority: 1,
+                tags: vec!["io".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update_task_status(&paths, "0.1.0", &t.id, TaskStatus::Done, None).unwrap();
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran".into())).unwrap();
+
+        let task = patch_task(
+            &paths,
+            "0.1.0",
+            &t.id,
+            TaskPatch { title: Some("export to CSV".into()), ..Default::default() },
+        )
+        .unwrap()
+        .task;
+        assert_eq!(task.title, "export to CSV");
+        assert_eq!((task.description.as_str(), task.priority), ("csv", 1));
+        assert_eq!(task.tags, vec!["io".to_string()]);
+        assert!(task.is_verified(), "wording fixes do not un-check the work");
+
+        let task = patch_task(
+            &paths,
+            "0.1.0",
+            &t.id,
+            TaskPatch { tags: Some(vec![]), ..Default::default() },
+        )
+        .unwrap()
+        .task;
+        assert!(task.tags.is_empty(), "an explicit empty list clears the tags");
+        assert_eq!(task.title, "export to CSV");
+
+        let err = patch_task(&paths, "0.1.0", &t.id, TaskPatch::default()).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        let lines =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 10).unwrap();
+        assert!(
+            lines.iter().any(|e| e.message.contains("title \"export\" → \"export to CSV\"")),
+            "{lines:?}"
+        );
+
+        // A rewritten description — where acceptance criteria live — is tied
+        // to both versions by hash, so a later reader can tell which text a
+        // verification was checked against.
+        patch_task(
+            &paths,
+            "0.1.0",
+            &t.id,
+            TaskPatch { description: Some("csv, and done when it opens in Excel".into()), ..Default::default() },
+        )
+        .unwrap();
+        let lines =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 1).unwrap();
+        let expected = format!(
+            "description updated (sha256 {} → {})",
+            short_sha256(b"csv"),
+            short_sha256("csv, and done when it opens in Excel".as_bytes())
+        );
+        assert!(lines[0].message.contains(&expected), "{}", lines[0].message);
+    }
+
+    // ── 2026-11-09 security review of the D149 write surface (F1–F5) ──
+    // Each of these was first a passing exploit in the reviewer's worktree;
+    // the asserts below are the safe outcomes. Findings in full:
+    // nextup_docs/reviews/d149-write-surface-security-review-2026-11.md.
+
+    /// F1: a NUL let one delta impersonate two in the bundle hash. The framing
+    /// is fixed in `specs` (unit-tested there); text that can hide content
+    /// from the person reviewing it is also refused at the door.
+    #[test]
+    fn write_task_file_refuses_control_characters_but_keeps_tabs_and_line_breaks() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = todo_task(&paths, "export");
+        for bad in ["a\0b", "a\u{7}b", "a\u{1b}[2Jb", "a\u{7f}b"] {
+            let err = write_task_file(&paths, "0.1.0", &t.id, "specs/a/spec.md", Some(bad.into()))
+                .unwrap_err();
+            assert!(err.to_string().contains("control character"), "{bad:?}: {err}");
+        }
+        assert!(!paths.task_artifact_dir(&t.id).exists());
+        let fine = "## ADDED Requirements\r\n\r\n### Requirement: x\r\n\tMUST.\r\n";
+        assert!(write_task_file(&paths, "0.1.0", &t.id, "design.md", Some(fine.into())).is_ok());
+    }
+
+    /// F2: a task verified with no hash (before D149, or with the spec module
+    /// off) gave the fold nothing to compare, and the hub only warned — the
+    /// sweep then folded the new delta unattended.
+    #[test]
+    fn a_delta_cannot_be_added_through_the_hub_to_a_task_verified_without_a_hash() {
+        let (_g, paths) = workspace(); // spec module off while verifying
+        let t = done_task(&paths, "old, verified work", true);
+        assert_eq!(t.verified_specs_hash, None);
+        enable_specs(&paths);
+
+        let err = write_task_file(&paths, "0.1.0", &t.id, "specs/auth/spec.md", Some(DELTA_OK.into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("clear its verification"), "{err}");
+        assert!(!paths.task_delta_specs_dir(&t.id).exists());
+        // Prose never folds, so it stays writable.
+        assert!(write_task_file(&paths, "0.1.0", &t.id, "design.md", Some("d\n".into())).is_ok());
+
+        // The way through: clear, write, verify again — which records the hash.
+        set_task_verification(&paths, "0.1.0", &t.id, false, None).unwrap();
+        write_task_file(&paths, "0.1.0", &t.id, "specs/auth/spec.md", Some(DELTA_OK.into())).unwrap();
+        let task = set_task_verification(&paths, "0.1.0", &t.id, true, Some("re-ran".into()))
+            .unwrap()
+            .task;
+        assert!(task.verified_specs_hash.is_some());
+    }
+
+    /// F3: the hash ignored a leading BOM but the parser did not, so a BOM hid
+    /// a `## REMOVED` section from the dry-run a reviewer saw while the hash
+    /// already covered the version without it. Now both see the same text:
+    /// the removal is visible before verification.
+    #[test]
+    fn a_leading_bom_hides_nothing_from_the_dry_run() {
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        std::fs::create_dir_all(paths.spec_file("auth").parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.spec_file("auth"),
+            "# auth Specification\n\n## Purpose\nLogin.\n\n## Requirements\n\n### Requirement: Lockout\nThe system SHALL lock an account after 5 failed logins.\n\n#### Scenario: s\n- **WHEN** x\n- **THEN** y\n",
+        )
+        .unwrap();
+        let t = done_task(&paths, "auth tweak", false);
+        let body = "## REMOVED Requirements\n\n### Requirement: Lockout\n**Reason**: x\n\n## ADDED Requirements\n\n### Requirement: Remember me\nThe system SHALL offer remember-me.\n\n#### Scenario: s\n- **WHEN** x\n- **THEN** y\n";
+        let report = write_task_file(
+            &paths,
+            "0.1.0",
+            &t.id,
+            "specs/auth/spec.md",
+            Some(format!("\u{feff}{body}")),
+        )
+        .unwrap()
+        .specs
+        .unwrap();
+        assert_eq!((report.added, report.removed), (1, 1), "the reviewer sees the removal");
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("reviewed".into())).unwrap();
+        // Dropping the BOM afterwards changes nothing anyone has not seen.
+        let out =
+            write_task_file(&paths, "0.1.0", &t.id, "specs/auth/spec.md", Some(body.into())).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!((out.specs.as_ref().unwrap().added, out.specs.unwrap().removed), (1, 1));
+    }
+
+    /// F4 (a): the fold wrote specs/ before the task file's marker, and the
+    /// callers ledgered it only after — a task file held open by another
+    /// process left the main spec rewritten with no ledger line. Windows only:
+    /// the share mode is how a plain reader denies writes there.
+    #[cfg(windows)]
+    #[test]
+    fn a_fold_whose_marker_write_fails_still_ledgers_what_it_changed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = done_task(&paths, "x", false);
+        write_task_file(&paths, "0.1.0", &t.id, "specs/export/spec.md", Some(DELTA_OK.into())).unwrap();
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran".into())).unwrap();
+
+        let task_json = paths.tasks_dir().join(format!("{}.json", t.id));
+        let hold =
+            std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&task_json).unwrap();
+        let swept = archive_verified_done_tasks(&paths, "0.1.0", None).unwrap();
+        drop(hold);
+
+        assert!(swept.is_empty(), "the task could not be marked, so it is not archived yet");
+        assert!(paths.spec_file("export").exists(), "specs/ was written…");
+        assert_eq!(spec_folded_lines(&paths).len(), 1, "…and the ledger says so");
+        // Once the file is free the next sweep catches up.
+        let swept = archive_verified_done_tasks(&paths, "0.1.0", None).unwrap();
+        assert_eq!(swept, vec![t.id.clone()]);
+    }
+
+    /// F4 (b): one task file held open aborted the whole sweep after earlier
+    /// tasks were already archived — no summary line, no fresh snapshot.
+    #[cfg(windows)]
+    #[test]
+    fn one_unwritable_task_file_does_not_abort_the_archive_sweep() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let (_g, paths) = workspace();
+        let first = done_task(&paths, "first", true);
+        let second = done_task(&paths, "second", true);
+        let third = done_task(&paths, "third", true);
+        let archived_lines = |paths: &WorkspacePaths| {
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskArchived, 50).unwrap()
+        };
+        let before = archived_lines(&paths).len();
+
+        let task_json = paths.tasks_dir().join(format!("{}.json", second.id));
+        let hold =
+            std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&task_json).unwrap();
+        let swept = archive_verified_done_tasks(&paths, "0.1.0", None);
+        drop(hold);
+
+        assert_eq!(swept.unwrap(), vec![first.id.clone(), third.id.clone()]);
+        let lines = archived_lines(&paths);
+        assert_eq!(lines.len(), before + 1, "the summary line is written");
+        assert!(lines[0].message.contains(&first.id) && !lines[0].message.contains(&second.id));
+    }
+
+    /// F5: a post-write re-hash that failed skipped the ledger line of a
+    /// write that had already landed, while the hub recorded the call as
+    /// failed. Now the write reports success with a warning, and is ledgered.
+    #[cfg(windows)]
+    #[test]
+    fn a_landed_write_is_ledgered_even_when_the_bundle_cannot_be_re_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_g, paths) = workspace();
+        enable_specs(&paths);
+        let t = done_task(&paths, "x", false);
+        write_task_file(&paths, "0.1.0", &t.id, "specs/a/spec.md", Some(DELTA_OK.into())).unwrap();
+        write_task_file(&paths, "0.1.0", &t.id, "specs/b/spec.md", Some(DELTA_OK.into())).unwrap();
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("ran".into())).unwrap();
+
+        let sibling = paths.task_delta_specs_dir(&t.id).join("b").join("spec.md");
+        let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&sibling).unwrap();
+        let out =
+            write_task_file(&paths, "0.1.0", &t.id, "specs/a/spec.md", Some(DELTA_EDITED.into()));
+        drop(hold);
+
+        let out = out.expect("the write landed, so the call succeeds");
+        assert!(out.warnings.iter().any(|w| w.contains("could not be re-read")), "{:?}", out.warnings);
+        let sha = short_sha256(DELTA_EDITED.as_bytes());
+        let lines =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 50).unwrap();
+        assert!(lines.iter().any(|e| e.message.contains(&sha)), "{lines:?}");
     }
 }

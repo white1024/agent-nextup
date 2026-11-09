@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../../api";
 import { Check } from "../../components/controls";
 import { useGuardedMutation } from "../../hooks";
+import { grantAllToolsPreferred, rememberGrantAllTools } from "../../lib/prefs";
 import type { AdoptionDraft, NewTask, SystemStatus } from "../../types";
 import TemplatePicker from "./TemplatePicker";
 
@@ -26,6 +27,7 @@ export default function AdoptWizard({
   const [description, setDescription] = useState("");
   const [templateId, setTemplateId] = useState("coding-v1");
   const [taskSelected, setTaskSelected] = useState<boolean[]>([]);
+  const [grantAll, setGrantAll] = useState(grantAllToolsPreferred);
   const { busy, run: runSubmit } = useGuardedMutation(onError);
 
   // The picker is awaited *outside* the guard on purpose: the native dialog is
@@ -62,9 +64,12 @@ export default function AdoptWizard({
           goals: [],
           boundaries: [],
           templateId,
+          grantAllTools: grantAll,
         },
         tasks,
       );
+      // Same preference as the create wizard: one person, one habit.
+      rememberGrantAllTools(grantAll);
       onLoaded(status);
     });
   }
@@ -153,6 +158,13 @@ export default function AdoptWizard({
           )}
 
           <TemplatePicker templateId={templateId} onSelect={setTemplateId} />
+
+          <Check checked={grantAll} onChange={setGrantAll}>
+            <span>
+              {t("wizard.grantAllTools")}
+              <span className="muted template-hint"> {t("wizard.grantAllToolsHint")}</span>
+            </span>
+          </Check>
         </>
       )}
 

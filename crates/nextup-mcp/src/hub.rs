@@ -501,6 +501,42 @@ pub struct SetMilestoneVerifiedArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct EditTaskArgs {
+    /// Task id, e.g. "T-0001"
+    pub id: String,
+    /// New title; omit to keep it
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New description (replaces the whole text); omit to keep it
+    #[serde(default)]
+    pub description: Option<String>,
+    /// 0 = P0, the highest; omit to keep it
+    #[serde(default)]
+    pub priority: Option<u8>,
+    /// The complete new tag list (replaces it; [] clears it); omit to keep it
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteTaskFileArgs {
+    /// Task id, e.g. "T-0001"
+    pub id: String,
+    /// Relative to the task's folder tasks/<id>/: "proposal.md", "design.md" or
+    /// "specs/<capability>/spec.md"
+    pub path: String,
+    /// The whole new content of the file (a delta's MODIFIED block is a full
+    /// rewrite anyway). Omit only together with delete: true
+    #[serde(default)]
+    pub content: Option<String>,
+    /// true deletes the file instead; content must then be omitted
+    #[serde(default)]
+    pub delete: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageArgs {
     pub message: String,
 }
@@ -889,6 +925,31 @@ impl Hub {
         self.dispatch("set_task_verification", move |paths| {
             let update =
                 ops::set_task_verification(paths, APP_VERSION, &args.id, args.verified, args.note)?;
+            Ok(TaskWriteResult::new(paths, update))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "edit_task",
+        description = "Change a task's title, description, priority or tags after it was created. Only the fields you pass change; tags, when passed, replaces the whole list. Status, verification, assignee and dependencies are not edited here — each has its own tool and rules. Editing does not clear a verification: fix wording freely, but if the substance of the work changed, that is a new task. Writes to the ledger (what changed), regenerates the handoff layer and returns a compact result."
+    )]
+    async fn edit_task(
+        &self,
+        Parameters(args): Parameters<EditTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch("edit_task", move |paths| {
+            let update = ops::patch_task(
+                paths,
+                APP_VERSION,
+                &args.id,
+                ops::TaskPatch {
+                    title: args.title,
+                    description: args.description,
+                    priority: args.priority,
+                    tags: args.tags,
+                },
+            )?;
             Ok(TaskWriteResult::new(paths, update))
         })
         .await
@@ -1683,6 +1744,36 @@ impl Hub {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("validate_task_specs", move |paths| {
             ops::validate_task_specs(paths, &args.id)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "write_task_file",
+        description = "Write or delete one file in a task's artifact folder tasks/<id>/: proposal.md, design.md, or a spec delta at specs/<capability>/spec.md. content is the whole new file. Writing the files with your own file tools works too; use this when you have no write access to tasks/ (running unattended, sandboxed). A delta is written even when it does not fold yet — the result carries the same dry-run validate_task_specs returns, so fix what it lists. Refused for an archived task, and for a delta whose task has already folded. If the task is verified, the result warns you: a delta changed after verification is refused at archive time until the task is verified again. Leaves a ledger line naming the file and a hash of what was written."
+    )]
+    async fn write_task_file(
+        &self,
+        Parameters(args): Parameters<WriteTaskFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch("write_task_file", move |paths| {
+            let content = match (args.content, args.delete) {
+                (Some(text), false) => Some(text),
+                (None, true) => None,
+                (Some(_), true) => {
+                    return Err(nextup_core::NextUpError::InvalidInput(
+                        "pass content to write, or delete: true to delete — not both".into(),
+                    ))
+                }
+                // An omitted field must never mean "delete": a call that lost
+                // its content argument would otherwise erase the file.
+                (None, false) => {
+                    return Err(nextup_core::NextUpError::InvalidInput(
+                        "content is required — to delete the file pass delete: true instead".into(),
+                    ))
+                }
+            };
+            ops::write_task_file(paths, APP_VERSION, &args.id, &args.path, content)
         })
         .await
     }
@@ -2728,6 +2819,81 @@ mod tests {
         assert_eq!(report["added"], 1);
         let after = text_of(&call(&client, "get_spec", json!({ "capability": "export" })).await);
         assert!(!after.contains("Requirement: C"), "dry-run writes nothing");
+    }
+
+    /// D149: an agent with no write access to `tasks/` can still write its
+    /// task's artifacts and edit the task — through calls that are audited
+    /// and attributed. A missing `content` is refused rather than read as a
+    /// delete, so a call that lost its argument cannot erase a file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_contents_are_writable_through_the_hub() {
+        let (_guard, paths) = workspace();
+        nextup_core::workspace::modules::set_module_enabled(
+            &paths,
+            nextup_core::workspace::modules::MODULE_SPECS,
+            true,
+        )
+        .unwrap();
+        // Enabling a module later does not grant its tools (same as collab).
+        agent::set_tool_allowed(&paths, "write_task_file", true).unwrap();
+        let client = serve_as(&paths, Some("loop-agent")).await;
+        let tools = client.peer().list_all_tools().await.unwrap();
+        for name in ["edit_task", "write_task_file"] {
+            assert!(tools.iter().any(|t| t.name == name), "{name} must be advertised");
+        }
+
+        let task = call(&client, "create_task", json!({ "title": "export" })).await;
+        let task: serde_json::Value = serde_json::from_str(&text_of(&task)).unwrap();
+        let id = task["id"].as_str().unwrap().to_string();
+        let file = paths.task_delta_specs_dir(&id).join("export").join("spec.md");
+
+        for args in [
+            json!({ "id": id, "path": "specs/export/spec.md" }),
+            json!({ "id": id, "path": "specs/export/spec.md", "content": "x", "delete": true }),
+        ] {
+            let refused = call(&client, "write_task_file", args).await;
+            assert_eq!(refused.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&text_of(&refused)).unwrap();
+            assert_eq!(body["kind"], "invalid_input");
+        }
+        assert!(!file.exists());
+
+        let delta = "## ADDED Requirements\n\n### Requirement: C\nThe system SHALL export it.\n\n#### Scenario: s\n- **WHEN** x\n";
+        let wrote = call(
+            &client,
+            "write_task_file",
+            json!({ "id": id, "path": "specs/export/spec.md", "content": delta }),
+        )
+        .await;
+        assert_ne!(wrote.is_error, Some(true), "got: {}", text_of(&wrote));
+        let wrote: serde_json::Value = serde_json::from_str(&text_of(&wrote)).unwrap();
+        assert_eq!(wrote["specs"]["ok"], true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), delta);
+
+        let edited =
+            call(&client, "edit_task", json!({ "id": id, "description": "csv and json" })).await;
+        assert_ne!(edited.is_error, Some(true), "got: {}", text_of(&edited));
+        let edited: serde_json::Value = serde_json::from_str(&text_of(&edited)).unwrap();
+        assert_eq!(edited["task"]["description"], "csv and json");
+        assert_eq!(edited["task"]["title"], "export");
+
+        let deleted = call(
+            &client,
+            "write_task_file",
+            json!({ "id": id, "path": "specs/export/spec.md", "delete": true }),
+        )
+        .await;
+        assert_ne!(deleted.is_error, Some(true), "got: {}", text_of(&deleted));
+        assert!(!file.exists());
+
+        // Both the semantic lines and the audit lines name the caller.
+        let ledger = Ledger::new(paths.ledger_file());
+        let edits = ledger.recent_of_kind(LedgerKind::TaskEdited, 10).unwrap();
+        assert!(
+            edits.iter().any(|e| e.message.contains("wrote tasks/")
+                && e.actor.as_deref() == Some("loop-agent")),
+            "{edits:?}"
+        );
     }
 
     /// Team module end to end (D48): exposure follows the switch, publish is

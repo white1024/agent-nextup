@@ -420,6 +420,27 @@ fn check_task_files(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -
             continue;
         }
         match std::fs::read(&path).ok().and_then(|raw| serde_json::from_slice::<Task>(&raw).ok()) {
+            // A malformed id, or one that is not this file's own name (a
+            // copied file), is skipped by listings and refused by every tool —
+            // the store will not turn it into a path. Say so rather than let
+            // the task silently disappear.
+            Some(task)
+                if crate::workspace::tasks::validate_task_id(&task.id).is_err()
+                    || path.file_stem().and_then(|s| s.to_str()) != Some(task.id.as_str()) =>
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let id: String = task.id.chars().take(40).collect();
+                findings.push(finding(
+                    "task_file",
+                    DoctorSeverity::Error,
+                    format!("tasks/{name}"),
+                    format!(
+                        "task file holds id '{id}', which is not its own file name in the T-0001 \
+                         shape — it is invisible to listings and every tool refuses it; rename \
+                         the file or fix the id"
+                    ),
+                ));
+            }
             Some(task) => parsed.push(task),
             None => {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -569,7 +590,6 @@ mod modules_check_tests {
 /// stale-after-fold bundles, and fold conflicts that will make the archive
 /// refuse (or the auto sweep skip) a task. All read-only dry-runs.
 fn check_specs(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -> Result<()> {
-    use crate::workspace::layout::SPEC_FILE;
     use crate::workspace::specs;
     use crate::workspace::tasks::TaskStore;
     const SPEC_SIZE_LIMIT: usize = 32 * 1024;
@@ -629,20 +649,18 @@ fn check_specs(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -> Res
         if let Some(folded_at) = &task.spec_folded_at {
             // Folded, then the bundle changed: those edits never fold again
             // by themselves — the marker only clears when the task reopens.
-            let Ok(folded) = DateTime::parse_from_rfc3339(folded_at) else { continue };
-            let folded = folded.with_timezone(&Utc);
-            let dir = paths.task_delta_specs_dir(&task.id);
-            // One second of tolerance: the marker is truncated to whole
-            // seconds (now_rfc3339) while NTFS mtimes carry sub-second
-            // precision — a fold landing in the same wall-clock second as
-            // the delta's last write must not read as an edit (batch ②
-            // review: scripted flows hit this 3/3).
-            let edited_after = deltas.iter().any(|d| {
-                std::fs::metadata(dir.join(&d.capability).join(SPEC_FILE))
-                    .and_then(|m| m.modified())
-                    .map(|t| DateTime::<Utc>::from(t) > folded + chrono::Duration::seconds(1))
-                    .unwrap_or(false)
-            });
+            //
+            // Compared by content (D149). This used to compare file times
+            // against the marker, and git stamps every file a clone or pull
+            // touches with the current time — so a fresh clone reported every
+            // folded task with a delta (seen 12 and 22 at once on a real
+            // project). A fold made before the hash existed has nothing to
+            // compare and stays quiet: a check that cries wolf after every
+            // clone teaches people to ignore it, which is worse than silence.
+            let edited_after = task
+                .spec_folded_hash
+                .as_deref()
+                .is_some_and(|folded| folded != specs::delta_bundle_hash(&deltas));
             if edited_after {
                 findings.push(finding(
                     "spec_delta_stale",
@@ -667,6 +685,26 @@ fn check_specs(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -> Res
                 ),
             ));
             continue;
+        }
+        // Verified, then the bundle changed (D149): the archive refuses it and
+        // the auto sweep skips it, so without this the task would simply sit
+        // there with nothing saying why.
+        if task
+            .verified_specs_hash
+            .as_deref()
+            .is_some_and(|attested| attested != specs::delta_bundle_hash(&deltas))
+        {
+            findings.push(finding(
+                "spec_delta_changed_after_verify",
+                DoctorSeverity::Warning,
+                rel.clone(),
+                format!(
+                    "{} delta specs changed after the task was verified — archiving refuses them \
+                     (and the auto sweep skips the task) until someone checks the new version: \
+                     clear its verification and verify it again",
+                    task.id
+                ),
+            ));
         }
         // Dry-run the fold for every unfolded bundle; sweep candidates get
         // the sharper wording (the auto sweep will silently skip them).
@@ -1376,15 +1414,12 @@ mod tests {
         write_task_delta(&paths, &orphan.id, "export", DELTA);
         TaskStore::new(paths.tasks_dir()).set_archived(&orphan.id, true).unwrap();
 
-        // Stale: folded through the real archive path, then the bundle
-        // edited afterwards. The marker is backdated so the file mtime is
-        // deterministically newer than the fold.
+        // Stale: folded through the real archive path, then the bundle's
+        // content edited afterwards (D149 compares content, not file times).
         let stale = done_verified(&paths, "edited after fold");
         write_task_delta(&paths, &stale.id, "billing", DELTA);
         ops::set_task_archived(&paths, "0.0.0-test", &stale.id, true).unwrap();
-        TaskStore::new(paths.tasks_dir())
-            .set_spec_folded_at(&stale.id, Some("2020-01-01T00:00:00Z".into()))
-            .unwrap();
+        write_task_delta(&paths, &stale.id, "billing", &DELTA.replace("必須。", "必須，且要快。"));
 
         let report = run_doctor(paths.root()).unwrap();
         let orphan_hit = report.findings.iter().find(|f| f.check == "spec_delta_orphan").unwrap();
@@ -1392,6 +1427,65 @@ mod tests {
         let stale_hit = report.findings.iter().find(|f| f.check == "spec_delta_stale").unwrap();
         assert!(stale_hit.message.contains(&stale.id), "{}", stale_hit.message);
         assert_eq!(stale_hit.severity, DoctorSeverity::Warning);
+    }
+
+    /// A copied task file (its id names another task) and a malformed id are
+    /// invisible to listings and refused by every tool, so the doctor is what
+    /// says the task went missing and why.
+    #[test]
+    fn task_files_whose_id_is_not_their_name_are_errors() {
+        let (_g, paths) = managed_workspace();
+        let t = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "real".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        let tasks = paths.tasks_dir();
+        std::fs::copy(tasks.join(format!("{}.json", t.id)), tasks.join("T-0042.json")).unwrap();
+        let report = run_doctor(paths.root()).unwrap();
+        let hit = report
+            .findings
+            .iter()
+            .find(|f| f.check == "task_file" && f.target == "tasks/T-0042.json")
+            .expect("copied file reported");
+        assert_eq!(hit.severity, DoctorSeverity::Error);
+        assert!(hit.message.contains(&t.id), "{}", hit.message);
+        assert!(
+            report.findings.iter().all(|f| f.target != format!("tasks/{}.json", t.id)),
+            "the real file is fine: {:?}",
+            report.findings
+        );
+    }
+
+    /// D149: the archive refuses a delta changed after verification and the
+    /// sweep skips it — the doctor is what says why the task is sitting there.
+    #[test]
+    fn a_delta_changed_after_verification_is_reported() {
+        let (_g, paths) = managed_workspace();
+        use crate::workspace::ops;
+        const DELTA: &str = "## ADDED Requirements\n\n### Requirement: 匯出\n必須。\n\n#### Scenario: s\n- **WHEN** x\n";
+        let t = ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "spec work".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        ops::update_task_status(&paths, "0.0.0-test", &t.id, TaskStatus::Done, None).unwrap();
+        write_task_delta(&paths, &t.id, "export", DELTA);
+        ops::set_task_verification(&paths, "0.0.0-test", &t.id, true, Some("ran".into())).unwrap();
+        let quiet = run_doctor(paths.root()).unwrap();
+        assert!(quiet.findings.iter().all(|f| f.check != "spec_delta_changed_after_verify"));
+
+        write_task_delta(&paths, &t.id, "export", &DELTA.replace("必須。", "必須，且要快。"));
+        let report = run_doctor(paths.root()).unwrap();
+        let hit = report
+            .findings
+            .iter()
+            .find(|f| f.check == "spec_delta_changed_after_verify")
+            .expect("reported");
+        assert_eq!(hit.severity, DoctorSeverity::Warning);
+        assert!(hit.message.contains(&t.id), "{}", hit.message);
     }
 
     /// Batch ② review error: a Big5 spec or delta file crashed the whole
@@ -1412,22 +1506,42 @@ mod tests {
         assert!(hits >= 2, "one finding per unreadable file: {:?}", report.findings);
     }
 
-    /// Batch ② review: the fold marker is second-truncated while mtimes are
-    /// sub-second — a fold in the same wall-clock second as the delta write
-    /// must not read as "edited after fold". And a bundle directory whose
-    /// task file is gone must surface (task-driven checks cannot see it).
+    /// D149: a git clone or pull stamps every file it touches with the
+    /// current time, and the old file-time comparison reported every folded
+    /// task with a delta after one. A newer mtime, CRLF line endings (git on
+    /// Windows) and a BOM are not edits; a fold recorded before the hash
+    /// existed stays quiet. And a bundle directory whose task file is gone
+    /// must surface (task-driven checks cannot see it).
     #[test]
-    fn same_second_fold_is_not_stale_and_ownerless_bundles_are_flagged() {
+    fn checkout_touched_or_crlf_bundles_are_not_stale_and_ownerless_bundles_are_flagged() {
         let (_g, paths) = managed_workspace();
         use crate::workspace::ops;
+        use crate::workspace::tasks::TaskStore;
         const DELTA: &str = "## ADDED Requirements\n\n### Requirement: 匯出\n必須。\n\n#### Scenario: s\n- **WHEN** x\n";
         let t = done_verified(&paths, "fresh fold");
         write_task_delta(&paths, &t.id, "export", DELTA);
         ops::set_task_archived(&paths, "0.0.0-test", &t.id, true).unwrap();
+
+        // What a checkout on another machine looks like: same text, CRLF,
+        // a BOM, and a file time far newer than the fold.
+        let file = paths.task_delta_specs_dir(&t.id).join("export").join("spec.md");
+        std::fs::write(&file, format!("\u{feff}{}", DELTA.replace('\n', "\r\n"))).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(future).unwrap();
+
+        // A fold from before the hash existed: nothing to compare.
+        let legacy = done_verified(&paths, "legacy fold");
+        write_task_delta(&paths, &legacy.id, "billing", DELTA);
+        ops::set_task_archived(&paths, "0.0.0-test", &legacy.id, true).unwrap();
+        let store = TaskStore::new(paths.tasks_dir());
+        let folded_at = store.get(&legacy.id).unwrap().spec_folded_at;
+        store.set_spec_folded(&legacy.id, folded_at, None).unwrap();
+        write_task_delta(&paths, &legacy.id, "billing", "edited, but who can tell\n");
+
         let report = run_doctor(paths.root()).unwrap();
         assert!(
             report.findings.iter().all(|f| f.check != "spec_delta_stale"),
-            "same-second fold is not an edit: {:?}",
+            "a checkout is not an edit, and a legacy fold has no baseline: {:?}",
             report.findings
         );
 

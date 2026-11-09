@@ -16,7 +16,7 @@ A requirement's identity is `### Requirement: Title`, compared **exactly** after
 
 ## The delta
 
-It lives at `tasks/<task-id>/specs/<capability>/spec.md` — write it directly with your own file tools — in four sections:
+It lives at `tasks/<task-id>/specs/<capability>/spec.md` — write it with your own file tools, or with `write_task_file` when you cannot write to `tasks/` (a sandboxed or unattended run; it also hands back the fold dry-run) — in four sections:
 
 - `## ADDED Requirements` — the new requirement in full
 - `## MODIFIED Requirements` — **rewrite the whole block, this is not a diff**; read the current state with `get_spec` first and preserve every existing scenario; dropping any one of them means the fold is refused
@@ -28,6 +28,8 @@ It lives at `tasks/<task-id>/specs/<capability>/spec.md` — write it directly w
 ## The flow
 
 Write the artifacts (proposal and design as free prose, which the engine does not parse) → implement → **check yourself with `validate_task_specs`** (a dry-run; the conflicts it reports are the same ones that will refuse you at archive time) → mark `done` → the user verifies → archiving folds it in (the engine does this, leaving a `spec_folded` ledger trace).
+
+**The verification covers the delta as it was.** Change the delta after the task is verified and archiving refuses it until the task is verified again — the engine will not fold text nobody checked. So the delta is finished before you ask for verification; if you must change it afterwards, say so to the user, because that verification no longer holds.
 
 **Folding is the engine's job — do not edit the main spec yourself to "keep it in sync".** If a human edited the main spec first that is fine too; the engine treats an already-synced edit as a no-op.
 

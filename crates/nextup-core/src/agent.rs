@@ -166,6 +166,12 @@ pub const TOOLS: &[ToolMeta] = &[
     guarded("team_member_ledger", Some(MODULE_PRIME), "prime", "member_contents"),
     guarded("team_member_specs", Some(MODULE_PRIME), "prime", "member_contents"),
     guarded("team_archive_task", Some(MODULE_PRIME), "prime", "member_signoff"),
+    // Task contents after creation (D149). Granted like create_task: neither
+    // asserts anything about progress or verification — the attribute edit
+    // keeps those dimensions out by construction (TaskEdit), and a delta
+    // written after verification is refused at fold time, not here.
+    granted("edit_task", None, "tasks"),
+    granted("write_task_file", Some(MODULE_SPECS), "tasks"),
 ];
 
 /// Display order of the write-tier semantic groups (D39). Presentation
@@ -642,13 +648,14 @@ mod tests {
              record_lesson_fired archive_stale_lessons generate_handoff \
              upgrade_workspace_assets publish_delivery team_set_edge team_set_edge_auto_route \
              team_route team_add_member team_create_member team_remove_member \
-             team_member_tasks team_member_ledger team_member_specs team_archive_task"
+             team_member_tasks team_member_ledger team_member_specs team_archive_task \
+             edit_task write_task_file"
         );
         assert_eq!(
             DEFAULT_GRANTED_TOOLS.join(" "),
             "create_task update_task_status claim_task assign_task record_decision record_note \
              record_progress record_rejected add_milestone set_milestone_done record_lesson \
-             record_lesson_fired archive_stale_lessons generate_handoff"
+             record_lesson_fired archive_stale_lessons generate_handoff edit_task write_task_file"
         );
         // Reason-ordered, not table-ordered — see GUARD_REASONS.
         assert_eq!(

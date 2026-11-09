@@ -610,7 +610,7 @@ mod tests {
             .unwrap();
         store.update_status(&claimed.id, TaskStatus::Done, None).unwrap();
         store.update_status(&checked.id, TaskStatus::Done, None).unwrap();
-        store.set_verification(&checked.id, true, Some("live run observed".into())).unwrap();
+        store.set_verification(&checked.id, true, Some("live run observed".into()), None).unwrap();
 
         let mut ctx = sample_context();
         ctx.milestones.push(crate::workspace::context::Milestone {

@@ -33,6 +33,9 @@ fn main() {
         template_lang: None,
         modules,
         create_root: false,
+        // The D63 day-one grant, as an unticked wizard gives it (D150): the
+        // e2e runs open the guarded tools themselves, as a person would.
+        grant_all_tools: false,
     };
 
     match initialize_project(&params, &keys, "0.1.0") {

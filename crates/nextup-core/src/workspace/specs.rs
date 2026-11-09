@@ -1142,13 +1142,95 @@ pub fn cross_task_overlaps(
 
 /// A task's delta specs, sorted by capability. No bundle dir = empty.
 pub fn read_task_deltas(paths: &WorkspacePaths, task_id: &str) -> Result<Vec<DeltaFile>> {
+    // An id is joined into the path below; see tasks::validate_task_id.
+    crate::workspace::tasks::validate_task_id(task_id)?;
     let dir = paths.task_delta_specs_dir(task_id);
     let mut out = Vec::new();
     for capability in capability_dirs(&dir)? {
         let file = dir.join(&capability).join(SPEC_FILE);
-        out.push(DeltaFile { capability, content: read_text(&file)? });
+        let text = read_text(&file)?;
+        // A leading BOM (some Windows editors write one) hid the first `##`
+        // heading from the parser, silently dropping that section — while the
+        // bundle hash already ignored the BOM. The two disagreed about the same
+        // bytes, so a verified dry-run could report "nothing removed" for a
+        // delta that removed a requirement once the BOM was taken out (2026-11-09
+        // security review, F3). One normalisation, applied here, for both.
+        let content = match text.strip_prefix('\u{feff}') {
+            Some(rest) => rest.to_string(),
+            None => text,
+        };
+        out.push(DeltaFile { capability, content });
     }
     Ok(out)
+}
+
+/// Content hash of a task's delta bundle (D149): what verification attests
+/// and what a fold records, so both can later be compared against the bundle
+/// as it is now — by content, never by file time (a git clone or pull stamps
+/// every file it touches with the current time).
+///
+/// Line endings are normalised and a leading BOM dropped first: git on
+/// Windows may check the same commit out with CRLF, and a hash that differed
+/// between two machines holding identical text would refuse folds and raise
+/// false alarms there — the very failure the file-time check had. An empty
+/// bundle has a hash too (of nothing), so "verified with no delta, delta
+/// added later" is a mismatch rather than an absence.
+pub fn delta_bundle_hash(deltas: &[DeltaFile]) -> String {
+    hash_bundle(deltas.iter().map(|d| (d.capability.as_str(), d.content.as_bytes())))
+}
+
+/// [`delta_bundle_hash`] straight from disk, over raw bytes: verification and
+/// the doctor must not fail on a bundle that is not valid UTF-8 (that is the
+/// fold's refusal to make, and the doctor's `spec_parse` finding to report).
+/// For valid text it equals the hash of what the fold reads.
+pub fn task_bundle_hash(paths: &WorkspacePaths, task_id: &str) -> Result<String> {
+    crate::workspace::tasks::validate_task_id(task_id)?;
+    let dir = paths.task_delta_specs_dir(task_id);
+    let mut files = Vec::new();
+    for capability in capability_dirs(&dir)? {
+        let bytes = crate::workspace::atomic::read_file(&dir.join(&capability).join(SPEC_FILE))?;
+        files.push((capability, bytes));
+    }
+    Ok(hash_bundle(files.iter().map(|(c, b)| (c.as_str(), b.as_slice()))))
+}
+
+/// Every field is length-prefixed. The first version separated fields with a
+/// NUL byte, and since delta text may itself contain NUL, one file
+/// `A \0 b \0 B` hashed exactly like two files `a = A`, `b = B` — a verified
+/// single-capability bundle could be split afterwards into one that folds a
+/// second, never-seen capability under the same hash (2026-11-09 security
+/// review, F1). A length prefix makes the encoding prefix-free, so no content
+/// can stand in for structure.
+fn hash_bundle<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<(&str, &[u8])> = files.collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    for (capability, bytes) in sorted {
+        let text = normalized_delta_bytes(bytes);
+        hasher.update((capability.len() as u64).to_le_bytes());
+        hasher.update(capability.as_bytes());
+        hasher.update((text.len() as u64).to_le_bytes());
+        hasher.update(&text);
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What two machines holding the same delta agree on: no leading BOM (the
+/// parser drops it too, see [`read_task_deltas`]) and LF line endings (git on
+/// Windows may check the same commit out with CRLF). A lone CR is kept — the
+/// parser does not treat it as a line break either.
+fn normalized_delta_bytes(bytes: &[u8]) -> Vec<u8> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if !(bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n')) {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Current main-spec content for one capability, `None` when absent.
@@ -1941,5 +2023,31 @@ mod tests {
         for bad in ["", "Bad", "-lead", "_lead", "has space", "中文", &"x".repeat(65)] {
             assert!(validate_capability_name(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn delta_file(capability: &str, content: &str) -> DeltaFile {
+        DeltaFile { capability: capability.into(), content: content.into() }
+    }
+
+    /// 2026-11-09 security review F1: with NUL-separated fields, one file
+    /// `A \0 b \0 B` hashed like two files — a verified bundle could be split
+    /// into one that folds an unseen capability under the same hash.
+    #[test]
+    fn bundle_hash_framing_cannot_be_forged_by_content() {
+        let one = delta_bundle_hash(&[delta_file("a", "A\0b\0B")]);
+        let two = delta_bundle_hash(&[delta_file("a", "A"), delta_file("b", "B")]);
+        assert_ne!(one, two);
+        // Moving text between the name and the content is structure too.
+        assert_ne!(delta_bundle_hash(&[delta_file("ab", "c")]), delta_bundle_hash(&[delta_file("a", "bc")]));
+        // …while what two checkouts of the same text differ by still hashes alike.
+        assert_eq!(
+            delta_bundle_hash(&[delta_file("a", "x\ny\n")]),
+            delta_bundle_hash(&[delta_file("a", "\u{feff}x\r\ny\r\n")])
+        );
+        // Order of discovery does not matter, the capability name does.
+        assert_eq!(
+            delta_bundle_hash(&[delta_file("a", "1"), delta_file("b", "2")]),
+            delta_bundle_hash(&[delta_file("b", "2"), delta_file("a", "1")])
+        );
     }
 }

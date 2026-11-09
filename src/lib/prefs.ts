@@ -240,3 +240,20 @@ export function consoleWide(): boolean {
 export function setConsoleWide(wide: boolean): void {
   writeJson(CONSOLE_WIDE_KEY, wide);
 }
+
+const GRANT_ALL_KEY = "nextup-grant-all-tools";
+
+/**
+ * Whether the create and adopt wizards start with "grant every write tool"
+ * ticked (D150). It remembers the choice a project was last actually created
+ * with: someone running many projects unattended grants everything every time
+ * and should not have to say so again, while a first-time user still meets the
+ * guarded default (D63).
+ */
+export function grantAllToolsPreferred(): boolean {
+  return readJson<boolean>(GRANT_ALL_KEY, false) === true;
+}
+
+export function rememberGrantAllTools(on: boolean): void {
+  writeJson(GRANT_ALL_KEY, on);
+}

@@ -45,6 +45,13 @@ pub struct InitProjectParams {
     /// leave this off and initialize inside an existing folder.
     #[serde(default)]
     pub create_root: bool,
+    /// Grant every write tool this workspace exposes from day one, the guarded
+    /// ones included (D150) — the wizard's "grant all" box, which remembers the
+    /// person's last choice. Everything that does not pass it (headless init,
+    /// a coordinator creating a member, the box left unticked) keeps the D63
+    /// day-one grant.
+    #[serde(default)]
+    pub grant_all_tools: bool,
 }
 
 /// Create the full Agent NextUp structure inside `params.root`:
@@ -154,14 +161,23 @@ pub fn initialize_project(
 
     // Day-one agent grant (D63). Someone installing Agent NextUp wants an agent on
     // the project, so the recording and flow tools start allowed and the
-    // first hub call succeeds instead of being denied. The guarded five stay
+    // first hub call succeeds instead of being denied. The guarded ones stay
     // off — self-verification, phase advancement, cross-workspace publishing
-    // and asset rewrites are the judgement calls the harness keeps human.
+    // and asset rewrites are the judgement calls the harness keeps human —
+    // unless the person creating the workspace ticked "grant all" (D150):
+    // someone running many projects unattended cannot be the one to press
+    // verify in each of them, and the grant is theirs to give.
     // Must run *after* the module loop: the grant is filtered by what this
     // workspace exposes, and a module enabled above changes that set.
     let modules = crate::workspace::modules::get_modules(&paths)?;
-    let granted: Vec<String> =
-        crate::agent::default_granted_tools(&modules).iter().map(|t| t.to_string()).collect();
+    let granted: Vec<String> = if params.grant_all_tools {
+        crate::agent::exposed_write_tools(&modules)
+    } else {
+        crate::agent::default_granted_tools(&modules)
+    }
+    .iter()
+    .map(|t| t.to_string())
+    .collect();
     if !granted.is_empty() {
         crate::agent::set_tools_allowed(&paths, &granted, true)?;
     }
@@ -173,9 +189,17 @@ pub fn initialize_project(
 
     ledger_for(&paths).append(&LedgerEvent::new(
         LedgerKind::ProjectInitialized,
+        // Authorisation changes are not ledgered anywhere else, so the one
+        // grant that opens the guarded tools says so here — "who let agents
+        // verify their own work in this project, and when" has an answer.
         format!(
-            "project \"{name}\" initialized (domain: {domain}, workflow: {})",
-            template.name
+            "project \"{name}\" initialized (domain: {domain}, workflow: {}){}",
+            template.name,
+            if params.grant_all_tools {
+                "; every write tool granted to agents at creation, guarded ones included"
+            } else {
+                ""
+            }
         ),
         None,
     ))?;
@@ -226,6 +250,7 @@ mod tests {
             template_lang: None,
             modules: vec![],
             create_root: false,
+            grant_all_tools: false,
         }
     }
 
@@ -332,6 +357,34 @@ mod tests {
         let access = crate::agent::get_access(&paths).unwrap();
         assert!(crate::agent::authorize(&access, "claim_task").is_ok());
         assert!(crate::agent::authorize(&access, "assign_task").is_ok());
+    }
+
+    /// D150: the wizard's "grant all" opens every tool the workspace exposes —
+    /// guarded ones included, module-bound ones only where the module is on —
+    /// and the ledger says so, since nothing else records an access change.
+    #[test]
+    fn grant_all_opens_every_exposed_write_tool_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(dir.path());
+        p.grant_all_tools = true;
+        p.modules = vec![crate::workspace::modules::MODULE_SPECS.into()];
+        initialize_project(&p, &StaticKeyProvider([1u8; 32]), "0.1.0").unwrap();
+
+        let paths = WorkspacePaths::new(dir.path());
+        let access = crate::agent::get_access(&paths).unwrap();
+        let modules = crate::workspace::modules::get_modules(&paths).unwrap();
+        let exposed = crate::agent::exposed_write_tools(&modules);
+        assert!(exposed.contains(&"set_task_verification") && exposed.contains(&"write_task_file"));
+        for tool in &exposed {
+            assert!(crate::agent::authorize(&access, tool).is_ok(), "'{tool}' must be granted");
+        }
+        assert!(!access.tool_allowed("claim_task"), "collab is off: its tools stay out");
+
+        let line = crate::workspace::ledger::Ledger::new(paths.ledger_file())
+            .recent_of_kind(LedgerKind::ProjectInitialized, 1)
+            .unwrap()
+            .remove(0);
+        assert!(line.message.contains("every write tool granted"), "{}", line.message);
     }
 
     #[test]

@@ -107,6 +107,20 @@ pub struct Task {
     /// fold again on the next archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_folded_at: Option<String>,
+    /// Content hash of the delta bundle at the moment the task was verified
+    /// (D149). Folding turns a verified claim into the spec layer's truth, so
+    /// a fold refuses a bundle that no longer matches what was verified —
+    /// before this, a delta edited after verification folded unseen, and the
+    /// workspace-open sweep did it without anyone pressing anything. Absent on
+    /// tasks verified before it existed (and, with the spec module off, on
+    /// tasks verified with no bundle): those fold as they always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_specs_hash: Option<String>,
+    /// Content hash of the bundle as it was folded (D149) — what the doctor
+    /// compares to tell a real edit after the fold from a git checkout that
+    /// only touched file times. Absent on folds made before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_folded_hash: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -176,12 +190,22 @@ impl TaskStore {
         Self { dir: tasks_dir.into() }
     }
 
-    fn task_file(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.json"))
+    /// The one place an id becomes a path, so the one place it is checked.
+    /// Ids arrive from agents (hub tool arguments, `dependsOn` lists) and are
+    /// joined into `tasks/{id}.json` here and into `tasks/{id}/…` by the
+    /// artifact bundle — unchecked, `../.` read a planted `<ws>/..json` while
+    /// steering the bundle to `<ws>/specs/` (reported against D149's
+    /// `write_task_file`, 2026-11-09).
+    fn task_file(&self, id: &str) -> Result<PathBuf> {
+        validate_task_id(id)?;
+        Ok(self.dir.join(format!("{id}.json")))
     }
 
     /// All tasks sorted by id. Non-task files and unparsable JSON are skipped
-    /// (reported upstream via the watcher, but they never poison listing).
+    /// (reported upstream via the watcher, but they never poison listing), and
+    /// so is a file whose id is malformed or disagrees with its own file name:
+    /// callers turn listed ids into paths, and `get` would refuse it anyway.
+    /// The doctor reports both (`task_file`).
     pub fn list(&self) -> Result<Vec<Task>> {
         let mut tasks = Vec::new();
         if !self.dir.exists() {
@@ -195,7 +219,10 @@ impl TaskStore {
             }
             let Ok(raw) = std::fs::read(&path) else { continue };
             if let Ok(task) = serde_json::from_slice::<Task>(&raw) {
-                tasks.push(task);
+                let stem = path.file_stem().and_then(|s| s.to_str());
+                if validate_task_id(&task.id).is_ok() && stem == Some(task.id.as_str()) {
+                    tasks.push(task);
+                }
             }
         }
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
@@ -203,11 +230,20 @@ impl TaskStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Task> {
-        let path = self.task_file(id);
+        let path = self.task_file(id)?;
         if !path.exists() {
             return Err(NextUpError::NotFound(format!("task {id} does not exist")));
         }
-        super::atomic::read_json_file(&path)
+        let task: Task = super::atomic::read_json_file(&path)?;
+        // A copied file keeps the id it was copied from. Acting on it would
+        // touch one task's bundle while ledgering another's title.
+        if task.id != id {
+            return Err(NextUpError::InvalidInput(format!(
+                "tasks/{id}.json holds task {} — a task file's name and its id must agree",
+                task.id
+            )));
+        }
+        Ok(task)
     }
 
     pub fn create(&self, input: NewTask) -> Result<Task> {
@@ -235,10 +271,12 @@ impl TaskStore {
             verified_note: None,
             archived: false,
             spec_folded_at: None,
+            verified_specs_hash: None,
+            spec_folded_hash: None,
             created_at: now.clone(),
             updated_at: now,
         };
-        atomic_write_json(&self.task_file(&task.id), &task)?;
+        atomic_write_json(&self.task_file(&task.id)?, &task)?;
         Ok(task)
     }
 
@@ -257,7 +295,7 @@ impl TaskStore {
         task.priority = edit.priority;
         task.tags = normalize_tags(edit.tags);
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
@@ -274,7 +312,7 @@ impl TaskStore {
         if !dependents.is_empty() {
             return Err(NextUpError::HasDependents { id: id.to_string(), dependents });
         }
-        std::fs::remove_file(self.task_file(id))?;
+        std::fs::remove_file(self.task_file(id)?)?;
         Ok(task)
     }
 
@@ -336,6 +374,7 @@ impl TaskStore {
         if status != task.status {
             task.verified_at = None;
             task.verified_note = None;
+            task.verified_specs_hash = None;
         }
         // Reopening an archived task un-archives it (D40): archived is a
         // sub-state of done, so a task cannot be "in progress but archived".
@@ -345,17 +384,28 @@ impl TaskStore {
         if status != TaskStatus::Done {
             task.archived = false;
             task.spec_folded_at = None;
+            task.spec_folded_hash = None;
         }
         task.status = status;
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
     /// Mark a done task as verified (with mandatory evidence: what was run /
     /// observed), or clear the mark. Verification only makes sense as a
     /// counter-check of a completion claim, so non-done tasks are rejected.
-    pub fn set_verification(&self, id: &str, verified: bool, note: Option<String>) -> Result<Task> {
+    ///
+    /// `specs_hash` is the delta bundle's hash at this moment (D149), computed
+    /// by the ops layer — the store knows where task files live, not how a
+    /// bundle is read. Ignored when clearing.
+    pub fn set_verification(
+        &self,
+        id: &str,
+        verified: bool,
+        note: Option<String>,
+        specs_hash: Option<String>,
+    ) -> Result<Task> {
         let mut task = self.get(id)?;
         if verified {
             if task.status != TaskStatus::Done {
@@ -371,12 +421,14 @@ impl TaskStore {
             }
             task.verified_at = Some(now_rfc3339());
             task.verified_note = Some(note);
+            task.verified_specs_hash = specs_hash;
         } else {
             task.verified_at = None;
             task.verified_note = None;
+            task.verified_specs_hash = None;
         }
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
@@ -393,18 +445,19 @@ impl TaskStore {
         }
         task.archived = archived;
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
-    /// Engine bookkeeping (D79): stamp or clear the spec-fold marker. Not a
-    /// user dimension — only the ops archive path calls this, right after a
-    /// successful fold.
-    pub fn set_spec_folded_at(&self, id: &str, at: Option<String>) -> Result<Task> {
+    /// Engine bookkeeping (D79): stamp or clear the spec-fold marker, together
+    /// with the hash of the bundle as folded (D149). Not a user dimension —
+    /// only the ops archive path calls this, right after a successful fold.
+    pub fn set_spec_folded(&self, id: &str, at: Option<String>, hash: Option<String>) -> Result<Task> {
         let mut task = self.get(id)?;
         task.spec_folded_at = at;
+        task.spec_folded_hash = hash;
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
@@ -415,7 +468,7 @@ impl TaskStore {
         let mut task = self.get(id)?;
         task.assignee = normalize_assignee(assignee);
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
@@ -426,7 +479,7 @@ impl TaskStore {
         let mut task = self.get(id)?;
         task.depends_on = self.validate_depends_on(Some(id), depends_on)?;
         task.updated_at = now_rfc3339();
-        atomic_write_json(&self.task_file(id), &task)?;
+        atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
     }
 
@@ -449,7 +502,7 @@ impl TaskStore {
                     "{dep} cannot depend on itself"
                 )));
             }
-            if !self.task_file(&dep).exists() {
+            if !self.task_file(&dep)?.exists() {
                 return Err(NextUpError::InvalidInput(format!(
                     "cannot depend on {dep}: no such task"
                 )));
@@ -518,6 +571,20 @@ impl TaskStore {
         }
         Ok(super::ids::next_seq_id("T-", stems.iter().map(String::as_str)))
     }
+}
+
+/// A task id is `T-` and digits — the only shape `next_id` ever mints. Checked
+/// before any id becomes a path (`TaskStore::task_file`, and the bundle readers
+/// in `specs`), because every separator, dot and drive letter is a way out of
+/// `tasks/`. The digit count is bounded only so a hostile string stays short
+/// in the error message.
+pub fn validate_task_id(id: &str) -> Result<()> {
+    let digits = id.strip_prefix("T-").unwrap_or("");
+    if !digits.is_empty() && digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(());
+    }
+    let shown: String = id.chars().take(40).collect();
+    Err(NextUpError::InvalidInput(format!("task id must look like T-0001 — got '{shown}'")))
 }
 
 /// Empty or whitespace-only assignee means "unassigned" — store None so the
@@ -801,24 +868,24 @@ mod tests {
         let t = store.create(new_task("v", 0)).unwrap();
 
         // Not done yet → cannot verify.
-        let err = store.set_verification(&t.id, true, Some("ran tests".into())).unwrap_err();
+        let err = store.set_verification(&t.id, true, Some("ran tests".into()), None).unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
 
         store.update_status(&t.id, TaskStatus::Done, None).unwrap();
         // Done but no evidence → still rejected.
-        let err = store.set_verification(&t.id, true, None).unwrap_err();
+        let err = store.set_verification(&t.id, true, None, None).unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
-        let err = store.set_verification(&t.id, true, Some("  ".into())).unwrap_err();
+        let err = store.set_verification(&t.id, true, Some("  ".into()), None).unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
 
         let v = store
-            .set_verification(&t.id, true, Some("cargo test all green".into()))
+            .set_verification(&t.id, true, Some("cargo test all green".into()), None)
             .unwrap();
         assert!(v.is_verified());
         assert_eq!(v.verified_note.as_deref(), Some("cargo test all green"));
 
         // Clearing needs no evidence and wipes both fields.
-        let cleared = store.set_verification(&t.id, false, None).unwrap();
+        let cleared = store.set_verification(&t.id, false, None, None).unwrap();
         assert!(!cleared.is_verified());
         assert_eq!(cleared.verified_note, None);
     }
@@ -828,7 +895,7 @@ mod tests {
         let (_g, store) = store();
         let t = store.create(new_task("v", 0)).unwrap();
         store.update_status(&t.id, TaskStatus::Done, None).unwrap();
-        store.set_verification(&t.id, true, Some("walked the GUI".into())).unwrap();
+        store.set_verification(&t.id, true, Some("walked the GUI".into()), None).unwrap();
 
         // Reopening the task drops the stale verification.
         let reopened = store.update_status(&t.id, TaskStatus::InProgress, None).unwrap();
@@ -843,7 +910,7 @@ mod tests {
         let b = store.create(new_task("b", 0)).unwrap();
         store.update_status(&a.id, TaskStatus::Done, None).unwrap();
         store.update_status(&b.id, TaskStatus::Done, None).unwrap();
-        store.set_verification(&a.id, true, Some("verified live".into())).unwrap();
+        store.set_verification(&a.id, true, Some("verified live".into()), None).unwrap();
 
         let counts = compute_counts(&store.list().unwrap());
         assert_eq!(counts.done, 2);
@@ -904,7 +971,7 @@ mod tests {
         let dangling = task("dangling", 2, &[]);
         let mut edited = store.get(&dangling.id).unwrap();
         edited.depends_on = vec!["T-9999".into()];
-        atomic_write_json(&store.task_file(&dangling.id), &edited).unwrap();
+        atomic_write_json(&store.task_file(&dangling.id).unwrap(), &edited).unwrap();
         let active = task("active", 3, &[]);
         store.update_status(&active.id, TaskStatus::InProgress, None).unwrap();
 
@@ -1082,7 +1149,7 @@ mod tests {
         store.update_status(&dep.id, TaskStatus::Done, None).unwrap();
         store.update_status(&t.id, TaskStatus::Done, None).unwrap();
         store.set_assignee(&t.id, Some("fe".into())).unwrap();
-        store.set_verification(&t.id, true, Some("ran the suite".into())).unwrap();
+        store.set_verification(&t.id, true, Some("ran the suite".into()), None).unwrap();
         store.set_archived(&t.id, true).unwrap();
 
         let edited = store.edit(&t.id, edit_of("renamed", 3, &["docs"])).unwrap();
@@ -1114,6 +1181,49 @@ mod tests {
         // and the ledger line for the deletion carries the old title, so the
         // audit trail still distinguishes the two occupants of the id.
         assert_eq!(store.create(new_task("next", 1)).unwrap().id, "T-0001");
+    }
+
+    /// Ids become paths, so only the shape `next_id` mints is accepted — every
+    /// separator, dot or drive letter is a way out of `tasks/` (2026-11-09
+    /// report against D149's write_task_file).
+    #[test]
+    fn task_ids_must_be_t_and_digits() {
+        for ok in ["T-0001", "T-1", "T-123456789"] {
+            assert!(validate_task_id(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "T-", "t-0001", "T-0001 ", " T-0001", "T-12a", "T-0001.json", "../.", "..\\.",
+            "../T-0001", "T-0001/..", "T-0001\\..", "C:T-0001", "T-1234567890",
+        ] {
+            assert_eq!(validate_task_id(bad).unwrap_err().kind(), "invalid_input", "{bad:?}");
+        }
+    }
+
+    /// Every store entry point checks the id before touching the disk, a copied
+    /// task file (whose id names another task) is refused rather than acted on
+    /// under the wrong title, and listings skip it instead of handing its id on.
+    #[test]
+    fn malformed_ids_and_copied_task_files_are_refused() {
+        let (dir, store) = store();
+        let t = store.create(new_task("real", 1)).unwrap();
+        // A planted copy outside tasks/ — the shape of the reported attack.
+        std::fs::copy(store.task_file(&t.id).unwrap(), dir.path().join("..json")).unwrap();
+        for id in ["../.", "..\\."] {
+            assert_eq!(store.get(id).unwrap_err().kind(), "invalid_input");
+            let err = store.update_status(id, TaskStatus::Done, None).unwrap_err();
+            assert_eq!(err.kind(), "invalid_input");
+            assert_eq!(store.delete(id).unwrap_err().kind(), "invalid_input");
+        }
+        // A copy inside tasks/ under another valid name.
+        std::fs::copy(store.task_file(&t.id).unwrap(), store.task_file("T-0042").unwrap()).unwrap();
+        let err = store.get("T-0042").unwrap_err();
+        assert!(err.to_string().contains("holds task T-0001"), "{err}");
+        let ids: Vec<String> = store.list().unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![t.id.clone()], "the copy is not listed twice under one id");
+        // dependsOn ids are paths too.
+        let mut bad_dep = new_task("dep", 1);
+        bad_dep.depends_on = vec!["../.".into()];
+        assert_eq!(store.create(bad_dep).unwrap_err().kind(), "invalid_input");
     }
 
     #[test]

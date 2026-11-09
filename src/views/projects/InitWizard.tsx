@@ -8,6 +8,7 @@ import { useGuardedMutation } from "../../hooks";
 import { DOMAIN_SUGGESTIONS, splitLines } from "../../lib/contextForm";
 import { shownDomain } from "../../lib/domain";
 import { MODULE_CATALOG } from "../../lib/modules";
+import { grantAllToolsPreferred, rememberGrantAllTools } from "../../lib/prefs";
 import type { InitTargetProbe, SystemStatus, TemplateSummary } from "../../types";
 import TemplatePicker from "./TemplatePicker";
 
@@ -59,6 +60,7 @@ export default function InitWizard({
   const [gitAvailable, setGitAvailable] = useState(false);
   const [initGit, setInitGit] = useState(true);
   const [selectedModules, setSelectedModules] = useState<string[]>([]);
+  const [grantAll, setGrantAll] = useState(grantAllToolsPreferred);
   const { busy, run } = useGuardedMutation(onError);
 
   // What the field shows vs. what we actually use: the preview, probe and
@@ -126,9 +128,13 @@ export default function InitWizard({
           // Omitted (undefined) when none checked — the backend default is "none".
           modules: selectedModules.length > 0 ? selectedModules : undefined,
           createRoot: true,
+          grantAllTools: grantAll,
         },
         gitAvailable && initGit,
       );
+      // Remembered only once a project was really created with it: ticking
+      // and cancelling is not a choice anyone made.
+      rememberGrantAllTools(grantAll);
       onLoaded(status);
     });
   }
@@ -269,6 +275,13 @@ export default function InitWizard({
           </span>
         </Check>
       ))}
+
+      <Check checked={grantAll} onChange={setGrantAll}>
+        <span>
+          {t("wizard.grantAllTools")}
+          <span className="muted template-hint"> {t("wizard.grantAllToolsHint")}</span>
+        </span>
+      </Check>
 
       <div className="form-actions">
         <button className="btn" onClick={onCancel} disabled={busy}>
