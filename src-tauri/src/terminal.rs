@@ -1210,10 +1210,27 @@ mod tests {
         resolve_program("cmd").expect("cmd.exe is always on PATH on Windows")
     }
 
-    /// Collect output until the exit event (or deadline). ConPTY opens by
-    /// asking where the cursor is (DSR, `ESC[6n`) and stalls all output
-    /// processing until the "terminal" answers — xterm.js replies on its
-    /// own in production, so the headless test must play that part here.
+    /// Terminal queries ConPTY may send and then wait on, with the reply
+    /// xterm.js gives in production. ConPTY opens by asking where the cursor
+    /// is (DSR) and stalls all output until it hears back. A November 2026
+    /// `windows-latest` image left `powershell.exe -Command` hanging in this
+    /// PTY while `cmd.exe` still ran, i.e. something on PowerShell's path
+    /// asked a question nobody answered; the other replies are the queries a
+    /// newer conhost is known to send (attributes, colours). Every one is
+    /// answered each time it appears, not just the first.
+    #[cfg(windows)]
+    const TERMINAL_REPLIES: &[(&str, &str)] = &[
+        ("\x1b[6n", "\x1b[1;1R"),
+        ("\x1b[c", "\x1b[?1;2c"),
+        ("\x1b[0c", "\x1b[?1;2c"),
+        ("\x1b]10;?", "\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+        ("\x1b]11;?", "\x1b]11;rgb:0000/0000/0000\x1b\\"),
+    ];
+
+    /// Collect output until the exit event (or deadline), playing the part of
+    /// the terminal for [`TERMINAL_REPLIES`]. The output and every query
+    /// answered go to stderr, so a failure shows what the shell was waiting on
+    /// instead of only that it never exited.
     #[cfg(windows)]
     fn drain_until_exit(
         mgr: &Arc<TerminalManager>,
@@ -1222,23 +1239,40 @@ mod tests {
         deadline: Duration,
     ) -> (String, Option<Option<u32>>) {
         let mut collected = String::new();
-        let mut dsr_answered = false;
+        let mut answered = vec![0usize; TERMINAL_REPLIES.len()];
         let started = std::time::Instant::now();
+        let mut exit = None;
         while started.elapsed() < deadline {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(TerminalEvent::Output { data, .. }) => {
                     collected.push_str(&data);
-                    if !dsr_answered && collected.contains("\x1b[6n") {
-                        dsr_answered = true;
-                        let _ = mgr.write(id, "\x1b[1;1R");
+                    for (i, (query, reply)) in TERMINAL_REPLIES.iter().enumerate() {
+                        let seen = collected.matches(query).count();
+                        while answered[i] < seen {
+                            answered[i] += 1;
+                            let _ = mgr.write(id, reply);
+                        }
                     }
                 }
-                Ok(TerminalEvent::Exit { exit_code, .. }) => return (collected, Some(exit_code)),
+                Ok(TerminalEvent::Exit { exit_code, .. }) => {
+                    exit = Some(exit_code);
+                    break;
+                }
                 Ok(TerminalEvent::SessionsChanged) => {}
                 Err(_) => {}
             }
         }
-        (collected, None)
+        let replied: Vec<_> = TERMINAL_REPLIES
+            .iter()
+            .zip(&answered)
+            .filter(|(_, n)| **n > 0)
+            .map(|((q, _), n)| format!("{q:?}x{n}"))
+            .collect();
+        eprintln!(
+            "pty drain after {:?}: exit={exit:?} replied={replied:?} output={collected:?}",
+            started.elapsed()
+        );
+        (collected, exit)
     }
 
     #[test]
@@ -1393,7 +1427,7 @@ mod tests {
             )
             .expect("spawn powershell");
         let (output, exit) = drain_until_exit(&mgr, meta.id, &rx, Duration::from_secs(20));
-        assert!(exit.is_some(), "powershell must exit");
+        assert!(exit.is_some(), "powershell must exit; output so far: {output:?}");
         assert!(output.contains("61234"), "expected evaluated output, got: {output:?}");
     }
 
