@@ -29,11 +29,13 @@ if you need the reasoning behind one, open an issue and ask.
 
 ## Getting set up
 
-You need **Rust** (stable, edition 2021), **pnpm**, and the
+You need **rustup**, **pnpm**, and the
 [Tauri v2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS
-(on Windows that is WebView2, which ships with Windows 11). Node is pinned by
-`use-node-version` in `.npmrc` and pnpm downloads it for you — whatever Node you
-have installed does not matter.
+(on Windows that is WebView2, which ships with Windows 11). Both runtimes are
+pinned and fetched for you: Rust by `rust-toolchain.toml` (rustup installs that
+version the first time you build here), Node by `use-node-version` in `.npmrc`
+(pnpm downloads it) — whatever versions you have installed do not matter. CI
+builds with the same Rust; raising it is a commit of its own.
 
 ```bash
 pnpm install

@@ -17,22 +17,26 @@ name = "agent_nextup_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# 2.7 finds target/ by walking up from OUT_DIR; 2.6 assumed a fixed depth, and
+# under Rust 1.100's build-dir layout it copied the hub sidecar onto the hub
+# crate's own build directory (rust-toolchain.toml).
+tauri-build = { version = "2.7.5", features = [] }
 
 [dependencies]
 nextup-core = { path = "../crates/nextup-core" }
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
+tauri = { version = "2.12.6", features = [] }
+tauri-plugin-opener = "2.7.3"
+tauri-plugin-dialog = "2.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 notify = "8"
 portable-pty = "0.9"
-# In-app update, user-triggered (D144). Pinned to the minor that still builds
-# against tauri 2.11: 2.13+ pulls tauri 2.12 (and tao/wry with it), and a
-# runtime bump does not belong inside a feature commit — the quit path (G065)
-# and the middle-click behaviour (G070) both live in that layer.
-tauri-plugin-updater = "~2.12"
+# In-app update, user-triggered (D144). Its own minor, matched by
+# @tauri-apps/plugin-updater in package.json (the CLI refuses mismatched
+# minors). It was held at ~2.12 while the app stayed on tauri 2.11; the move
+# to tauri 2.12 (and tao/wry with it) was its own commit, re-checked against
+# the quit path (G065) and the middle-click behaviour (G070).
+tauri-plugin-updater = "~2.14"
 
 # macOS quit path only (G065). Already in the tree via tao, so this pulls in
 # nothing new — it just lets us name `NSApplication terminate:` directly,

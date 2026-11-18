@@ -1,0 +1,9 @@
+# One compiler for this repo, here and in CI. Unpinned, CI took whatever
+# "stable" was on release day: Rust 1.100 changed Cargo's build-dir layout and
+# tauri-build before 2.7 could not find target/ under it, so the 1.0.0 tag build
+# failed on macOS and Linux while every local run (an older stable) was green.
+# Raise this deliberately, in its own commit, and run the whole test suite.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

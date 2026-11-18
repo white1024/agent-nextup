@@ -124,7 +124,7 @@ Nothing carries a publisher certificate and nothing is notarized, so the first l
 <details>
 <summary><strong>Or build from source</strong></summary>
 
-**Prerequisites** — Rust (stable, MSVC toolchain on Windows), [pnpm](https://pnpm.io/), and WebView2 on Windows 10. You don't need to manage Node: the repo pins the version and pnpm fetches it.
+**Prerequisites** — [rustup](https://rustup.rs/) (MSVC toolchain on Windows), [pnpm](https://pnpm.io/), and WebView2 on Windows 10. You don't need to manage Rust or Node versions: the repo pins both, and rustup and pnpm fetch them.
 
 ```bash
 git clone https://github.com/white1024/agent-nextup.git
