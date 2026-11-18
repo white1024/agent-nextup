@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 
 // Inline SVG icon set.
 // stroke=currentColor so icons inherit text color everywhere.
@@ -32,12 +32,79 @@ function Base({
   );
 }
 
-/** Brand mark (a cube) */
+/** Brand mark: the cube from the app icon, drawn true-isometric (D154 ③ —
+ *  the boot cube settles at this exact angle, so the two must not drift). */
 export function IconLogo(p: IconProps) {
   return (
     <Base {...p} sw={2}>
-      <path d="M4 7l8-4 8 4v10l-8 4-8-4z" />
-      <path d="M4 7l8 4 8-4M12 11v10" />
+      <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+      <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+    </Base>
+  );
+}
+
+/**
+ * The app icon itself — the gradient tile with the white cube — at any size.
+ * Same drawing as `src-tauri/icon-source.svg` (D154 ③). Brand colours, not
+ * tokens: this is the product's mark, and it does not change with the theme
+ * or carry any of the status meanings. Gradient ids are per instance, since
+ * the sidebar and the boot screen can both have one on screen.
+ */
+export function AppMark({ size = 26, className }: IconProps) {
+  const id = useId().replace(/:/g, "");
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 1024 1024"
+      className={className}
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <defs>
+        <linearGradient id={`${id}a`} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#6b63e8" />
+          <stop offset="1" stopColor="#4a42c0" />
+        </linearGradient>
+        <linearGradient id={`${id}b`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#fff" stopOpacity=".16" />
+          <stop offset=".3" stopColor="#fff" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <g className="lg-bg">
+        <rect width="1024" height="1024" rx="228" fill={`url(#${id}a)`} />
+        <rect width="1024" height="1024" rx="228" fill={`url(#${id}b)`} />
+      </g>
+      <g
+        className="lg-fg"
+        transform="translate(152 152) scale(30)"
+        fill="none"
+        stroke="#fff"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+        <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+      </g>
+    </svg>
+  );
+}
+
+/** Back (left arrow): the workspace sidebar's way out to all projects. */
+export function IconBack(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M19 12H5M11 6l-6 6 6 6" />
+    </Base>
+  );
+}
+
+/** Command key (⌘ shape): the command palette's entry. */
+export function IconCmd(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
     </Base>
   );
 }
@@ -165,11 +232,22 @@ export function IconWarn(p: IconProps) {
   );
 }
 
+/** Info (ⓘ): opens an explanation that is not worth a permanent line. */
+export function IconInfo(p: IconProps) {
+  return (
+    <Base {...p}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v6M12 7.5v.01" />
+    </Base>
+  );
+}
+
 export function IconLock(p: IconProps) {
   return (
     <Base {...p}>
       <rect x="4" y="10" width="16" height="10" rx="2" />
-      <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+      {/* The shackle turns on its own when a backup unseals (C40). */}
+      <path className="lock-shackle" d="M8 10V7a4 4 0 0 1 8 0v3" />
     </Base>
   );
 }
@@ -317,11 +395,35 @@ export function IconPopout(p: IconProps) {
   );
 }
 
+/** The bolt's outline, in IconBolt's 24 × 24 box. Exported for the team
+ *  canvas, which draws the automatic-flow mark inside its own SVG (9(f): the
+ *  glyph is this path, not a ⚡ character, wherever it appears). */
+export const BOLT_PATH = "M13 2L3 14h9l-1 8 10-12h-9z";
+
 /** Automatic delivery (a bolt, D71 marker on automatic edges) */
 export function IconBolt(p: IconProps) {
   return (
     <Base {...p} sw={2}>
-      <path d="M13 2L3 14h9l-1 8 10-12h-9z" />
+      <path d={BOLT_PATH} />
+    </Base>
+  );
+}
+
+/** Fit the whole graph into view (the team canvas's zoom controls) */
+export function IconFit(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+    </Base>
+  );
+}
+
+/** One delivery envelope (the send result's card, spec 50 §9) */
+export function IconEnvelope(p: IconProps) {
+  return (
+    <Base {...p} sw={1.7}>
+      <rect x="3" y="5" width="18" height="14" rx="2.5" />
+      <path d="M3.5 7l8.5 6 8.5-6" />
     </Base>
   );
 }
@@ -371,6 +473,15 @@ export function IconStopSquare(p: IconProps) {
   return (
     <Base {...p} sw={1.5}>
       <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" />
+    </Base>
+  );
+}
+
+/** Start an agent CLI (an outlined play triangle, spec 40 launch bar) */
+export function IconPlay(p: IconProps) {
+  return (
+    <Base {...p}>
+      <path d="M7 4.5v15l12-7.5z" />
     </Base>
   );
 }

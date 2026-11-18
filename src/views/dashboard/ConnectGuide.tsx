@@ -1,6 +1,7 @@
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { IconWarn } from "../../components/icons";
+import { motionOff } from "../../lib/fx";
 import type { AgentMcpStatus } from "../../types";
 
 interface Props {
@@ -22,7 +23,7 @@ interface Props {
 }
 
 /**
- * First-run connect guide (product review §5-1, D63).
+ * First-run connect guide (product review §5-1, D63; spec 20 §10).
  *
  * Getting an agent onto a project spans three places — the hub binary, the
  * tool catalog, the terminal — and nothing used to say which of them was still
@@ -35,6 +36,10 @@ interface Props {
  * day-one grant (D63) authorizes the everyday tools at init. A checklist whose
  * boxes are pre-ticked teaches nothing — so the steps that are fine stay quiet
  * and only what actually blocks the user gets a line and a button.
+ *
+ * Marks follow the design's one-meaning-per-colour rule (D153 R7): a blocked
+ * step is the amber round ("waiting on you"); the terminal step has no mark at
+ * all — violet means an agent *is* running, and this line is about starting one.
  */
 export default function ConnectGuide({
   mcp,
@@ -49,6 +54,8 @@ export default function ConnectGuide({
   onDismiss,
 }: Props) {
   const { t } = useTranslation();
+  const card = useRef<HTMLDivElement>(null);
+  const [leaving, setLeaving] = useState(false);
 
   // The hub is a problem only when it is actually broken. Packaged builds ship
   // the binary beside the app, so "missing" is rare; "repair" is the real case
@@ -57,32 +64,64 @@ export default function ConnectGuide({
   const hubBroken = mcp !== null && !mcp.healthy;
   const hubRepairable = hubBroken && mcp.resolvedPath !== null;
   const noGrants = enabled && total > 0 && granted === 0;
+  const ready = !hubBroken && enabled && !noGrants;
+
+  // "Fixed": the ready line rises in when it appears after the card was
+  // already on screen (a repair that worked), never on the first paint.
+  const readyRef = useRef<HTMLParagraphElement>(null);
+  const wasReady = useRef(ready);
+  useLayoutEffect(() => {
+    if (ready && !wasReady.current && readyRef.current && !motionOff()) {
+      readyRef.current.animate(
+        [
+          { opacity: 0, transform: "translateY(18px)" },
+          { opacity: 1, transform: "none" },
+        ],
+        { duration: 420, easing: "cubic-bezier(.16,1,.3,1)" },
+      );
+    }
+    wasReady.current = ready;
+  }, [ready]);
+
+  function dismiss() {
+    const el = card.current;
+    if (el === null || motionOff()) {
+      onDismiss();
+      return;
+    }
+    setLeaving(true);
+    const anim = el.animate(
+      [
+        { opacity: 1, transform: "none" },
+        { opacity: 0, transform: "translateY(12px)" },
+      ],
+      { duration: 240, easing: "ease-in", fill: "forwards" },
+    );
+    void anim.finished.catch(() => undefined).then(onDismiss);
+  }
 
   return (
-    <div className="connect-guide">
+    <div className="connect-guide" ref={card} aria-busy={leaving || undefined}>
       <div className="cg-head">
-        <span className="cg-title">{t("connect.heading")}</span>
-        <div className="spacer" />
-        <button type="button" className="btn btn-small btn-ghost" onClick={onDismiss}>
+        <i className="cg-orb" aria-hidden="true" />
+        <div className="cg-head-text">
+          <span className="cg-title">{t("connect.heading")}</span>
+          <p>{t("connect.subtitle")}</p>
+        </div>
+        <button type="button" className="btn btn-small btn-ghost" onClick={dismiss} disabled={leaving}>
           {t("connect.alreadyDone")}
         </button>
       </div>
-      <p className="section-hint">{t("connect.subtitle")}</p>
 
       <ul className="cg-steps">
         {hubBroken && (
           <li className="cg-step cg-step--warn">
-            <IconWarn size={13} />
+            <i className="mk-y" aria-hidden="true" />
             <span className="cg-step-text">
               {hubRepairable ? t("connect.hubRepair") : t("connect.hubMissing")}
             </span>
             {hubRepairable && (
-              <button
-                type="button"
-                className="btn btn-small"
-                disabled={repairing}
-                onClick={onRepairMcp}
-              >
+              <button type="button" className="btn btn-small" disabled={repairing} onClick={onRepairMcp}>
                 {repairing ? t("tools.mcpRepairing") : t("tools.mcpRepair")}
               </button>
             )}
@@ -91,7 +130,7 @@ export default function ConnectGuide({
 
         {!enabled && (
           <li className="cg-step cg-step--warn">
-            <IconWarn size={13} />
+            <i className="mk-y" aria-hidden="true" />
             <span className="cg-step-text">{t("connect.masterOff")}</span>
             <button type="button" className="btn btn-small" onClick={onGoToTools}>
               {t("connect.openCatalog")}
@@ -101,7 +140,7 @@ export default function ConnectGuide({
 
         {noGrants && (
           <li className="cg-step cg-step--warn">
-            <IconWarn size={13} />
+            <i className="mk-y" aria-hidden="true" />
             <span className="cg-step-text">{t("connect.noGrants")}</span>
             <button type="button" className="btn btn-small" onClick={onGoToTools}>
               {t("connect.openCatalog")}
@@ -120,8 +159,11 @@ export default function ConnectGuide({
         </li>
       </ul>
 
-      {!hubBroken && enabled && !noGrants && (
-        <p className="section-hint num">{t("connect.readyHint", { n: granted, total })}</p>
+      {ready && (
+        <p className="cg-ready num" ref={readyRef}>
+          <i className="mk-e" aria-hidden="true" />
+          {t("connect.readyHint", { n: granted, total })}
+        </p>
       )}
     </div>
   );

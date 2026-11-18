@@ -38,7 +38,20 @@ pub struct TemplateSummary {
     pub description: String,
     pub domain_hint: String,
     pub phase_count: usize,
+    /// Each phase's title and exit-gate kinds, in order (D155 ②): the
+    /// template cards draw the whole band from the listing, so they need not
+    /// fetch every template body one by one.
+    pub phases: Vec<PhaseOutline>,
     pub source: TemplateSource,
+}
+
+/// Just enough of a phase to draw it: name and the shape of its exit gates.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseOutline {
+    pub title: String,
+    /// [`Gate::kind`] tags, in the phase's order.
+    pub gates: Vec<&'static str>,
 }
 
 pub const DEFAULT_TEMPLATE_ID: &str = "generic-v1";
@@ -199,6 +212,14 @@ pub fn template_summaries(
             description: t.description,
             domain_hint: t.domain_hint,
             phase_count: t.phases.len(),
+            phases: t
+                .phases
+                .iter()
+                .map(|p| PhaseOutline {
+                    title: p.title.clone(),
+                    gates: p.exit_gates.iter().map(Gate::kind).collect(),
+                })
+                .collect(),
             source,
         })
         .collect())
@@ -383,6 +404,40 @@ fn validate_gate(phase_id: &str, gate: &Gate) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Gate::kind` is a hand-written mirror of the serde tag; a new variant
+    /// or a renamed tag would otherwise ship a kind no card can draw.
+    #[test]
+    fn gate_kind_matches_the_wire_tag() {
+        let gates = [
+            Gate::MinTasks { count: 1 },
+            Gate::AllTasksDone,
+            Gate::NoBlockedTasks,
+            Gate::ArtifactExists { path: "x".into() },
+            Gate::MinDecisions { count: 1 },
+            Gate::ManualConfirm { prompt: "p".into() },
+            Gate::DoctorClean,
+        ];
+        for gate in gates {
+            let wire = serde_json::to_value(&gate).unwrap();
+            assert_eq!(wire["kind"], gate.kind());
+        }
+    }
+
+    /// The listing carries every phase with its gates, in order (D155 ②).
+    #[test]
+    fn summaries_carry_the_phase_outline() {
+        let summaries = template_summaries(None, TemplateLang::En).unwrap();
+        for summary in &summaries {
+            let full = resolve_template(Some(&summary.id), None, TemplateLang::En).unwrap();
+            assert_eq!(summary.phases.len(), summary.phase_count);
+            for (outline, phase) in summary.phases.iter().zip(&full.phases) {
+                assert_eq!(outline.title, phase.title);
+                let kinds: Vec<&str> = phase.exit_gates.iter().map(Gate::kind).collect();
+                assert_eq!(outline.gates, kinds);
+            }
+        }
+    }
 
     #[test]
     fn built_ins_parse_and_validate() {

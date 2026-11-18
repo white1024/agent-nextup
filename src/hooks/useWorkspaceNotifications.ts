@@ -35,7 +35,7 @@ import {
   unseenDeliveries,
 } from "../lib/notify";
 import { markConnected } from "../lib/prefs";
-import { autoRouteSweep, type ToastSpec } from "../lib/teamAutoRoute";
+import { autoRouteSweep, autoSources, type ToastSpec } from "../lib/teamAutoRoute";
 import type { LedgerAppendedPayload, SystemStatus, WorkspaceChangedPayload } from "../types";
 
 /** The i18n `t` this layer needs — same shape the auto-send sweep takes. */
@@ -68,7 +68,7 @@ export interface NotificationIo {
   /** Where the toasts' actions jump to. Called, never depended on. */
   openInbox: () => void;
   openProjects: () => void;
-  authorizeTool: (tool: string) => void;
+  authorizeTool: (tool: string, from: HTMLElement | null) => void;
 }
 
 /**
@@ -136,7 +136,8 @@ export function useWorkspaceNotifications(io: NotificationIo): { inboxUnseen: nu
           if (Date.now() - new Date(denial.at).getTime() > DENIAL_FRESH_MS) continue;
           pushToast({
             kind: "agentDenied",
-            tone: "error",
+            tone: "you",
+            source: "logo",
             message: t("notify.agentDenied", {
               actor: denial.actor ?? t("notify.someAgent"),
               tool: denial.tool,
@@ -145,7 +146,7 @@ export function useWorkspaceNotifications(io: NotificationIo): { inboxUnseen: nu
             dedupeKey: `denied:${denial.actor ?? "?"}:${denial.tool}`,
             action: {
               label: t("notify.goAuthorize"),
-              run: () => ioRef.current.authorizeTool(denial.tool),
+              run: (from) => ioRef.current.authorizeTool(denial.tool, from),
             },
           });
         }
@@ -245,7 +246,8 @@ export function useWorkspaceNotifications(io: NotificationIo): { inboxUnseen: nu
           notifiedDeliveriesRef.current.add(delivery.id);
           pushToast({
             kind: "deliveryArrived",
-            tone: "info",
+            tone: "you",
+            source: "inbox",
             message: t("notify.deliveryArrived", { from: delivery.from.name }),
             dedupeKey: `delivery:${delivery.id}`,
             action: { label: t("notify.openInbox"), run: () => ioRef.current.openInbox() },
@@ -299,6 +301,17 @@ export function useWorkspaceNotifications(io: NotificationIo): { inboxUnseen: nu
     startupScanRef.current = true;
     const openRoot = status.workspace?.root ?? null;
     void (async () => {
+      // Call site ④ (D152): every workspace an automatic edge leaves, not just
+      // the open one. The hub sends at publish time; this catches what it
+      // could not — a downstream that was offline, a hub that had no app
+      // directory. Before the inbox scan, so what this delivers is counted.
+      try {
+        for (const root of autoSources(await api.teamsList())) {
+          await autoRouteSweep(root, { pushToast, t });
+        }
+      } catch (e) {
+        console.warn("start-up auto-send sweep failed:", e);
+      }
       try {
         const workspaces = await api.recentWorkspaces();
         // A workspace that cannot be read contributes no rows, so it drops out
@@ -312,7 +325,8 @@ export function useWorkspaceNotifications(io: NotificationIo): { inboxUnseen: nu
         if (projects.length === 0) return;
         pushToast({
           kind: "deliveryArrived",
-          tone: "info",
+          tone: "you",
+          source: "projects",
           message: otherDeliveriesMessage(
             projects.map((p) => p.name),
             t,

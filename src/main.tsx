@@ -7,6 +7,7 @@ import PopoutTerminal from "./views/PopoutTerminal";
 import "./i18n";
 import "./styles.css";
 import { markBoot } from "./lib/boot";
+import { applyTeamSkin } from "./lib/prefs";
 import { applyThemeMode, THEME_EVENT } from "./theme";
 import { applyZoom, ZOOM_EVENT } from "./zoom";
 
@@ -27,6 +28,10 @@ void listen(THEME_EVENT, () => applyThemeMode()).catch(() => {});
 // for the window that already exists; this is what covers the ones opened later.
 applyZoom();
 void listen(ZOOM_EVENT, () => applyZoom()).catch(() => {});
+
+// Which way the teams pages are drawn (D157). No cross-window event: the teams
+// pages only ever open in the main window, which is where Settings lives too.
+applyTeamSkin();
 
 // A pop-out window (B16-C) loads the same bundle with `?popout=<id>` and
 // renders just that one terminal, not the whole app shell.

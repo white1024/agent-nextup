@@ -2,12 +2,13 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ComponentType,
-  type CSSProperties,
 } from "react";
+import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -29,6 +30,7 @@ import type {
   WorkspaceChangedPayload,
   WorkspaceModules,
 } from "./types";
+import NavCategories from "./shell/NavCategories";
 import WorkspaceSwitcher from "./shell/WorkspaceSwitcher";
 import {
   IconBook,
@@ -38,19 +40,22 @@ import {
   IconFolder,
   IconInbox,
   IconLayers,
-  IconLogo,
+  AppMark,
+  IconBack,
+  IconCmd,
   IconSearch,
   IconSettings,
   IconTasks,
   IconTerminal,
   IconTools,
   IconUsers,
+  IconWarn,
   type IconProps,
 } from "./components/icons";
 import { useRecentWorkspaces, useToasts } from "./hooks";
 import { useWorkspaceNotifications } from "./hooks/useWorkspaceNotifications";
 import { usePulse } from "./hooks/anim";
-import { markConnected } from "./lib/prefs";
+import { lastSeenVersion, markConnected, rememberVersion } from "./lib/prefs";
 import ToastStack from "./shell/ToastStack";
 import CommandPalette, { type Command } from "./shell/CommandPalette";
 import { QuickNoteModal } from "./components/QuickNote";
@@ -59,20 +64,25 @@ import ProjectsHome from "./views/projects";
 import { CAT_ALL, categoryItems } from "./lib/categories";
 import TemplatesHome from "./views/templates";
 import Dashboard from "./views/dashboard";
-import Tasks from "./views/Tasks";
-import Collab from "./views/Collab";
+import Tasks from "./views/tasks";
+import Collab from "./views/collab";
 import Inbox from "./views/Inbox";
-import Specs from "./views/Specs";
+import Specs from "./views/specs";
 import Teams from "./views/teams";
 import Ledger from "./views/Ledger";
 import Search from "./views/Search";
-import Tools from "./views/Tools";
+import Tools from "./views/tools";
 import TerminalView from "./views/Terminal";
-import AgentSessions from "./views/AgentSessions";
+import AgentSessions from "./views/agents";
 import Settings from "./views/settings";
 import ProjectSettings from "./views/ProjectSettings";
 import ConfirmDanger from "./components/ConfirmDanger";
+import Scramble from "./components/Scramble";
 import ErrorBoundary from "./shell/ErrorBoundary";
+import { BootBack, BootExit, BootScreen } from "./shell/Boot";
+import { centreOf, motionOff, stashOrigin } from "./lib/fx";
+import { EASE_OUT } from "./lib/listMotion";
+import { growTo, parkMark, projectCard } from "./lib/transitions";
 
 type View =
   | "projects"
@@ -145,6 +155,18 @@ const VIEW_SCOPE: Record<View, "app" | "workspace"> = {
 };
 
 /**
+ * Where a command-palette pick flies to (C211): the sidebar cell for that page,
+ * or — when the page lives in the other sidebar — the way out to all projects.
+ * Read at the moment of the pick, so it is whatever is on screen then.
+ */
+function sidebarCell(view: View): Element | null {
+  return (
+    document.querySelector(`.sidebar [data-view="${view}"]`) ??
+    document.querySelector(".sidebar .side-back")
+  );
+}
+
+/**
  * Global shortcuts (D66, product review §1-14). The label and the binding live in one
  * place so the hint the palette shows cannot drift from the key that actually
  * works — hand-copied lists have drifted three times in this repo (D63).
@@ -185,25 +207,18 @@ const TOAST_TTL_MS = 8_000;
  * worth marking. `StatTile` gets this right for free by living on a panel
  * that is always on screen.
  */
-function NavBadge({
-  count,
-  title,
-  tone = "warn",
-}: {
-  count: number;
-  title: string;
-  /** `warn` = something is stuck (red); `event` = something arrived (accent).
-   *  See the `.nav-item .badge` note in styles.css for why they differ. */
-  tone?: "warn" | "event";
-}) {
-  const bumped = usePulse(count);
+function NavBadge({ count, title }: { count: number; title: string }) {
+  // As long as the entry's amber glow (C276), so the class outlives it.
+  const bumped = usePulse(count, 620);
   if (count <= 0) return null;
+  // One kind since D153: blocked tasks and unread deliveries are both "waiting
+  // on you", so both are the amber circle plus the number. (They used to be
+  // red and accent; the reasoning that split them is in the `.badge` note in
+  // styles.css.)
   return (
-    <span
-      className={`badge${tone === "event" ? " badge--event" : ""}${bumped ? " badge--bumped" : ""}`}
-      title={title}
-    >
-      {count}
+    <span className={`badge badge--you${bumped ? " badge--bumped" : ""}`} title={title}>
+      <span className="mk-y" aria-hidden="true" />
+      <Scramble value={count} />
     </span>
   );
 }
@@ -222,7 +237,6 @@ export default function App() {
   // Whether the sidebar shows the built-in categories nobody has used yet
   // (r2 3-5). Session state, not a pref: it answers "let me see what template
   // kinds exist", which is a question you ask once and not a standing setting.
-  const [catsExpanded, setCatsExpanded] = useState(false);
   // Incremented whenever the workspace changed (backend watcher event or a
   // local mutation) so child views know to re-read from the source of truth.
   const [refreshKey, setRefreshKey] = useState(0);
@@ -233,6 +247,8 @@ export default function App() {
   // Project catalog + templates: shared by the sidebar categories and the
   // projects home so both render from the same fetch.
   const { recent, setRecent, reload: reloadRecent } = useRecentWorkspaces();
+  // The sidebar logo: where the boot mark flies to (C2).
+  const brandMarkRef = useRef<HTMLSpanElement>(null);
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   // App-level terminal sessions (D50): drive the sidebar/card running
   // markers and the quit guard. The terminal view reports launches/closes
@@ -251,6 +267,10 @@ export default function App() {
   // in Tools. Cleared by Tools once consumed, so it acts exactly once.
   const [focusTool, setFocusTool] = useState<string | null>(null);
   const clearFocusTool = useCallback(() => setFocusTool(null), []);
+  // C238: the rename notice's "go to tools" asks the page to bring the shipped
+  // assets into view (the rename leaves the guide saying the old name).
+  const [focusAssets, setFocusAssets] = useState(false);
+  const clearFocusAssets = useCallback(() => setFocusAssets(false), []);
   // Task the command palette asked the task view to reveal (D66). Same parked
   // one-shot shape as focusTool above — still no router, so a jump that has to
   // carry a target keeps its payload here.
@@ -273,6 +293,12 @@ export default function App() {
       strength table governs four known event kinds, and funnelling arbitrary
       errors through it would empty that table of meaning (D62). */
   const [actionError, setActionError] = useState<string | null>(null);
+  // The version the last run on this machine had (C197), read once per start.
+  const versionBefore = useRef<string | null>(lastSeenVersion());
+  const appVersion = status?.appVersion;
+  useEffect(() => {
+    if (appVersion !== undefined) rememberVersion(appVersion);
+  }, [appVersion]);
 
   const refresh = useCallback(async () => {
     try {
@@ -321,6 +347,20 @@ export default function App() {
   // now outlives `status` arriving — which is itself a re-render — so this is
   // a live path, not a hypothetical one.
   const [bootAnim] = useState(bootSplashDelays);
+
+  // C2 plays once, and only if the splash was really on screen — a boot fast
+  // enough to skip it has nothing to fly anywhere. A layout effect, so the
+  // overlay is in place before the shell's first paint rather than one frame
+  // after it.
+  const bootShownRef = useRef(false);
+  const [bootExit, setBootExit] = useState(false);
+  // C227 in progress: the app is on its way out.
+  const [quitting, setQuitting] = useState(false);
+  useLayoutEffect(() => {
+    if (status === null || bootHeld || !bootShownRef.current) return;
+    bootShownRef.current = false;
+    if (!motionOff()) setBootExit(true);
+  }, [status, bootHeld]);
 
   // Debounced filesystem deltas from the Rust watcher.
   useEffect(() => {
@@ -395,6 +435,13 @@ export default function App() {
     // the children. Unlike closing tabs one by one, shutdown keeps the files so
     // the next launch restores the tabs (which resume on view, not read-only).
     await api.terminalShutdown().catch(() => {});
+    // C227 (D153): the boot played backwards, then the real quit. Skipped
+    // under reduced motion — closing is just closing.
+    if (!motionOff()) {
+      setQuitPrompt(false);
+      setQuitting(true);
+      return;
+    }
     // Quitting is the OS's job, not ours: `quit_app` sends the platform's own
     // shutdown, which takes every window with it — including a pop-out
     // terminal (B16-C), the reason this used to destroy windows by hand.
@@ -405,16 +452,48 @@ export default function App() {
 
   // Agent overview → the workspace's terminal view, opening it on the way
   // if it is not the current one. The session itself never notices.
-  async function openTerminalOf(root: string) {
+  //
+  // With `from` (the stage, or a project's group) the change is content
+  // opening into its detail (C27 / C291): a terminal-dark frame grows from it
+  // to the terminal. The workspace is opened first, while the old page still
+  // shows, so a failed open stays on this page with its error and no frame;
+  // the switch and the page change are then one swap under the picture, and
+  // where it lands is still applyStatus' decision (invariant 19).
+  async function openTerminalOf(root: string, from?: Element | null) {
+    let switched: SystemStatus | null = null;
     if (wsRoot !== root) {
       try {
-        applySwitched(await api.openWorkspace(root));
+        switched = await api.openWorkspace(root);
       } catch (e) {
         setLoadError(errorMessage(e));
         return;
       }
     }
-    setView("terminal");
+    const swap = () => {
+      if (switched !== null) applySwitched(switched);
+      setView("terminal");
+    };
+    if (from == null) {
+      swap();
+      return;
+    }
+    void growTo(
+      { from, to: () => document.querySelector('[data-vt="term"]'), look: "term" },
+      swap,
+    );
+  }
+
+  /** Terminal → agent overview folds the page back into the stage it grew
+   *  from (C27's return); any other way in is a plain page change. */
+  function goToAgents() {
+    if (view !== "terminal") {
+      setView("agents");
+      return;
+    }
+    void growTo(
+      { from: null, back: true, look: "term", to: () => document.querySelector("[data-stage]") },
+      () => setView("agents"),
+    );
   }
 
   // Catalog and template list re-read whenever the home is (re)entered —
@@ -436,6 +515,15 @@ export default function App() {
   // on workspace switch/close so one workspace's modules never leak into the
   // next. Local toggles (Settings) update the state directly via setModules.
   const wsRoot = status?.workspace?.root ?? null;
+
+  // The workspace sidebar's "phase · template" line reads the overview list. A
+  // phase advance arrives as a refreshKey bump, so re-read it then — trailing
+  // and coalesced, because an agent at work bumps refreshKey in bursts.
+  useEffect(() => {
+    if (wsRoot === null) return;
+    const id = window.setTimeout(reloadRecent, 1200);
+    return () => window.clearTimeout(id);
+  }, [wsRoot, refreshKey, reloadRecent]);
   const modulesRootRef = useRef<string | null>(null);
   useEffect(() => {
     if (modulesRootRef.current !== wsRoot) {
@@ -562,9 +650,19 @@ export default function App() {
     t,
     openInbox: () => setView("inbox"),
     openProjects: () => setView("projects"),
-    authorizeTool: (tool) => {
-      setFocusTool(tool);
-      setView("tools");
+    // C173: the page grows out of the toast, and the toast's amber circle
+    // stays behind for the tools page to fly to the switch.
+    authorizeTool: (tool, from) => {
+      const swap = () => {
+        setFocusTool(tool);
+        setView("tools");
+      };
+      parkMark(centreOf(from?.querySelector(".toast-mk")));
+      if (from === null) {
+        swap();
+        return;
+      }
+      void growTo({ from, to: () => document.querySelector("main.content .view"), look: "panel" }, swap);
     },
   });
 
@@ -689,7 +787,11 @@ export default function App() {
         id: `view:${key}`,
         group: t("cmdk.groupNav"),
         title: t(`nav.${key}`),
-        run: () => setView(key),
+        flyTo: () => sidebarCell(key),
+        // From inside a workspace the palette is the only way to the agent
+        // overview (that sidebar has no app-level entries), so it takes the
+        // same fold-back into the stage (C27's return).
+        run: () => (key === "agents" ? goToAgents() : setView(key)),
       });
     }
 
@@ -704,6 +806,7 @@ export default function App() {
         group: t("cmdk.groupProjects"),
         title: ws.name,
         hint: ws.root,
+        flyTo: () => document.querySelector(".switcher-trigger") ?? sidebarCell("projects"),
         run: () => {
           void (async () => {
             setActionError(null);
@@ -725,6 +828,7 @@ export default function App() {
         group: t("cmdk.groupActions"),
         title: t("tasks.newTitle"),
         hint: SHORTCUT_HINT.newTask,
+        flyTo: () => sidebarCell("tasks"),
         run: () => {
           setFocusCreate(true);
           setView("tasks");
@@ -735,6 +839,7 @@ export default function App() {
         group: t("cmdk.groupActions"),
         title: t("note.addDecision"),
         hint: SHORTCUT_HINT.note,
+        opensDialog: true,
         run: () => setNoteOpen(true),
       });
     }
@@ -748,6 +853,7 @@ export default function App() {
         hint: t(`status.${task.status}`),
         keywords: `${task.id} ${task.tags.join(" ")}`,
         searchOnly: true,
+        flyTo: () => sidebarCell("tasks"),
         run: () => {
           setFocusTask(task.id);
           setView("tasks");
@@ -758,61 +864,103 @@ export default function App() {
     return out;
   }, [status, recent, paletteTasks, view, t, moduleOn, applyStatus]);
 
+  /**
+   * A workspace page change from the sidebar. Dashboard ⇄ tasks is content
+   * opening into its detail (C23, D153): the task overview grows into the
+   * task list, and folds back into it on the way out. Every other move is a
+   * plain page change.
+   */
+  function goTo(v: View) {
+    if (view === "dashboard" && v === "tasks") {
+      void growTo(
+        {
+          from: document.querySelector('[data-vt="stats"]'),
+          to: () => document.querySelector('[data-vt="tklist"]'),
+          look: "panel",
+        },
+        () => setView(v),
+      );
+      return;
+    }
+    if (view === "tasks" && v === "dashboard") {
+      void growTo(
+        { from: null, back: true, look: "panel", to: () => document.querySelector('[data-vt="stats"]') },
+        () => setView(v),
+      );
+      return;
+    }
+    // C41: entering the inbox through its badge, the amber light starts at
+    // the badge and runs to each unread envelope once they are on screen.
+    if (v === "inbox" && view !== "inbox" && inboxUnseen > 0) {
+      stashOrigin("inbox", centreOf(document.querySelector('.sidebar [data-view="inbox"] .badge .mk-y')));
+    }
+    setView(v);
+  }
+
+  /**
+   * The top error line's Close (my-design review F6): it lifts away, then the
+   * page slides back up into the room it took — the way it came in (barDrop)
+   * run backwards. Reduced motion: gone at once.
+   */
+  function dismissActionError(bar: HTMLElement | null) {
+    if (bar === null || motionOff()) {
+      setActionError(null);
+      return;
+    }
+    const page = document.querySelector<HTMLElement>("main.content .view");
+    const before = page?.getBoundingClientRect().top;
+    const out = bar.animate(
+      [
+        { opacity: 1, transform: "none" },
+        { opacity: 0, transform: "translateY(-8px)" },
+      ],
+      { duration: 200, easing: "ease-in", fill: "forwards" },
+    );
+    void out.finished
+      .catch(() => undefined)
+      .then(() => {
+        flushSync(() => setActionError(null));
+        const after = page?.getBoundingClientRect().top;
+        if (page == null || before === undefined || after === undefined || Math.abs(before - after) < 1) return;
+        page.animate([{ transform: `translateY(${before - after}px)` }, { transform: "none" }], {
+          duration: 320,
+          easing: EASE_OUT,
+        });
+      });
+  }
+
   function showCategory(id: string) {
     setCategory(id);
     setView("projects");
   }
 
   if (status === null || bootHeld) {
-    // True boot failure: nothing to show yet, so block with a retry. Checked
-    // ahead of the hold — a splash that keeps running over a known failure is
-    // just a delay before bad news.
-    if (status === null && loadError !== null) {
-      return (
-        <div className="splash" style={{ flexDirection: "column", gap: "var(--s-3)" }}>
-          <div className="alert alert-error">{loadError}</div>
-          <button className="btn" onClick={() => void refresh()}>
-            {t("common.retry")}
-          </button>
-        </div>
-      );
-    }
-    // Not a second loading screen: the same mark, under the same class, that
-    // index.html painted and createRoot() has just cleared. Two gaps sit back
-    // to back at startup — the bundle download and then the first IPC round
-    // trip — and showing a brand mark for one and the word "loading" for the
-    // other made the boot look like two events. It is one wait.
+    // Not a second loading screen: the same splash, under the same classes,
+    // that index.html painted and createRoot() has just cleared. Two gaps sit
+    // back to back at startup — the bundle download and then the first IPC
+    // round trip — and one splash spanning both makes it one wait, not two
+    // events. Reached with `status` already loaded whenever the minimum showing
+    // has not run out; that is the intended case (BOOT_MIN_VISIBLE_MS).
     //
-    // Reached with `status` already loaded whenever the minimum showing has
-    // not run out; that is the intended case, not a leftover. See
-    // BOOT_MIN_VISIBLE_MS for what it costs and how to turn it off.
+    // A true boot failure stays on this screen too (C226): the error takes the
+    // place the slow notice would, with a retry, and the mark stops beating.
+    // It is checked ahead of the hold — a splash that keeps running over a
+    // known failure is just a delay before bad news.
     //
-    // No styles here on purpose. index.html's inline <style> is in <head> and
-    // outlives #root, so `.boot` is still fully styled; a copy in styles.css
-    // would be a second source for a screen nobody looks at twice. Only the
-    // animation needs help across the handoff — see bootSplashDelays().
+    // The slow notice is appended rather than swapped in: the wait has not
+    // ended and the app has learned nothing about why, so the screen should
+    // not change its mind about what it is. It adds a way out, not a verdict.
+    bootShownRef.current = true;
     return (
-      <div
-        className="boot"
-        role="status"
-        aria-live="polite"
-        aria-label={t("common.loading")}
-        style={{ animationDelay: bootAnim.hold, "--boot-shift": bootAnim.shift } as CSSProperties}
-      >
-        <IconLogo size={34} />
-        <span>Agent NextUp</span>
-        {bootSlow && status === null && (
-          // Appended rather than swapped in: the wait has not ended and the
-          // app has learned nothing about why, so the screen should not change
-          // its mind about what it is. This adds a way out, not a verdict.
-          <div className="boot-slow">
-            <span>{t("common.bootSlow")}</span>
-            <button className="btn" onClick={() => void refresh()}>
-              {t("common.retry")}
-            </button>
-          </div>
-        )}
-      </div>
+      <BootScreen
+        delays={bootAnim}
+        label={t("common.loading")}
+        slow={bootSlow && status === null}
+        slowText={t("common.bootSlow")}
+        error={status === null ? loadError : null}
+        retryLabel={t("common.retry")}
+        onRetry={() => void refresh()}
+      />
     );
   }
 
@@ -824,188 +972,212 @@ export default function App() {
   // dead filter.
   const activeCategory =
     category === CAT_ALL || cats.some((c) => c.id === category) ? category : CAT_ALL;
-  // Every built-in is always *listed* (above) — but on a catalog where they
-  // are mostly unused that meant four permanent "0" rows in the sidebar,
-  // pushing the workspace nav below the fold for nothing (r2 3-5). The empty
-  // ones fold behind one row instead. The selected category is never folded
-  // away, which is what keeps "an emptied selection shows the empty-category
-  // message" true rather than turning into a filter that vanished.
-  const catsShown = catsExpanded
-    ? cats
-    : cats.filter((c) => c.count > 0 || c.id === activeCategory);
-  const catsFolded = cats.length - catsShown.length;
+  const inWorkspace = status.workspace !== null && VIEW_SCOPE[view] === "workspace";
+  // The switcher's second line (D153): "phase · template", from the same
+  // overview list the projects page reads — no extra IPC for it.
+  const wsOverview = recent?.find((w) => w.root === wsRoot) ?? null;
+  const wsMeta =
+    wsOverview === null
+      ? null
+      : [wsOverview.currentPhaseTitle ?? wsOverview.currentPhase, wsOverview.templateName]
+          .filter((x): x is string => typeof x === "string" && x !== "")
+          .join(" · ") || null;
 
   return (
     <div className="shell">
-      <aside className="sidebar">
+      {/* Two sidebars (D153): the app tier while you are looking at something
+          that spans projects, the project's own ten pages once you are inside
+          one. Which one shows follows the page, not whether a workspace
+          happens to be open — Settings with a project open is still an app
+          page. */}
+      <aside className={`sidebar ${inWorkspace ? "sidebar--ws" : "sidebar--app"}`}>
         <div className="brand">
-          <div className="brand-mark">
-            <IconLogo size={18} />
-          </div>
-          <div style={{ minWidth: 0 }}>
-            <div className="brand-name">{t("app.name")}</div>
-          </div>
+          <span className="brand-mark" ref={brandMarkRef}>
+            <AppMark size={26} />
+          </span>
+          <span className="brand-name">{t("app.name")}</span>
         </div>
 
         {/* Middle region scrolls on short windows; brand and foot stay pinned. */}
         <div className="sidebar-scroll">
-        <nav className="nav nav--home">
-          <button
-            className={`nav-item ${view === "projects" && activeCategory === CAT_ALL ? "active" : ""}`}
-            onClick={() => showCategory(CAT_ALL)}
-          >
-            <IconFolder size={17} className="nav-icon" />
-            {t("welcome.projectsTitle")}
-          </button>
-          {/* Inside a project the directory folds away (D46) — the home
-              item stays as the way back; re-entering it expands the list. */}
-          {view === "projects" &&
-            catsShown.map((c) => (
+          {inWorkspace && status.workspace !== null ? (
+            <div className="sidebar-ws">
               <button
-                key={c.id}
-                className={`nav-item nav-sub ${activeCategory === c.id ? "active" : ""}`}
-                onClick={() => showCategory(c.id)}
+                className="side-back"
+                onClick={() => {
+                  // C13 backwards: the project folds back into its card.
+                  const root = wsRoot;
+                  void growTo(
+                    {
+                      from: null,
+                      back: true,
+                      look: "card",
+                      to: () => projectCard(root),
+                    },
+                    () => showCategory(CAT_ALL),
+                  );
+                }}
               >
-                <span className="nav-sub-label">{c.label}</span>
-                <span className="nav-count">{c.count}</span>
+                <IconBack size={15} className="nav-icon" />
+                {t("nav.allProjects")}
               </button>
-            ))}
-          {view === "projects" && (catsFolded > 0 || catsExpanded) && (
-            <button
-              className="nav-item nav-sub nav-sub-more"
-              onClick={() => setCatsExpanded((v) => !v)}
-            >
-              <span className="nav-sub-label">
-                {catsExpanded ? t("welcome.catFewer") : t("welcome.catMore", { n: catsFolded })}
-              </span>
-            </button>
-          )}
-          {/* Teams live at the app level like the projects home (D48): the
-              graph spans workspaces, so it needs none open. */}
-          <button
-            className={`nav-item ${view === "teams" ? "active" : ""}`}
-            onClick={() => setView("teams")}
-          >
-            <IconFlow size={17} className="nav-icon" />
-            {t("nav.teams")}
-          </button>
-          {/* Agent overview is app-level too (D50): sessions span projects
-              and keep running while none of them is open. */}
-          <button
-            className={`nav-item ${view === "agents" ? "active" : ""}`}
-            onClick={() => setView("agents")}
-          >
-            <IconTerminal size={17} className="nav-icon" />
-            {t("nav.agents")}
-            {runningTerms.length > 0 && (
-              <span className="badge" title={t("term.runningMark")}>
-                {runningTerms.length}
-              </span>
-            )}
-          </button>
-          {/* Workflow templates are a first-class machine-wide asset (D51):
-              promoted out of Settings into their own app-level view. */}
-          <button
-            className={`nav-item ${view === "templates" ? "active" : ""}`}
-            onClick={() => setView("templates")}
-          >
-            <IconLayers size={17} className="nav-icon" />
-            {t("nav.templates")}
-          </button>
-          {/* Settings are app-level too (D49): language/theme are
-              machine-wide, so the page must not require an open workspace. */}
-          <button
-            className={`nav-item ${view === "settings" ? "active" : ""}`}
-            onClick={() => setView("settings")}
-          >
-            <IconSettings size={17} className="nav-icon" />
-            {t("nav.settings")}
-          </button>
-        </nav>
-
-        {status.workspace !== null && (
-          <div className="sidebar-ws">
-            <WorkspaceSwitcher
-              workspace={status.workspace}
-              onSwitched={applySwitched}
-              onSeeAll={() => showCategory(CAT_ALL)}
-            />
-            <nav className="nav">
-              <div className="nav-label">{t("nav.section")}</div>
-              {NAV.filter(({ view: v }) => {
-                const owner = moduleForView(v);
-                return owner === null || moduleOn(owner);
-              }).map(
-                ({ view: v, icon: Icon }) => (
+              <WorkspaceSwitcher
+                workspace={status.workspace}
+                meta={wsMeta}
+                onSwitched={applySwitched}
+                onSeeAll={() => showCategory(CAT_ALL)}
+              />
+              <nav className="nav">
+                <div className="nav-label">{t("nav.section")}</div>
+                {NAV.filter(({ view: v }) => {
+                  const owner = moduleForView(v);
+                  return owner === null || moduleOn(owner);
+                }).map(({ view: v, icon: Icon }) => (
                   <button
                     key={v}
+                    data-view={v}
                     className={`nav-item ${view === v ? "active" : ""}`}
-                    onClick={() => setView(v)}
+                    onClick={() => goTo(v)}
                   >
                     <Icon size={17} className="nav-icon" />
                     {t(`nav.${v}`)}
                     {v === "tasks" && <NavBadge count={blocked} title={t("status.blocked")} />}
                     {v === "inbox" && (
-                      <NavBadge
-                        count={inboxUnseen}
-                        title={t("notify.unreadDeliveries")}
-                        tone="event"
-                      />
+                      <NavBadge count={inboxUnseen} title={t("notify.unreadDeliveries")} />
                     )}
                     {v === "terminal" && wsRoot !== null && runningRoots.has(wsRoot) && (
-                      <span
-                        className="nav-dot"
-                        title={t("term.runningMark")}
-                        aria-label={t("term.runningMark")}
-                      />
+                      <span className="badge nav-run" title={t("term.runningMark")}>
+                        <span className="dot-run amb" role="img" aria-label={t("term.runningMark")} />
+                      </span>
                     )}
                   </button>
-                ),
+                ))}
+              </nav>
+            </div>
+          ) : (
+            <nav className="nav nav--home">
+              <button
+                data-view="projects"
+                className={`nav-item ${view === "projects" ? "active" : ""}`}
+                onClick={() => showCategory(CAT_ALL)}
+              >
+                <IconFolder size={17} className="nav-icon" />
+                {t("welcome.projectsTitle")}
+              </button>
+              {/* The directory only unfolds on the projects page (D46). Until
+                  the overview has been read the counts are unknown, not zero
+                  (invariant 10): the cells stay blank and the fold row waits. */}
+              {view === "projects" && (
+                <NavCategories
+                  cats={cats}
+                  total={recent === null ? null : recent.length}
+                  active={activeCategory}
+                  onSelect={showCategory}
+                />
               )}
+              {/* Teams live at the app level like the projects home (D48): the
+                  graph spans workspaces, so it needs none open. */}
+              <button
+                data-view="teams"
+                className={`nav-item ${view === "teams" ? "active" : ""}`}
+                onClick={() => setView("teams")}
+              >
+                <IconFlow size={17} className="nav-icon" />
+                {t("nav.teams")}
+              </button>
+              {/* Agent overview is app-level too (D50): sessions span projects
+                  and keep running while none of them is open. */}
+              <button
+                data-view="agents"
+                className={`nav-item ${view === "agents" ? "active" : ""}`}
+                onClick={goToAgents}
+              >
+                <IconTerminal size={17} className="nav-icon" />
+                {t("nav.agents")}
+                {runningTerms.length > 0 && (
+                  <span className="badge" title={t("term.runningMark")}>
+                    <span className="dot-run amb" aria-hidden="true" />
+                    {runningTerms.length}
+                  </span>
+                )}
+              </button>
+              {/* Workflow templates are a first-class machine-wide asset (D51):
+                  promoted out of Settings into their own app-level view. */}
+              <button
+                data-view="templates"
+                className={`nav-item ${view === "templates" ? "active" : ""}`}
+                onClick={() => setView("templates")}
+              >
+                <IconLayers size={17} className="nav-icon" />
+                {t("nav.templates")}
+              </button>
+              {/* Settings are app-level too (D49): language/theme are
+                  machine-wide, so the page must not require an open workspace. */}
+              <button
+                data-view="settings"
+                className={`nav-item ${view === "settings" ? "active" : ""}`}
+                onClick={() => setView("settings")}
+              >
+                <IconSettings size={17} className="nav-icon" />
+                {t("nav.settings")}
+              </button>
             </nav>
-          </div>
-        )}
+          )}
         </div>
 
-        {agentLive && (
-          <div className="sidebar-foot">
+        <div className="sidebar-foot">
+          {inWorkspace && agentLive && (
             <span className="agent-live">
-              <span className="pulse" aria-hidden="true">
-                <span className="ring" />
-                <span className="core" />
-              </span>
+              <span className="agent-live-dot amb" aria-hidden="true" />
               {t("app.agentLive")}
             </span>
-          </div>
-        )}
-        {/* A shortcut-only feature may as well not exist — nothing on
-            screen ever mentions it. This button is both the entry point and
-            the documentation (in-app help proper is B9's job; all this does
-            is make Ctrl+K visible). */}
-        <div className="sidebar-foot">
-          <button className="cmdk-open" onClick={() => setPaletteOpen(true)}>
-            <IconSearch size={13} className="nav-icon" />
+          )}
+          {/* A shortcut-only feature may as well not exist — nothing on
+              screen ever mentions it. This button is both the entry point and
+              the documentation (in-app help proper is B9's job; all this does
+              is make Ctrl+K visible). */}
+          <button className="nav-item cmdk-open" onClick={() => setPaletteOpen(true)}>
+            <IconCmd size={15} className="nav-icon" />
             <span className="cmdk-open-label">{t("cmdk.label")}</span>
             <kbd>{SHORTCUT_HINT.palette}</kbd>
           </button>
-        </div>
-        <div className="sidebar-foot">
-          <span className="muted">v{status.appVersion}</span>
+          {/* C197: after an update, the number settles from the old version
+              into the new one — once, on the first start of the new version. */}
+          <Scramble
+            className="side-ver"
+            value={`v${status.appVersion}`}
+            initial={versionBefore.current === null ? undefined : `v${versionBefore.current}`}
+            durationMs={760}
+          />
         </div>
       </aside>
 
       <main className="content">
-        {loadError !== null && (
-          <div className="alert alert-error">
-            {t("app.refreshFailed")} {loadError}
-          </div>
-        )}
-        {actionError !== null && (
-          <div className="alert alert-error">
-            {actionError}
-            <button className="btn btn-ghost" onClick={() => setActionError(null)}>
-              {t("common.close")}
-            </button>
+        {/* The page's own error bars (D153): above the page header, each with
+            a warning mark; they drop in from above (C29). Sticky, so the
+            message stays in view while the page scrolls (invariant 16(c)). */}
+        {(loadError !== null || actionError !== null) && (
+          <div className="top-bars">
+            {loadError !== null && (
+              <div className="top-bar" role="alert">
+                <IconWarn size={15} />
+                <span>
+                  {t("app.refreshFailed")} {loadError}
+                </span>
+              </div>
+            )}
+            {actionError !== null && (
+              <div className="top-bar" role="alert">
+                <IconWarn size={15} />
+                <span>{actionError}</span>
+                <button
+                  className="btn btn-ghost btn-small"
+                  onClick={(e) => dismissActionError(e.currentTarget.closest<HTMLElement>(".top-bar"))}
+                >
+                  {t("common.close")}
+                </button>
+              </div>
+            )}
           </div>
         )}
         {/* One view crashing shouldn't take the whole window with it
@@ -1027,7 +1199,7 @@ export default function App() {
               category={activeCategory}
               onClearCategory={() => setCategory(CAT_ALL)}
               onLoaded={applyStatus}
-              runningRoots={runningRoots}
+              sessions={runningTerms}
             />
           )}
           {view === "teams" && <Teams refreshKey={refreshKey} pushToast={pushToast} />}
@@ -1035,7 +1207,7 @@ export default function App() {
             <AgentSessions
               sessions={termSessions}
               overview={recent}
-              onOpen={(root) => void openTerminalOf(root)}
+              onOpen={(root, from) => void openTerminalOf(root, from)}
               onSessionsChanged={() => void reloadTerminals()}
             />
           )}
@@ -1103,6 +1275,8 @@ export default function App() {
                   refreshKey={refreshKey}
                   focusTool={focusTool}
                   onFocusHandled={clearFocusTool}
+                  focusAssets={focusAssets}
+                  onAssetsFocused={clearFocusAssets}
                 />
               )}
               {view === "terminal" && (
@@ -1120,6 +1294,10 @@ export default function App() {
                   modules={modules}
                   onModulesChange={setModules}
                   onGoToAppSettings={() => setView("settings")}
+                  onGoToTools={() => {
+                    setFocusAssets(true);
+                    setView("tools");
+                  }}
                 />
               )}
             </Fragment>
@@ -1139,7 +1317,11 @@ export default function App() {
         <QuickNoteModal onClose={() => setNoteOpen(false)} onSaved={onMutated} />
       )}
 
-      <ToastStack toasts={toasts} onDismiss={dismiss} />
+      <ToastStack toasts={toasts} ttlMs={TOAST_TTL_MS} onDismiss={dismiss} />
+
+      {bootExit && <BootExit target={brandMarkRef} onDone={() => setBootExit(false)} />}
+
+      {quitting && <BootBack from={brandMarkRef} onDone={() => void api.quitApp()} />}
 
       {quitPrompt && (
         <ConfirmDanger

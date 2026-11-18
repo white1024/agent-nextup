@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectContext } from "../types";
-import { formOf, isDirty, splitLines } from "./contextForm";
+import { dirtyFields, formOf, isDirty, nameMissing, renames, splitLines } from "./contextForm";
 
 function ctx(over: Partial<ProjectContext> = {}): ProjectContext {
   return {
@@ -40,12 +40,35 @@ describe("project info form", () => {
     expect(isDirty(form, ctx())).toBe(false);
   });
 
-  it("sees a real change in each of the four fields", () => {
+  it("sees a real change in each field, the name included", () => {
     const base = formOf(ctx());
+    expect(isDirty({ ...base, name: "renamed" }, ctx())).toBe(true);
     expect(isDirty({ ...base, domain: "research" }, ctx())).toBe(true);
     expect(isDirty({ ...base, description: "another" }, ctx())).toBe(true);
     expect(isDirty({ ...base, goals: "ship it\nmeasure it" }, ctx())).toBe(true);
     expect(isDirty({ ...base, boundaries: "" }, ctx())).toBe(true);
+  });
+
+  it("names exactly the fields that changed, in form order", () => {
+    const base = formOf(ctx());
+    expect(dirtyFields(base, ctx())).toEqual([]);
+    expect(dirtyFields({ ...base, boundaries: "", name: "renamed" }, ctx())).toEqual(["name", "boundaries"]);
+    // Normalised per field: padding one field does not mark it, editing another does.
+    expect(dirtyFields({ ...base, description: " a demo ", goals: "ship it\nmeasure it" }, ctx())).toEqual([
+      "goals",
+    ]);
+  });
+
+  it("ignores padding around the name, as the engine trims it", () => {
+    const form = { ...formOf(ctx()), name: "  demo " };
+    expect(isDirty(form, ctx())).toBe(false);
+    expect(renames(form, ctx())).toBe(false);
+    expect(renames({ ...form, name: "demo 2" }, ctx())).toBe(true);
+  });
+
+  it("will not offer a blank name", () => {
+    expect(nameMissing({ ...formOf(ctx()), name: "   " })).toBe(true);
+    expect(nameMissing(formOf(ctx()))).toBe(false);
   });
 
   it("treats emptying the domain field as setting it back to unset", () => {

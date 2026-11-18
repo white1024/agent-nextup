@@ -501,6 +501,15 @@ pub struct LedgerTail {
     pub reset: bool,
 }
 
+/// What [`Ledger::tail_window`] could see: the whole lines inside the byte
+/// window, and whether the file holds anything older than that.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerWindow {
+    /// Chronological, corrupt lines skipped as in every other read.
+    pub events: Vec<LedgerEvent>,
+    pub truncated: bool,
+}
+
 pub struct Ledger {
     file: PathBuf,
 }
@@ -677,6 +686,54 @@ impl Ledger {
             events.drain(..events.len() - limit);
         }
         Ok(LedgerTail { events, next_line: total, reset: false })
+    }
+
+    /// The events in the last `max_bytes` of the file, chronological — a read
+    /// whose cost does not grow with the ledger's history (D155).
+    ///
+    /// Every other read here parses the whole file, which is right for one
+    /// open workspace and wrong for a surface that reads *every* registered
+    /// workspace on a timer: there the cost would be the sum of every
+    /// project's history, and that sum only grows.
+    ///
+    /// The window starts mid-line almost every time, so the first partial
+    /// line is dropped — except when the byte before the window is a newline,
+    /// in which case the window already starts on a whole line and dropping it
+    /// would lose a good event. `truncated` says whether anything older was
+    /// left unread, so a caller counting events can tell a total from a floor.
+    pub fn tail_window(&self, max_bytes: u64) -> Result<LedgerWindow> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if !self.file.exists() {
+            return Ok(LedgerWindow { events: Vec::new(), truncated: false });
+        }
+        let io_at = |source: std::io::Error| crate::error::NextUpError::IoAt {
+            path: self.file.display().to_string(),
+            source,
+        };
+        let mut file = std::fs::File::open(&self.file).map_err(io_at)?;
+        let len = file.metadata().map_err(io_at)?.len();
+        let truncated = len > max_bytes;
+        // One byte of lookbehind decides whether the window's first line is whole.
+        let start = if truncated { len - max_bytes - 1 } else { 0 };
+        file.seek(SeekFrom::Start(start)).map_err(io_at)?;
+        let mut buf = Vec::with_capacity((len - start) as usize);
+        file.read_to_end(&mut buf).map_err(io_at)?;
+        let body: &[u8] = if truncated {
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(nl) => &buf[nl + 1..],
+                None => &[],
+            }
+        } else {
+            &buf
+        };
+        let raw = String::from_utf8_lossy(body);
+        let events = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<LedgerEvent>(l).ok())
+            .collect();
+        Ok(LedgerWindow { events, truncated })
     }
 
     fn read_all(&self) -> Result<Vec<LedgerEvent>> {
@@ -1146,5 +1203,57 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         assert_eq!(decisions[0].message, "use SQLite over sled");
         assert_eq!(decisions[1].message, "files are source of truth");
+    }
+
+    fn line_len(event: &LedgerEvent) -> u64 {
+        serde_json::to_vec(event).unwrap().len() as u64 + 1
+    }
+
+    /// The window is a byte budget, not a line count: a ledger far larger than
+    /// it still yields only what fits, and says it left something behind.
+    #[test]
+    fn tail_window_reads_only_the_end() {
+        let (_g, ledger) = ledger();
+        assert_eq!(
+            ledger.tail_window(1024).unwrap(),
+            LedgerWindow { events: Vec::new(), truncated: false },
+            "no file is an empty, complete window"
+        );
+        let mut events = Vec::new();
+        for i in 0..200 {
+            let e = LedgerEvent::new(LedgerKind::Note, format!("note {i:03}"), None);
+            ledger.append(&e).unwrap();
+            events.push(e);
+        }
+        let one = line_len(&events[0]);
+
+        let whole = ledger.tail_window(one * 1000).unwrap();
+        assert_eq!(whole.events.len(), 200);
+        assert!(!whole.truncated);
+
+        // Half a line past five whole ones: the partial line is dropped.
+        let tail = ledger.tail_window(one * 5 + one / 2).unwrap();
+        assert!(tail.truncated);
+        let msgs: Vec<_> = tail.events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(msgs, ["note 195", "note 196", "note 197", "note 198", "note 199"]);
+    }
+
+    /// When the window starts exactly on a line boundary the first line is
+    /// whole and must be kept — dropping "the first line" unconditionally
+    /// would lose a good event every time the arithmetic lands evenly.
+    #[test]
+    fn tail_window_keeps_a_first_line_that_starts_on_the_boundary() {
+        let (_g, ledger) = ledger();
+        let mut events = Vec::new();
+        for i in 0..10 {
+            let e = LedgerEvent::new(LedgerKind::Note, format!("note {i}"), None);
+            ledger.append(&e).unwrap();
+            events.push(e);
+        }
+        let one = line_len(&events[0]);
+        let tail = ledger.tail_window(one * 3).unwrap();
+        assert!(tail.truncated);
+        let msgs: Vec<_> = tail.events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(msgs, ["note 7", "note 8", "note 9"]);
     }
 }

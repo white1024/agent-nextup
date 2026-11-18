@@ -15,6 +15,7 @@
 //!   real workspace state. Sessions are *driven* by the harness, not merely
 //!   advised by prose guidelines.
 
+pub mod activity;
 pub mod agent_catalog;
 pub mod assets;
 pub mod atomic;

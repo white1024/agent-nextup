@@ -23,8 +23,13 @@ export function usePulse(value: unknown, ttl = 340): boolean {
 /**
  * Keys that appeared since the previous snapshot (first load animates
  * nothing). Entries auto-expire after `ttl` ms.
+ *
+ * `loaded`, when the caller can say it, marks the moment the first read came
+ * back: that snapshot is the baseline even when it is empty, so the very first
+ * entry of an empty list (the first envelope ever published) still arrives as
+ * new. Without it, the first non-empty snapshot is taken as the baseline.
  */
-export function useFreshKeys(keys: string[], ttl = 1600): Set<string> {
+export function useFreshKeys(keys: string[], ttl = 1600, loaded?: boolean): Set<string> {
   const seen = useRef<Set<string> | null>(null);
   const [fresh, setFresh] = useState<Set<string>>(() => new Set());
   const joined = keys.join(" ");
@@ -33,7 +38,7 @@ export function useFreshKeys(keys: string[], ttl = 1600): Set<string> {
     if (seen.current === null) {
       // Views mount with an empty list before the first fetch resolves — the
       // first NON-EMPTY snapshot is the baseline, absorbed without animation.
-      if (keys.length === 0) return;
+      if (loaded === undefined ? keys.length === 0 : !loaded) return;
       seen.current = new Set(keys);
       return;
     }
@@ -44,7 +49,7 @@ export function useFreshKeys(keys: string[], ttl = 1600): Set<string> {
     const id = window.setTimeout(() => setFresh(new Set()), ttl);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [joined, ttl]);
+  }, [joined, ttl, loaded]);
 
   return fresh;
 }

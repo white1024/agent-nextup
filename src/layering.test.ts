@@ -29,10 +29,10 @@ import { describe, expect, it } from "vitest";
  *   The moment a second screen wants it, the guard below is what tells you to
  *   promote it to components/ rather than reach across.
  *
- * Note what this does *not* claim: that every tested module is in lib/. Two
- * pure helpers are deliberately tested where they are used — `elidePath` in
- * components/PathLabel.tsx and views/teams/layout.ts — because a helper with
- * one caller belongs next to its caller. The rule is about what a folder may
+ * Note what this does *not* claim: that every tested module is in lib/. A
+ * pure helper with one home is deliberately tested where it is used — in
+ * components/, shell/ or a screen's folder under views/ — because a helper
+ * with one caller belongs next to its caller. The rule is about what a folder may
  * depend on and who may reach into it, not about where tests live.
  */
 

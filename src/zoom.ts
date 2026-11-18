@@ -16,11 +16,16 @@ export const ZOOM_EVENT = "zoom://changed";
  * something rounder.
  *
  * This is webview zoom: the whole page scales, so the viewport measured in CSS
- * px *shrinks* as the factor grows. The window's own floor is `minWidth: 960`
- * (tauri.conf.json), which at 1.25 leaves 768 CSS px — and styles.css already
+ * px *shrinks* as the factor grows. The window's own floor is `minWidth: 1100`
+ * (tauri.conf.json), which at 1.25 leaves 880 CSS px — and styles.css already
  * carries breakpoints at 1040 / 980 / 900 / 800 / 760, so that width is still
- * inside the range the layout was designed for. 1.5 would leave 640 px, below
+ * inside the range the layout was designed for. 1.5 would leave 733 px, below
  * the lowest breakpoint, where nothing is written to catch it.
+ *
+ * (The floor was 960 until 2026-11-14. It was raised so the projects page's
+ * live feed stays beside the cards at every offered step: at 960 and 1.25 the
+ * main area is 532 and the feed fell under the grid — 1080 is where it comes
+ * back, and 1100 leaves a margin.)
  *
  * So the ceiling is not a guess about taste: it is the last step that stays on
  * the responsive ladder the app already has. Widen the window and there is more

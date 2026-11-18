@@ -1089,17 +1089,28 @@ pub fn add_rejected(
 }
 
 /// The part of context.json a person may change after creation (D142): the
-/// four fields that *describe* the project. `None` leaves a field alone.
+/// fields that *describe* the project. `None` leaves a field alone.
 ///
-/// Deliberately not here: the name (four copies — team graph, sent envelopes,
-/// rendered curriculum, registry — each needing its own answer), the workspace
-/// id (teams resolve members by it), milestones and the rejected list (their
-/// own ops own them; agents append to `rejected` at any time), and the
-/// timestamps. A partial edit is the point: the editor never writes a whole
-/// `ProjectContext` back, so a field it does not know about cannot be lost.
+/// The name joined them in D151. It is the display name only — the folder
+/// does not move. Its other copies each got an answer: the team graph and the
+/// registry are app-level files this crate's callers refresh after a rename
+/// (`teams::rename_workspace`, `registry::record_workspace`); envelopes
+/// already sent keep the old name, because they are history; the curriculum
+/// that rendered the name in (guide, protocol, module guides) stays as it is
+/// until an asset upgrade, which the GUI points at — rewriting it here would
+/// also slip in every other engine change to those files. The `AGENTS.md`
+/// state block follows on its own (the regenerate below); the title lines of
+/// `AGENTS.md` and `CLAUDE.md` are the user's and are never rewritten.
+///
+/// Still not here: the workspace id (teams resolve members by it), milestones
+/// and the rejected list (their own ops own them; agents append to `rejected`
+/// at any time), and the timestamps. A partial edit is the point: the editor
+/// never writes a whole `ProjectContext` back, so a field it does not know
+/// about cannot be lost.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextEdit {
+    pub name: Option<String>,
     pub domain: Option<String>,
     pub description: Option<String>,
     pub goals: Option<Vec<String>>,
@@ -1115,8 +1126,13 @@ pub struct ContextEdit {
 /// Normalised the way init normalises them, so an edited project and a fresh
 /// one cannot disagree about shape: trimmed text, one entry per non-empty
 /// line, and a blank domain written as `general` — the one word for "nobody
-/// said" (D137). An edit that changes nothing writes nothing.
+/// said" (D137). A name is required, as at init. An edit that changes nothing
+/// writes nothing.
 pub fn edit_context(paths: &WorkspacePaths, app_version: &str, edit: ContextEdit) -> Result<ProjectContext> {
+    let name = edit.name.map(|n| n.trim().to_string());
+    if name.as_deref() == Some("") {
+        return Err(NextUpError::InvalidInput("project name cannot be empty".into()));
+    }
     let domain = edit.domain.map(|d| match d.trim() {
         "" => "general".to_string(),
         d => d.to_string(),
@@ -1127,6 +1143,12 @@ pub fn edit_context(paths: &WorkspacePaths, app_version: &str, edit: ContextEdit
 
     let apply = |ctx: &mut ProjectContext| -> Vec<String> {
         let mut changed = Vec::new();
+        if let Some(n) = &name {
+            if *n != ctx.name {
+                changed.push(format!("name ({} → {n})", ctx.name));
+                ctx.name = n.clone();
+            }
+        }
         if let Some(d) = &domain {
             if *d != ctx.domain {
                 changed.push(format!("domain ({} → {d})", ctx.domain));
@@ -1982,6 +2004,40 @@ mod tests {
         let (_g, paths) = workspace();
         let ctx = edit_context(&paths, "0.1.0", ContextEdit { domain: Some("   ".into()), ..Default::default() }).unwrap();
         assert_eq!(ctx.domain, "general", "the word the UI hides, same as init (D137)");
+    }
+
+    #[test]
+    fn edit_context_renames_and_ledgers_both_names() {
+        let (_g, paths) = workspace();
+        let before = load_context(&paths.context_file()).unwrap();
+        let ctx = edit_context(
+            &paths,
+            "0.1.0",
+            ContextEdit { name: Some("  Renamed project ".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(ctx.name, "Renamed project", "trimmed, as at init");
+        assert_eq!(ctx.workspace_id, before.workspace_id, "the identity teams key on does not move");
+        let lines = Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::ContextEdited, 5).unwrap();
+        assert_eq!(
+            lines[0].message,
+            format!("project context edited: name ({} → Renamed project)", before.name),
+            "the old name stays findable in the record"
+        );
+    }
+
+    #[test]
+    fn edit_context_refuses_a_blank_name_and_writes_nothing() {
+        let (_g, paths) = workspace();
+        let before = load_context(&paths.context_file()).unwrap();
+        let err = edit_context(
+            &paths,
+            "0.1.0",
+            ContextEdit { name: Some("   ".into()), domain: Some("research".into()), ..Default::default() },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        assert_eq!(load_context(&paths.context_file()).unwrap(), before, "not even the valid field lands");
     }
 
     #[test]

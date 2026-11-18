@@ -1,22 +1,32 @@
-import { useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { api, errorMessage } from "../api";
 import { useGuardedMutation, useWorkspaceData } from "../hooks";
+import { useFreshKeys } from "../hooks/anim";
 import EmptyState from "../components/EmptyState";
+import ErrorBar from "../components/ErrorBar";
+import FlashBar from "../components/FlashBar";
+import InfoTip from "../components/InfoTip";
 import Modal from "../components/Modal";
 import PathLabel from "../components/PathLabel";
-import TeachingHint from "../components/TeachingHint";
 import { IconPaperclip } from "../components/icons";
-import { seenDeliveries } from "../lib/notify";
+import { seenDeliveries, unreadFor } from "../lib/notify";
 import type { DeliveryEnvelope, DeliverySummary } from "../types";
 import TimeAgo from "../components/TimeAgo";
 import { absoluteTime } from "../lib/time";
 import { baseName, formatBytes } from "../lib/format";
+import { centreOf, fx, motionOff, takeOrigin, tokenRgb } from "../lib/fx";
+import { boxClose, boxOf, boxOpen, pictureOf, settleBox, type Box } from "../lib/listMotion";
 
 /** Rows rendered per mailbox before "show more" (the ledger's page size, D60). */
 const PAGE = 50;
+
+/** C41's rhythm: the k-th unread envelope gets its beam at BEAM + k·STEP. */
+const C41_BEAM_MS = 260;
+const C41_STEP_MS = 170;
+const C41_LAND_MS = 500;
 
 /**
  * A one-phrase name for an envelope, for the places that need words rather
@@ -30,6 +40,11 @@ function summarise(note: string | undefined, fallback: string): string {
   if (first === undefined) return fallback;
   const trimmed = first.trim();
   return trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed;
+}
+
+/** The row an envelope opened from, in either list. */
+function rowEl(scope: HTMLElement | null, id: string): HTMLElement | null {
+  return scope?.querySelector<HTMLElement>(`[data-row="${CSS.escape(id)}"]`) ?? null;
 }
 
 interface Props {
@@ -46,10 +61,15 @@ interface Props {
  * project* — the view renders it read-only; "Accept" means turning it into a
  * task by hand. Routing (who gets my outbox) lives in the app-level team
  * view, not here.
+ *
+ * D153 (spec 40): received on the left, publishing and the pending outbox on
+ * the right where they stay in view while the left scrolls; one column with
+ * publishing first when the main area is narrow. An envelope opens out of its
+ * row and folds back into it (C42).
  */
 export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Props) {
   const { t, i18n } = useTranslation();
-  const { data, error, setError, reload, loading } = useWorkspaceData<{
+  const { data, error, setError, reload } = useWorkspaceData<{
     inbox: DeliverySummary[];
     outbox: DeliverySummary[];
   }>(
@@ -59,6 +79,7 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
     }),
     refreshKey,
   );
+  const pageRef = useRef<HTMLDivElement>(null);
 
   // Which envelopes were unread when this page opened.
   //
@@ -82,7 +103,9 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
     unreadRef.current = { root, ids: seenDeliveries(root) };
   }
   const seenAtOpen = unreadRef.current.ids;
-  const isUnread = (row: DeliverySummary) => seenAtOpen !== null && !seenAtOpen.has(row.id);
+  // The agent half of the rule reads live data, so an envelope the agent opens
+  // while this page is up loses its bold on the spot — it has been picked up.
+  const isUnread = (row: DeliverySummary) => unreadFor(seenAtOpen, row);
 
   /** How many rows each mailbox is showing; grows by PAGE on "show more". */
   const [inboxShown, setInboxShown] = useState(PAGE);
@@ -104,6 +127,9 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
 
   /** Non-null while composing a Save-as-decision entry inside the envelope modal. */
   const [decisionDraft, setDecisionDraft] = useState<string | null>(null);
+  /** The envelope's action strip was swapped by the user (it rises; the first one does not). */
+  const [swapped, setSwapped] = useState(false);
+  const decisionRef = useRef<HTMLTextAreaElement>(null);
 
   /** Outbox envelope the next publish declares it corrects (D87 ⑦); "" for none. */
   const [supersedes, setSupersedes] = useState("");
@@ -117,6 +143,109 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
   // back to "not a correction" rather than publishing a claim core will reject.
   const supersedesValue = supersedable.some((r) => r.id === supersedes) ? supersedes : "";
 
+  // ── Motion (D153; each piece only on its own event) ─────────────────────
+
+  // Entering from the sidebar: the rows rise one after another. Not when a
+  // page frame is the arrival, and only on the mount — a reload is not one.
+  const [entering, setEntering] = useState(false);
+  useEffect(() => {
+    if (motionOff() || document.querySelector(".pt-veil") !== null) return;
+    setEntering(true);
+    const timer = window.setTimeout(() => setEntering(false), 1400);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  // C45: an envelope that has just been published slides in at the top of
+  // the pending list. The first read is the baseline even when it is empty,
+  // so the first envelope ever published arrives too.
+  const freshOut = useFreshKeys(
+    (data?.outbox ?? []).map((row) => row.id),
+    1600,
+    data !== null,
+  );
+
+  // C46: the batch "show more" revealed rises row by row.
+  const [moreIn, setMoreIn] = useState<{ box: "in" | "out"; from: number } | null>(null);
+  useEffect(() => {
+    if (moreIn === null) return;
+    const timer = window.setTimeout(() => setMoreIn(null), 1000);
+    return () => window.clearTimeout(timer);
+  }, [moreIn]);
+  function showMore(box: "in" | "out") {
+    const from = box === "in" ? inboxShown : outboxShown;
+    if (!motionOff()) setMoreIn({ box, from });
+    (box === "in" ? setInboxShown : setOutboxShown)((n) => n + PAGE);
+  }
+
+  // C41: arriving through the sidebar badge, an amber beam runs from the badge
+  // to each unread envelope; the dot pops and the row is swept as it lands.
+  // Once, on the first read — the badge's point is left by the click (App).
+  const [lit, setLit] = useState<Map<string, number>>(() => new Map());
+  const arrived = useRef(false);
+  const c41Timers = useRef<number[]>([]);
+  useEffect(() => () => c41Timers.current.forEach((id) => window.clearTimeout(id)), []);
+  useEffect(() => {
+    if (data === null || arrived.current) return;
+    arrived.current = true;
+    const from = takeOrigin("inbox");
+    if (from === null || motionOff()) return;
+    const targets = data.inbox.slice(0, Math.min(inboxShown, 12)).filter(isUnread);
+    if (targets.length === 0) return;
+    const rgb = tokenRgb("--orange");
+    const marks = new Map<string, number>();
+    targets.forEach((row, k) => {
+      const at = C41_BEAM_MS + k * C41_STEP_MS;
+      marks.set(row.id, at + C41_LAND_MS);
+      // Measured when the beam leaves, not now: the rows are still rising.
+      c41Timers.current.push(
+        window.setTimeout(() => {
+          const dot = rowEl(pageRef.current, row.id)?.querySelector(".mail-dot");
+          const to = centreOf(dot);
+          if (to === null || to.y < 0 || to.y > window.innerHeight) return;
+          fx.beam(from, to, { width: 2.2, bend: 0.12, dur: 560, rgb });
+        }, at),
+      );
+    });
+    setLit(marks);
+    const last = C41_BEAM_MS + targets.length * C41_STEP_MS + C41_LAND_MS + 800;
+    c41Timers.current.push(window.setTimeout(() => setLit(new Map()), last));
+    // Keyed on the first read only (the ref guards the rest).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  // ── The envelope (C42) ──────────────────────────────────────────────────
+
+  /** The row an envelope opened from (its lit background), until it folds back in. */
+  const [srcId, setSrcId] = useState<string | null>(null);
+  /** Taken at the click, played when the dialog has rendered. */
+  const growFrom = useRef<{ from: Box; picture: HTMLElement } | null>(null);
+
+  useLayoutEffect(() => {
+    if (open === null) return;
+    const g = growFrom.current;
+    growFrom.current = null;
+    const panel = pageRef.current?.querySelector<HTMLElement>(".env-dlg") ?? null;
+    const host = panel?.parentElement ?? null;
+    if (panel === null || host === null) return;
+    boxOpen({
+      host,
+      from: g?.from ?? { left: 0, top: 0, width: 0, height: 0 },
+      picture: g?.picture ?? null,
+      dst: panel,
+      cls: "env-ghost",
+    });
+  }, [open]);
+
+  // Record as decision: the text box takes focus with the caret after the
+  // prefilled words, ready to add to them.
+  useEffect(() => {
+    const el = decisionRef.current;
+    if (decisionDraft === null || el === null || document.activeElement === el) return;
+    el.focus({ preventScroll: true });
+    el.setSelectionRange(el.value.length, el.value.length);
+    // Only on the swap in, not on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [decisionDraft !== null]);
 
   async function chooseFiles() {
     try {
@@ -141,6 +270,7 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
       setNote("");
       setFiles([]);
       setSupersedes("");
+      setCreatedTask(null);
       setFlash(`${t("inbox.published")} ${envelope.id.slice(0, 8)}`);
       await reload();
       onMutated();
@@ -150,11 +280,61 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
   async function view(row: DeliverySummary, mailbox: "inbox" | "outbox") {
     setError(null);
     setDecisionDraft(null);
+    setSwapped(false);
     try {
-      setOpen(await api.exchangeGet(root, mailbox, row.id));
+      const envelope = await api.exchangeGet(root, mailbox, row.id);
+      settleBox();
+      const el = rowEl(pageRef.current, row.id);
+      growFrom.current = el === null ? null : { from: boxOf(el), picture: pictureOf(el) };
+      setSrcId(row.id);
+      setOpen(envelope);
     } catch (e) {
       setError(errorMessage(e));
     }
+  }
+
+  /**
+   * Closing, by any way out (✕, Close, Esc, the scrim, a write): the envelope
+   * folds back into its row — unless the row is off screen, when the dialog
+   * just sinks. `after` runs once the envelope is gone (the result line drops
+   * in then, C43).
+   */
+  function closeEnvelope(after?: () => void) {
+    const panel = pageRef.current?.querySelector<HTMLElement>(".env-dlg") ?? null;
+    const backdrop = panel?.parentElement ?? null;
+    const row = srcId === null ? null : rowEl(pageRef.current, srcId);
+    settleBox();
+    const to = row === null ? null : boxOf(row);
+    const inView = to !== null && to.height > 0 && to.top + to.height > 0 && to.top < window.innerHeight;
+    const finish = () => {
+      setSrcId(null);
+      after?.();
+    };
+    if (panel !== null && backdrop !== null && inView && !motionOff()) {
+      // The scrim stays the Modal's to fade; the panel is ours to carry back.
+      backdrop.dataset.exit = "scrim";
+      const layer = document.createElement("div");
+      layer.className = "env-layer";
+      layer.setAttribute("aria-hidden", "true");
+      document.body.appendChild(layer);
+      boxClose({
+        host: layer,
+        from: boxOf(panel),
+        to,
+        out: pictureOf(panel),
+        src: row,
+        hide: row === null ? [] : [row],
+        cls: "env-ghost",
+        done: () => {
+          layer.remove();
+          finish();
+        },
+      });
+    } else {
+      finish();
+    }
+    setOpen(null);
+    setDecisionDraft(null);
   }
 
   /** Save as decision (team module design §7, added later): a prefilled, editable ledger decision referencing the envelope. */
@@ -164,6 +344,7 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
       team: envelope.deliveredVia?.teamName ?? "-",
       id: envelope.id.slice(0, 8),
     });
+    setSwapped(true);
     setDecisionDraft(envelope.payload.note ? `${base}${envelope.payload.note}` : base);
   }
 
@@ -172,10 +353,11 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
     return run(async () => {
       setError(null);
       await api.addLedgerNote("decision", decisionDraft.trim());
-      setDecisionDraft(null);
-      setOpen(null);
-      setFlash(t("inbox.decisionSaved"));
       onMutated();
+      closeEnvelope(() => {
+        setCreatedTask(null);
+        setFlash(t("inbox.decisionSaved"));
+      });
     });
   }
 
@@ -192,17 +374,38 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
         priority: 2,
         tags: [],
       });
-      setOpen(null);
+      onMutated();
       // Name the task that was created and offer the way to it; a bare
       // "Created" leaves the user guessing where it landed.
-      setCreatedTask(created.id);
-      setFlash(t("inbox.taskCreated", { id: created.id }));
-      onMutated();
+      closeEnvelope(() => {
+        setCreatedTask(created.id);
+        setFlash(t("inbox.taskCreated", { id: created.id }));
+      });
     });
   }
 
+  /** Per-row classes and stagger variables shared by both lists. */
+  function rowMotion(box: "in" | "out", id: string, i: number): { cls: string; style: CSSProperties } {
+    let cls = "";
+    const style: Record<string, string | number> = { "--j": i };
+    if (srcId === id) cls += " env-src";
+    if (box === "out" && freshOut.has(id)) cls += " fresh";
+    if (box === "in" && lit.has(id)) {
+      cls += " lit";
+      style["--d"] = `${lit.get(id)}ms`;
+    }
+    if (moreIn !== null && moreIn.box === box && i >= moreIn.from) {
+      cls += " more-in";
+      style["--m"] = Math.min(i - moreIn.from, 12);
+    }
+    return { cls, style: style as CSSProperties };
+  }
+
+  const inbox = data?.inbox ?? [];
+  const outbox = data?.outbox ?? [];
+
   return (
-    <div className="view">
+    <div className={`view ibx${entering ? " ibx-enter" : ""}`} ref={pageRef}>
       <header className="view-header">
         <div className="vh-main">
           <h1>{t("inbox.heading")}</h1>
@@ -210,316 +413,326 @@ export default function Inbox({ root, refreshKey, onMutated, onGoToTasks }: Prop
         </div>
       </header>
 
-      {error && <div className="alert alert-error">{error}</div>}
-      {flash && (
-        <div className="alert alert-ok">
-          {flash}
-          {createdTask !== null && (
-            <button
-              className="btn-link"
-              style={{ marginLeft: "var(--s-2)" }}
-              onClick={onGoToTasks}
-            >
-              {t("inbox.goToTask")}
-            </button>
-          )}
-          <button
-            className="btn btn-ghost"
-            style={{ marginLeft: "var(--s-2)" }}
-            onClick={() => {
-              setFlash(null);
-              setCreatedTask(null);
-            }}
-          >
-            {t("common.close")}
+      <ErrorBar error={error} />
+      <FlashBar message={flash}>
+        {createdTask !== null && (
+          <button className="btn btn-small" onClick={onGoToTasks}>
+            {t("inbox.goToTask")}
           </button>
-        </div>
-      )}
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2 className="panel-title">
-            {t("inbox.received")}
-            <span className="sub">{t("inbox.receivedSub")}</span>
-          </h2>
-        </div>
-        {!loading && (data?.inbox ?? []).length === 0 && (
-          <EmptyState title={t("inbox.empty")} hint={t("inbox.emptyHint")} />
         )}
-        {/* One line per envelope, mail-client shape: sender, note clipped to the
-            width available, meta and the action in fixed right-hand columns.
-            The full note is one click away in the modal — which is why the IPC
-            still asks for whole notes (see the NoteDetail::Full note in
-            commands.rs): the layout bounds them, the data does not. */}
-        {(data?.inbox ?? []).slice(0, inboxShown).map((row) => {
-          const unread = isUnread(row);
-          return (
-            <div className={`settings-row mail-row${unread ? " unread" : ""}`} key={row.id}>
-              <span className="mail-dot" aria-hidden="true" />
-              <div className="sr-body">
-                <div className="sr-title mail-line">
-                  {unread && <span className="sr-only">{t("inbox.unread")}</span>}
-                  <span className="mail-from">{row.from.name}</span>
-                  {row.note && <span className="mail-note">{row.note}</span>}
-                  {row.attachmentCount > 0 && (
-                    <span className="pill attach-count">
-                      <IconPaperclip size={12} />
-                      {row.attachmentCount}
-                    </span>
-                  )}
-                </div>
-              </div>
-              <div className="mail-meta">
-                {row.deliveredVia ? `${t("teams.viaTeam")} ${row.deliveredVia.teamName} · ` : ""}
-                <TimeAgo at={row.deliveredAt ?? row.publishedAt} />
-              </div>
-              {/* Named per row: a screen reader listing the page's buttons gets
-                  N identical "View"s otherwise, and which envelope each opens is
-                  exactly the thing that is not on screen for that reader. */}
-              <button
-                className="btn"
-                aria-label={t("inbox.viewFrom", {
-                  name: row.from.name,
-                  summary: summarise(row.note, row.id.slice(0, 8)),
-                })}
-                onClick={() => void view(row, "inbox")}
-              >
-                {t("inbox.view")}
+        <button
+          className="btn btn-small btn-ghost"
+          onClick={() => {
+            setFlash(null);
+            setCreatedTask(null);
+          }}
+        >
+          {t("common.close")}
+        </button>
+      </FlashBar>
+
+      <div className="ibx-cols">
+        <section className="panel ibx-in">
+          <div className="panel-head">
+            <h2 className="panel-title">
+              {t("inbox.received")}
+              <span className="sub">{t("inbox.receivedSub")}</span>
+            </h2>
+          </div>
+          {/* Nothing until the first read answers (invariant 10(c)). */}
+          {data !== null && inbox.length === 0 && (
+            <EmptyState title={t("inbox.empty")} hint={t("inbox.emptyHint")} />
+          )}
+          {/* One line per envelope, mail-client shape: sender, note clipped to the
+              width available, meta and the action in fixed right-hand columns.
+              The full note is one click away in the envelope — which is why the
+              IPC still asks for whole notes (see the NoteDetail::Full note in
+              commands.rs): the layout bounds them, the data does not. */}
+          {inbox.length > 0 && (
+            <ul className="mails">
+              {inbox.slice(0, inboxShown).map((row, i) => {
+                const unread = isUnread(row);
+                const m = rowMotion("in", row.id, i);
+                return (
+                  <li
+                    className={`mail${unread ? " unread" : ""}${m.cls}`}
+                    style={m.style}
+                    key={row.id}
+                    data-row={row.id}
+                  >
+                    <span className="mail-dot" aria-hidden="true" />
+                    <div className="mail-body">
+                      <div className="mail-line">
+                        {unread && <span className="sr-only">{t("inbox.unread")}</span>}
+                        <span className="mail-from">{row.from.name}</span>
+                        {row.note && <span className="mail-note">{row.note}</span>}
+                        {row.attachmentCount > 0 && (
+                          <span className="mail-att" title={t("inbox.attachments", { n: row.attachmentCount })}>
+                            <IconPaperclip size={11} />
+                            {row.attachmentCount}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mail-meta">
+                      {row.agentReadAt
+                        ? `${row.agentReadBy ? t("inbox.agentReadBy", { name: row.agentReadBy }) : t("inbox.agentRead")} · `
+                        : ""}
+                      {row.deliveredVia ? `${t("teams.viaTeam")} ${row.deliveredVia.teamName} · ` : ""}
+                      <TimeAgo at={row.deliveredAt ?? row.publishedAt} />
+                    </div>
+                    {/* Named per row: a screen reader listing the page's buttons gets
+                        N identical "View"s otherwise, and which envelope each opens is
+                        exactly the thing that is not on screen for that reader. */}
+                    <button
+                      className="btn btn-small"
+                      aria-label={t("inbox.viewFrom", {
+                        name: row.from.name,
+                        summary: summarise(row.note, row.id.slice(0, 8)),
+                      })}
+                      onClick={() => void view(row, "inbox")}
+                    >
+                      {t("inbox.view")}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {inbox.length > inboxShown && (
+            <div className="mail-foot">
+              <button className="btn btn-small" onClick={() => showMore("in")}>
+                {t("inbox.showMore", { n: inbox.length - inboxShown })}
               </button>
             </div>
-          );
-        })}
-        {(data?.inbox ?? []).length > inboxShown && (
-          <div className="mail-foot">
-            <button className="btn" onClick={() => setInboxShown((n) => n + PAGE)}>
-              {t("inbox.showMore", { n: (data?.inbox ?? []).length - inboxShown })}
+          )}
+          <p className="ibx-trust">{t("inbox.trustHint")}</p>
+        </section>
+
+        <section className="panel ibx-out">
+          <div className="panel-head">
+            <h2 className="panel-title">
+              {t("inbox.publish")}
+              <span className="sub">{t("inbox.publishSub")}</span>
+            </h2>
+          </div>
+          <div className="ibx-pub">
+            <input
+              value={note}
+              aria-label={t("inbox.notePlaceholder")}
+              placeholder={t("inbox.notePlaceholder")}
+              onChange={(e) => setNote(e.target.value)}
+            />
+          </div>
+          <div className="ibx-attach-row">
+            <button className="btn btn-small" disabled={busy} onClick={() => void chooseFiles()}>
+              <IconPaperclip size={14} />
+              {t("inbox.attachFiles")}
+            </button>
+            <span>{t("inbox.attachHint")}</span>
+          </div>
+          {files.length > 0 && (
+            <div className="ibx-chips">
+              {files.map((f) => (
+                <span className="ibx-chip" key={f}>
+                  <IconPaperclip size={12} />
+                  {baseName(f)}
+                  <button
+                    className="ibx-chip-x"
+                    aria-label={t("inbox.attachRemove", { name: baseName(f) })}
+                    onClick={() => setFiles(files.filter((x) => x !== f))}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          {supersedable.length > 0 && (
+            <div className="ibx-sup">
+              <label>
+                <span>{t("inbox.supersedeLabel")}</span>
+                <select
+                  value={supersedesValue}
+                  disabled={busy}
+                  onChange={(e) => setSupersedes(e.target.value)}
+                >
+                  <option value="">{t("inbox.supersedeNone")}</option>
+                  {supersedable.map((row) => (
+                    // Note first, id second: the note is how the publisher
+                    // recognises which envelope this is. Separated by a middot,
+                    // not parentheses — the note is user text in either locale and
+                    // the id is Latin, so a bracket pair would have to pick a width.
+                    <option key={row.id} value={row.id}>
+                      {row.note ? `${row.note} · ${row.id.slice(0, 8)}` : row.id.slice(0, 8)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {/* Teaching, so one click deep (17(c)); the trust line above stays. */}
+              <InfoTip label={t("inbox.supersedeLabel")}>{t("inbox.supersedeHint")}</InfoTip>
+            </div>
+          )}
+          <div className="ibx-pub-go">
+            <button
+              className="btn btn-primary"
+              disabled={busy || (note.trim() === "" && files.length === 0)}
+              onClick={() => void publish()}
+            >
+              {t("inbox.publishNow")}
             </button>
           </div>
-        )}
-        <p className="section-hint" style={{ marginTop: "var(--s-2)" }}>
-          {t("inbox.trustHint")}
-        </p>
-      </section>
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2 className="panel-title">
-            {t("inbox.publish")}
-            <span className="sub">{t("inbox.publishSub")}</span>
-          </h2>
-        </div>
-        <div className="field-row">
-          <input
-            value={note}
-            aria-label={t("inbox.notePlaceholder")}
-            placeholder={t("inbox.notePlaceholder")}
-            onChange={(e) => setNote(e.target.value)}
-          />
-          <button
-            className="btn btn-primary"
-            disabled={busy || (note.trim() === "" && files.length === 0)}
-            onClick={() => void publish()}
-          >
-            {t("inbox.publishNow")}
-          </button>
-        </div>
-        <div className="attach-row">
-          <button className="btn" disabled={busy} onClick={() => void chooseFiles()}>
-            <IconPaperclip size={14} />
-            {t("inbox.attachFiles")}
-          </button>
-          <span className="section-hint">{t("inbox.attachHint")}</span>
-        </div>
-        {files.length > 0 && (
-          <div className="attach-chips">
-            {files.map((f) => (
-              <span className="pill" key={f}>
-                <IconPaperclip size={12} />
-                {baseName(f)}
-                <button
-                  className="attach-x"
-                  aria-label={t("inbox.attachRemove", { name: baseName(f) })}
-                  onClick={() => setFiles(files.filter((x) => x !== f))}
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        {supersedable.length > 0 && (
-          <div className="supersede-row">
-            <label className="field">
-              <span>{t("inbox.supersedeLabel")}</span>
-              <select
-                value={supersedesValue}
-                disabled={busy}
-                onChange={(e) => setSupersedes(e.target.value)}
-              >
-                <option value="">{t("inbox.supersedeNone")}</option>
-                {supersedable.map((row) => (
-                  // Note first, id second: the note is how the publisher
-                  // recognises which envelope this is. Separated by a middot,
-                  // not parentheses — the note is user text in either locale and
-                  // the id is Latin, so a bracket pair would have to pick a width.
-                  <option key={row.id} value={row.id}>
-                    {row.note ? `${row.note} · ${row.id.slice(0, 8)}` : row.id.slice(0, 8)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <TeachingHint id="inbox-supersede">{t("inbox.supersedeHint")}</TeachingHint>
-          </div>
-        )}
-        {!loading && (data?.outbox ?? []).length === 0 && (
-          <EmptyState title={t("inbox.outboxEmpty")} hint={t("inbox.outboxEmptyHint")} />
-        )}
-        {(data?.outbox ?? []).length > 0 && (
-          <>
-            <p className="section-hint" style={{ margin: "var(--s-3) 0 var(--s-2)" }}>
-              {t("inbox.pendingHint")}
-            </p>
-            {(data?.outbox ?? []).slice(0, outboxShown).map((row) => (
-              <div className="settings-row mail-row" key={row.id}>
-                <div className="sr-body">
-                  <div className="sr-title mail-line">
-                    <span className="mail-note mail-note--lead">
-                      {row.note ?? row.id.slice(0, 8)}
-                    </span>
-                    {row.attachmentCount > 0 && (
-                      <span className="pill attach-count">
-                        <IconPaperclip size={12} />
-                        {row.attachmentCount}
-                      </span>
-                    )}
-                    {/* Same mark and wording as the Teams send surface, where
-                        the choice of what to actually send is made — one fact,
-                        one vocabulary. Marked, never hidden: which envelope
-                        goes out stays the user's call. */}
-                    {row.supersededBy && (
-                      <span className="pill superseded">{t("teams.superseded")}</span>
-                    )}
-                  </div>
-                  {/* Kept on its own line: the supersede chain is a sentence
-                      about two ids, which the right-hand meta column has no
-                      room for without pushing the note out of the row. */}
-                  {(row.supersededBy || row.supersedes) && (
-                    <div className="sr-desc">
-                      {row.supersededBy &&
-                        t("teams.supersededBy", { id: row.supersededBy.slice(0, 8) })}
-                      {/* The forward link, shown only here: this is the publisher's
-                          own outbox, so "what did I say this corrects" is the
-                          confirmation that the declaration landed. */}
-                      {row.supersededBy && row.supersedes && " · "}
-                      {row.supersedes &&
-                        t("inbox.supersedesMark", { id: row.supersedes.slice(0, 8) })}
-                    </div>
-                  )}
+          {data !== null && outbox.length === 0 && (
+            <EmptyState title={t("inbox.outboxEmpty")} hint={t("inbox.outboxEmptyHint")} />
+          )}
+          {outbox.length > 0 && (
+            <>
+              <p className="ibx-pending">{t("inbox.pendingHint")}</p>
+              <ul className="mails">
+                {outbox.slice(0, outboxShown).map((row, i) => {
+                  const m = rowMotion("out", row.id, i);
+                  return (
+                    <li
+                      className={`mail${row.supersededBy ? " superseded" : ""}${m.cls}`}
+                      style={m.style}
+                      key={row.id}
+                      data-row={row.id}
+                    >
+                      <span className="mail-dot out" aria-hidden="true" />
+                      <div className="mail-body">
+                        <div className="mail-line">
+                          <span className="mail-note lead">{row.note ?? row.id.slice(0, 8)}</span>
+                          {row.attachmentCount > 0 && (
+                            <span className="mail-att" title={t("inbox.attachments", { n: row.attachmentCount })}>
+                              <IconPaperclip size={11} />
+                              {row.attachmentCount}
+                            </span>
+                          )}
+                          {/* Same wording as the Teams send surface, where the
+                              choice of what to actually send is made — one fact,
+                              one vocabulary. Marked, never hidden: which envelope
+                              goes out stays the user's call. */}
+                          {row.supersededBy && <span className="pill-sup">{t("teams.superseded")}</span>}
+                        </div>
+                        {/* Its own line: the supersede chain is a sentence about
+                            two ids, which the meta column has no room for. */}
+                        {(row.supersededBy || row.supersedes) && (
+                          <div className="mail-desc">
+                            {row.supersededBy &&
+                              t("teams.supersededBy", { id: row.supersededBy.slice(0, 8) })}
+                            {/* The forward link, shown only here: this is the publisher's
+                                own outbox, so "what did I say this corrects" is the
+                                confirmation that the declaration landed. */}
+                            {row.supersededBy && row.supersedes && " · "}
+                            {row.supersedes &&
+                              t("inbox.supersedesMark", { id: row.supersedes.slice(0, 8) })}
+                          </div>
+                        )}
+                      </div>
+                      <div className="mail-meta">
+                        <TimeAgo at={row.publishedAt} />
+                      </div>
+                      <button
+                        className="btn btn-small btn-ghost"
+                        aria-label={t("inbox.viewOutbox", {
+                          summary: summarise(row.note, row.id.slice(0, 8)),
+                        })}
+                        onClick={() => void view(row, "outbox")}
+                      >
+                        {t("inbox.view")}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {outbox.length > outboxShown && (
+                <div className="mail-foot">
+                  <button className="btn btn-small" onClick={() => showMore("out")}>
+                    {t("inbox.showMore", { n: outbox.length - outboxShown })}
+                  </button>
                 </div>
-                <div className="mail-meta">
-                  <TimeAgo at={row.publishedAt} />
-                </div>
-                <button
-                  className="btn btn-ghost"
-                  aria-label={t("inbox.viewOutbox", {
-                    summary: summarise(row.note, row.id.slice(0, 8)),
-                  })}
-                  onClick={() => void view(row, "outbox")}
-                >
-                  {t("inbox.view")}
-                </button>
-              </div>
-            ))}
-            {(data?.outbox ?? []).length > outboxShown && (
-              <div className="mail-foot">
-                <button className="btn" onClick={() => setOutboxShown((n) => n + PAGE)}>
-                  {t("inbox.showMore", { n: (data?.outbox ?? []).length - outboxShown })}
-                </button>
-              </div>
-            )}
-          </>
-        )}
-      </section>
+              )}
+            </>
+          )}
+        </section>
+      </div>
 
       {open && (
-        <Modal reader label={t("inbox.envelope")} onClose={() => setOpen(null)}>
-          <div className="form">
-            <h2 className="form-heading">{open.from.name}</h2>
-            <p className="muted" style={{ margin: 0 }}>
-              {open.deliveredVia ? `${t("teams.viaTeam")} ${open.deliveredVia.teamName} · ` : ""}
-              {absoluteTime(open.deliveredAt ?? open.publishedAt, i18n.language)} · {open.id}
-            </p>
-            <p className="section-hint" style={{ margin: 0 }}>
-              {t("inbox.trustHint")}
-            </p>
-            {open.payload.note && <p className="delivery-note">{open.payload.note}</p>}
-            {open.payload.attachments && open.payload.attachments.length > 0 && (
-              <div className="attach-list">
-                <h3 className="attach-title">
-                  {t("inbox.attachments", { n: open.payload.attachments.length })}
-                </h3>
-                {open.attachmentDir && <PathLabel path={open.attachmentDir} />}
-                <ul className="attach-files">
-                  {/* Show the path when there is one: it is where the file
-                      actually sits under the directory above, and the name
-                      alone is ambiguous now that two capabilities can both
-                      deliver a spec.md. */}
-                  {open.payload.attachments.map((att) => (
-                    <li key={att.path || att.name}>
-                      <span className="attach-name">{att.path || att.name}</span>
-                      <span className="attach-size muted">{formatBytes(att.sizeBytes)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {decisionDraft !== null ? (
-              <>
-                <label className="field">
-                  <span>{t("inbox.decisionLabel")}</span>
-                  <textarea
-                    className="note-input"
-                    rows={3}
-                    autoFocus
-                    value={decisionDraft}
-                    onChange={(e) => setDecisionDraft(e.target.value)}
-                  />
-                </label>
-                <div className="form-actions">
-                  <button className="btn" onClick={() => setDecisionDraft(null)}>
-                    {t("common.cancel")}
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    disabled={busy || decisionDraft.trim() === ""}
-                    onClick={() => void saveDecision()}
-                  >
-                    {t("inbox.decisionSave")}
-                  </button>
-                </div>
-              </>
-            ) : (
-              <div className="form-actions">
-                <button className="btn" onClick={() => setOpen(null)}>
-                  {t("common.close")}
+        <Modal reader grow className="env-dlg" label={t("inbox.envelope")} onClose={() => closeEnvelope()}>
+          <h2 className="env-title">{open.from.name}</h2>
+          <p className="env-meta">
+            {open.deliveredVia ? `${t("teams.viaTeam")} ${open.deliveredVia.teamName} · ` : ""}
+            {absoluteTime(open.deliveredAt ?? open.publishedAt, i18n.language)} ·{" "}
+            <span className="mono">{open.id}</span>
+          </p>
+          <p className="env-trust">{t("inbox.trustHint")}</p>
+          {open.payload.note && <p className="env-note">{open.payload.note}</p>}
+          {open.payload.attachments && open.payload.attachments.length > 0 && (
+            <div className="env-att">
+              <h3>{t("inbox.attachments", { n: open.payload.attachments.length })}</h3>
+              {open.attachmentDir && <PathLabel path={open.attachmentDir} />}
+              <ul>
+                {/* Show the path when there is one: it is where the file
+                    actually sits under the directory above, and the name
+                    alone is ambiguous now that two capabilities can both
+                    deliver a spec.md. */}
+                {open.payload.attachments.map((att) => (
+                  <li key={att.path || att.name}>
+                    <span className="env-an">{att.path || att.name}</span>
+                    <span className="env-as">{formatBytes(att.sizeBytes)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {decisionDraft !== null ? (
+            <div className={`env-dec${swapped ? " env-swap" : ""}`}>
+              <label>
+                <span>{t("inbox.decisionLabel")}</span>
+                <textarea
+                  ref={decisionRef}
+                  className="note-input"
+                  rows={5}
+                  value={decisionDraft}
+                  onChange={(e) => setDecisionDraft(e.target.value)}
+                />
+              </label>
+              <div className="env-acts">
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setSwapped(true);
+                    setDecisionDraft(null);
+                  }}
+                >
+                  {t("common.cancel")}
                 </button>
-                {open.deliveredAt != null && (
-                  <>
-                    <button className="btn" disabled={busy} onClick={() => startDecision(open)}>
-                      {t("inbox.toDecision")}
-                    </button>
-                    <button
-                      className="btn btn-primary"
-                      disabled={busy}
-                      onClick={() => void toTask(open)}
-                    >
-                      {t("inbox.toTask")}
-                    </button>
-                  </>
-                )}
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || decisionDraft.trim() === ""}
+                  onClick={() => void saveDecision()}
+                >
+                  {t("inbox.decisionSave")}
+                </button>
               </div>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div className={`env-acts${swapped ? " env-swap" : ""}`}>
+              <button className="btn" onClick={() => closeEnvelope()}>
+                {t("common.close")}
+              </button>
+              {open.deliveredAt != null && (
+                <>
+                  <button className="btn" disabled={busy} onClick={() => startDecision(open)}>
+                    {t("inbox.toDecision")}
+                  </button>
+                  <button className="btn btn-primary" disabled={busy} onClick={() => void toTask(open)}>
+                    {t("inbox.toTask")}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
         </Modal>
       )}
     </div>

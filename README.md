@@ -10,7 +10,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/Tauri%20v2-Rust%20%2B%20React-informational" alt="Tauri v2, Rust and React" />
-  <img src="https://img.shields.io/badge/status-in_development-informational" alt="In development" />
+  <img src="https://img.shields.io/github/v/release/white1024/agent-nextup?label=release&color=informational" alt="Latest release" />
   <img src="https://img.shields.io/badge/license-MIT-informational" alt="MIT licence" />
 </p>
 
@@ -23,7 +23,7 @@ An AI session is short and forgetful; a real project is long and full of context
 Agent NextUp keeps that context in files the engine keeps fresh. You make the decisions, your agent does the work, and a handoff stays possible at every moment.
 
 > [!IMPORTANT]
-> Installers are on the [releases page](https://github.com/white1024/agent-nextup/releases), for Windows x64, Linux x64 and macOS arm64. They are unsigned builds — Windows and macOS both stop the first launch, and [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each. From 0.2.0 an installed copy updates itself when you ask it to, from Settings. Development is Windows-first. [Quick start](#quick-start) covers both downloading and building from source.
+> Installers are on the [releases page](https://github.com/white1024/agent-nextup/releases), for Windows x64, Linux x64 and macOS arm64. They are unsigned builds — Windows and macOS both stop the first launch, and [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each. An installed copy updates itself when you ask it to, from Settings. Development is Windows-first. [Quick start](#quick-start) covers both downloading and building from source.
 
 ## What it organises
 
@@ -45,7 +45,7 @@ Any body of work — software, research, a side business, life planning — into
 - **A handoff that is never stale.** The snapshot regenerates on task, decision, milestone, and phase changes, so it is never older than your last action.
 - **Claimed done is not done.** Completing a task records a claim; verification is a separate mark that *requires* evidence, and the bulk archive sweep collects only verified work, deliberately leaving the rest on the list where you can see it.
 - **Agent reach is an allowlist.** Agents reach your project through the **hub** — `nextup-mcp`, a local MCP server bundled with the app that the agent CLI starts for each session. One master switch decides whether agents reach the hub at all; with it on, read-only tools need no further setup, and writes are authorised per tool, with the gatekeeping ones off by default unless you choose, when creating a project, to grant everything. Every call — including denied ones — lands in the ledger.
-- **Parallel agents can't jump the queue.** Give tasks an assignee and prerequisites and the engine refuses out-of-order starts and finishes. Claims cannot be stolen.
+- **Parallel agents can't jump the queue.** The engine refuses to start or finish a task before its prerequisites are done, in every workspace. With the collaboration module on, tasks also get an assignee, you set prerequisites from the app, and claims cannot be stolen.
 - **A terminal that runs the real CLIs.** A genuine PTY process per agent CLI, rooted at the workspace. Sessions belong to the app, so switching projects doesn't interrupt them, and a running terminal can pop out into its own window.
 - **Projects can feed each other.** Wire workspaces into a directed graph and one project delivers to another's inbox, with attachments. A member's agent can publish but never route — routing is a human action, a per-edge automation a human switches on, or a coordinator project a human puts in charge. Inbox content is defined as data, not instructions.
 - **One project can run the team.** Name a project as a team's *coordinator* and its agent gets the app-level view: the flow graph, routing on a member's behalf, the roster — it can bring a project in, take one out, even create a new project to bring in — and, member by member, a read of the task text, ledger and specs you would get by opening it. Naming a detail read leaves a line in that member's own ledger, so being read is not invisible; the cheap per-member summaries do not. A coordinator is not a member of the team it runs; it sits above the flow, with no node on the canvas. What it does not do is the work: no creating tasks, advancing phases, or marking anyone's result verified. The one write it has inside a member is the sign-off — archiving a finished task, which folds that task's spec delta and is refused until the task is verified — and that is a separate grant from reading. Authority is per team, granted tool by tool, and the coordinator cannot grant it to itself.
@@ -53,7 +53,7 @@ Any body of work — software, research, a side business, life planning — into
 - **Search and portable backups.** Full-text search over the workspace (language-agnostic chunking into an SQLite FTS5 index), and export/import of the management layer — tasks, specs, ledger and handoff material — as a zip you can carry to another machine. Your own source files are not in it: they travel with the folder, or with git.
 
 > [!NOTE]
-> Four of the bullets above are **capability modules**, not always-on features: collaboration (assignees and prerequisites), teams, team coordination, and the spec layer. You tick them on when you create the workspace, and a fresh project ships with none of them enabled. Every other bullet is always on.
+> Four of the bullets above are **capability modules**, not always-on features: collaboration (assignees, claims, and setting prerequisites from the app — the engine enforces prerequisites everywhere), teams, team coordination, and the spec layer. You tick them on when you create the workspace, and a fresh project ships with none of them enabled. Every other bullet is always on.
 
 ## How it works
 
@@ -119,7 +119,7 @@ Both listings above are abridged. The authoritative account of what lands on dis
 | macOS arm64 | `.dmg` |
 | Linux x64 | `.deb`, `.AppImage`, or `.rpm` |
 
-Nothing carries a publisher certificate and nothing is notarized, so the first launch is stopped: SmartScreen on Windows, Gatekeeper on macOS. [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each. From 0.2.0 on, **Settings → About → Check for updates** installs a newer version for you, verified against a signature first; nothing is checked in the background. Earlier versions and the Windows portable zip mean coming back here for it.
+Nothing carries a publisher certificate and nothing is notarized, so the first launch is stopped: SmartScreen on Windows, Gatekeeper on macOS. [reference/building](https://white1024.github.io/agent-nextup/reference/building/#unsigned-builds) has the click path past each. Once installed, **Settings → About → Check for updates** installs a newer version for you, verified against a signature first; nothing is checked in the background. The Windows portable zip, and any copy older than 0.2.0, mean coming back here for it.
 
 <details>
 <summary><strong>Or build from source</strong></summary>
@@ -195,7 +195,7 @@ See [reference/building](https://white1024.github.io/agent-nextup/reference/buil
 
 ## Status
 
-In active development. The [releases page](https://github.com/white1024/agent-nextup/releases) carries unsigned builds for three platforms — take the newest; from 0.2.0 the app updates itself when you ask it to.
+Actively developed. The [releases page](https://github.com/white1024/agent-nextup/releases) carries unsigned builds for three platforms — take the newest; once installed, the app updates itself when you ask it to (Settings → About).
 
 **Working** — the workspace engine and disk contract; the phase/gate harness (the workflow of phases, each closed by exit gates) and its built-in templates; the handoff layer; the hub MCP server with per-tool authorisation; the embedded agent terminal, including custom CLI entries carrying environment variables, which is how you point one at a local model; adopting an existing project through a wizard that analyses read-only and never overwrites; milestones; full-text search; portable backups. As opt-in modules: collaboration, teams and cross-project delivery, team coordination, and the spec layer.
 
@@ -203,4 +203,4 @@ In active development. The [releases page](https://github.com/white1024/agent-ne
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). The bundled typefaces (SIL Open Font License 1.1) and the workflow skills adapted from [mattpocock/skills](https://github.com/mattpocock/skills) (MIT) carry their own notices — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

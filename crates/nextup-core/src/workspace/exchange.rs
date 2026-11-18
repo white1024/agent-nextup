@@ -136,6 +136,20 @@ pub struct DeliveryEnvelope {
     /// several teams, and downstream audit must tell the flows apart (09 §4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_via: Option<DeliveredVia>,
+    /// When this project's own agent first opened the envelope through the
+    /// hub's `get_delivery` (D160), and the name it gave. Stamped on the inbox
+    /// copy only, first read wins — see [`mark_read_by_agent`].
+    ///
+    /// Stored in the workspace, unlike the human's "seen" marks, which live in
+    /// each machine's localStorage (D62 ⑤). The two are different facts:
+    /// "have *I* looked at this" belongs to one person at one desk, while
+    /// "this project's agent has picked it up" is true for everyone who opens
+    /// the project — and it is what ends the wait a delivery toast announces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_read_at: Option<String>,
+    /// Self-declared, like every actor (D31) — attribution, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_read_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -471,6 +485,8 @@ pub fn publish_delivery(
             superseded_by: None,
             delivered_at: None,
             delivered_via: None,
+            agent_read_at: None,
+            agent_read_by: None,
         };
         atomic_write_json(&envelope_file(paths, DeliveryBox::Outbox, &envelope.id), &envelope)?;
 
@@ -570,8 +586,10 @@ impl RouteOptions {
     }
 }
 
-/// Route one outbox envelope to the selected destinations (app layer only —
-/// the hub has no tool for this; 09 §5). Per destination: lock the downstream
+/// Route one outbox envelope to the selected destinations. Callers: a person
+/// pressing send (app layer, 09 §5), a coordinator's `team_route` (D116), and
+/// `auto_route` along automatic edges — from the app's sweep and from the
+/// hub's `publish_delivery` (D152). Per destination: lock the downstream
 /// workspace, write the stamped copy into its inbox (idempotent by id) and
 /// ledger `delivery_received` there. Afterwards, under the upstream lock:
 /// ledger `delivery_routed` per new delivery and remove the outbox original
@@ -632,6 +650,9 @@ pub fn route_delivery(
             copy.delivered_at = Some(now_rfc3339());
             copy.delivered_via =
                 Some(DeliveredVia { team_id: dest.team_id.clone(), team_name: dest.team_name.clone() });
+            // Read marks are the receiver's (D160); an arrival has had none.
+            copy.agent_read_at = None;
+            copy.agent_read_by = None;
             atomic_write_json(&target, &copy)?;
             ledger_for(&down).append(&LedgerEvent::new(
                 LedgerKind::DeliveryReceived,
@@ -683,6 +704,94 @@ pub fn route_delivery(
     Ok(outcome)
 }
 
+/// What [`auto_route`] did with one outbox envelope.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRouted {
+    pub envelope_id: String,
+    /// The route's result — destinations that took it, already had it, or
+    /// could not be reached. `None` when routing raised an error instead.
+    pub outcome: Option<RouteOutcome>,
+    /// Why routing this envelope failed outright (unreadable envelope, a
+    /// failed write on this side). Per envelope, so one bad file does not stop
+    /// the rest of the outbox from going out.
+    pub error: Option<String>,
+}
+
+/// Send `upstream`'s pending envelopes along every edge a human marked
+/// automatic (D71) — the one copy of that policy. `only` narrows it to one
+/// envelope, which is what a publish asks for.
+///
+/// D152 moved this here from the GUI, and moved *when* it runs: the hub calls
+/// it the moment an agent publishes, so an automatic line no longer waits for
+/// the app to happen to look. The app still calls it on its own triggers,
+/// which is how a delivery that could not be sent at publish time (downstream
+/// offline, app-level store unreadable) goes out later.
+///
+/// The rules, unchanged from the GUI sweep:
+/// - **who I am** is this workspace's own `workspaceId`, never a path match —
+///   member roots in `teams.json` are display caches;
+/// - **only automatic edges** are sent, and while any manual edge leaves this
+///   workspace the original stays pending (`keep_pending`): nobody decided to
+///   skip those (13 §3);
+/// - **a superseded envelope never travels** on its own — its publisher has
+///   declared it wrong, an automatic line has nobody to read that tag, and a
+///   delivery cannot be recalled. The correction is what goes out;
+/// - **`not_found` is not a failure**: a concurrent sender (the app and a hub,
+///   two sweeps) already moved the envelope.
+///
+/// Envelopes go oldest first, so a downstream receives them in publish order.
+/// Policy-triggered routes carry ` (auto)` on both sides' ledger lines.
+pub fn auto_route(
+    upstream: &WorkspacePaths,
+    app_version: &str,
+    teams: &[crate::workspace::teams::Team],
+    only: Option<&str>,
+) -> Result<Vec<AutoRouted>> {
+    let ctx = load_context(&upstream.context_file())?;
+    let Some(me) = ctx.workspace_id.as_deref() else {
+        // Never joined a team: no id was minted, so no edge can name it.
+        return Ok(Vec::new());
+    };
+    let mut destinations = Vec::new();
+    let mut manual_edges = 0usize;
+    for team in teams {
+        for edge in team.edges.iter().filter(|e| e.from == me) {
+            if !edge.auto_route {
+                manual_edges += 1;
+                continue;
+            }
+            if let Some(target) = team.members.iter().find(|m| m.workspace_id == edge.to) {
+                destinations.push(RouteDestination {
+                    root: PathBuf::from(&target.root),
+                    team_id: team.id.clone(),
+                    team_name: team.name.clone(),
+                });
+            }
+        }
+    }
+    if destinations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pending: Vec<DeliverySummary> = list_deliveries(upstream, DeliveryBox::Outbox, NoteDetail::Brief)?
+        .into_iter()
+        .filter(|row| row.superseded_by.is_none())
+        .filter(|row| only.is_none_or(|id| row.id == id))
+        .collect();
+    pending.reverse(); // list_deliveries is newest first
+    let opts = RouteOptions { auto: true, keep_pending: manual_edges > 0, actor: None };
+    let mut results = Vec::with_capacity(pending.len());
+    for row in pending {
+        match route_delivery(upstream, app_version, &row.id, &destinations, opts.clone()) {
+            Ok(outcome) => results.push(AutoRouted { envelope_id: row.id, outcome: Some(outcome), error: None }),
+            Err(e) if e.kind() == "not_found" => {}
+            Err(e) => results.push(AutoRouted { envelope_id: row.id, outcome: None, error: Some(e.to_string()) }),
+        }
+    }
+    Ok(results)
+}
+
 /// Listing row: the envelope's headline fields (note + attachment count) without
 /// the full attachment manifest.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -712,6 +821,11 @@ pub struct DeliverySummary {
     pub delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_via: Option<DeliveredVia>,
+    /// Straight from the manifest — see `DeliveryEnvelope::agent_read_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_read_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_read_by: Option<String>,
 }
 
 /// List one box, newest first. Unparsable files are skipped — hiding the
@@ -761,6 +875,8 @@ pub fn list_deliveries(
             published_at: envelope.published_at,
             delivered_at: envelope.delivered_at,
             delivered_via: envelope.delivered_via,
+            agent_read_at: envelope.agent_read_at,
+            agent_read_by: envelope.agent_read_by,
         });
     }
     rows.sort_by(|a, b| {
@@ -786,6 +902,39 @@ pub fn get_delivery(
     let envelope: DeliveryEnvelope = read_json_file(&path)?;
     check_schema(&envelope)?;
     Ok(envelope)
+}
+
+/// Record that this project's agent has opened an inbox envelope (D160), so
+/// the GUI stops announcing it: a delivery toast says "someone is waiting on
+/// this project", and once the project's own agent has read the envelope,
+/// nobody is.
+///
+/// Called by the hub after `get_delivery` reads the inbox — never by the GUI,
+/// whose reads are the human's and stay in localStorage (D62 ⑤), and never on
+/// the outbox, which holds this project's own words. The first read wins: a
+/// later read by another agent does not move the time or the name, because
+/// the question the stamp answers is "has it been picked up", not "who looked
+/// last".
+///
+/// Returns whether this call stamped anything. Rewriting the envelope is what
+/// tells an open app: `.nextup/exchange` is on the watcher's whitelist.
+pub fn mark_read_by_agent(paths: &WorkspacePaths, id: &str, actor: Option<&str>) -> Result<bool> {
+    validate_envelope_id(id)?;
+    with_mutation_lock(paths, || {
+        let path = envelope_file(paths, DeliveryBox::Inbox, id);
+        if !path.is_file() {
+            return Err(NextUpError::NotFound(format!("no delivery {id} in the inbox")));
+        }
+        let mut envelope: DeliveryEnvelope = read_json_file(&path)?;
+        check_schema(&envelope)?;
+        if envelope.agent_read_at.is_some() {
+            return Ok(false);
+        }
+        envelope.agent_read_at = Some(now_rfc3339());
+        envelope.agent_read_by = actor.map(str::to_string);
+        atomic_write_json(&path, &envelope)?;
+        Ok(true)
+    })
 }
 
 #[cfg(test)]
@@ -935,6 +1084,59 @@ mod tests {
             .unwrap();
         assert_eq!(down_log.len(), 1);
         assert!(down_log[0].message.contains("alpha"));
+    }
+
+    /// D160: the agent's read lands on the inbox copy once, shows in the
+    /// listing, and leaves nothing else behind.
+    #[test]
+    fn agent_read_stamps_the_inbox_copy_once() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        let envelope = publish_delivery(&up, "0.1.0", Some("read me".into()), &[], PublishOptions::default()).unwrap();
+        route_delivery(&up, "0.1.0", &envelope.id, &[dest(&down, "t")], RouteOptions::default()).unwrap();
+
+        let row = |paths: &WorkspacePaths| {
+            list_deliveries(paths, DeliveryBox::Inbox, NoteDetail::Brief).unwrap().remove(0)
+        };
+        assert!(row(&down).agent_read_at.is_none(), "an arrival has not been read");
+        let ledger_len = || std::fs::read_to_string(down.ledger_file()).unwrap().lines().count();
+        let lines_before = ledger_len();
+
+        assert!(mark_read_by_agent(&down, &envelope.id, Some("researcher")).unwrap());
+        let first = row(&down);
+        assert!(first.agent_read_at.is_some());
+        assert_eq!(first.agent_read_by.as_deref(), Some("researcher"));
+
+        // First read wins: neither the time nor the name moves.
+        assert!(!mark_read_by_agent(&down, &envelope.id, Some("reviewer")).unwrap());
+        let second = row(&down);
+        assert_eq!(second.agent_read_at, first.agent_read_at);
+        assert_eq!(second.agent_read_by.as_deref(), Some("researcher"));
+
+        // The envelope is the record; the ledger gets nothing new.
+        assert_eq!(ledger_len(), lines_before);
+        // The payload survives the rewrite untouched.
+        let full = get_delivery(&down, DeliveryBox::Inbox, &envelope.id).unwrap();
+        assert_eq!(full.payload.note.as_deref(), Some("read me"));
+        assert!(full.delivered_via.is_some());
+
+        // Inbox only, and the id is checked before it becomes a path.
+        assert_eq!(mark_read_by_agent(&up, &envelope.id, None).unwrap_err().kind(), "not_found");
+        assert_eq!(mark_read_by_agent(&down, "../context", None).unwrap_err().kind(), "invalid_input");
+    }
+
+    /// An anonymous agent still counts as having picked the envelope up.
+    #[test]
+    fn agent_read_without_a_name_still_counts() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        let envelope = publish_delivery(&up, "0.1.0", Some("n".into()), &[], PublishOptions::default()).unwrap();
+        route_delivery(&up, "0.1.0", &envelope.id, &[dest(&down, "t")], RouteOptions::default()).unwrap();
+
+        assert!(mark_read_by_agent(&down, &envelope.id, None).unwrap());
+        let row = list_deliveries(&down, DeliveryBox::Inbox, NoteDetail::Full).unwrap().remove(0);
+        assert!(row.agent_read_at.is_some());
+        assert!(row.agent_read_by.is_none());
     }
 
     #[test]
@@ -1207,6 +1409,145 @@ mod tests {
             .recent_of_kind(LedgerKind::DeliveryReceived, 5)
             .unwrap();
         assert!(down_log[0].message.ends_with(" (auto)"));
+    }
+
+    /// A one-team graph: `up` delivers to each of `downs`, automatically or not.
+    /// Member ids for the downstreams are arbitrary — routing goes by root.
+    fn graph(up: &WorkspacePaths, downs: &[(&WorkspacePaths, bool)]) -> Vec<crate::workspace::teams::Team> {
+        use crate::workspace::teams::{Team, TeamEdge, TeamMember};
+        let up_id = load_context(&up.context_file()).unwrap().workspace_id.expect("published, so minted");
+        let mut members = vec![TeamMember { workspace_id: up_id.clone(), root: up.root().display().to_string(), name: "up".into() }];
+        let mut edges = Vec::new();
+        for (i, (down, auto)) in downs.iter().enumerate() {
+            let id = format!("down-{i}");
+            members.push(TeamMember { workspace_id: id.clone(), root: down.root().display().to_string(), name: id.clone() });
+            edges.push(TeamEdge { from: up_id.clone(), to: id, auto_route: *auto });
+        }
+        vec![Team {
+            id: "team-1".into(),
+            name: "t".into(),
+            members,
+            edges,
+            layout: Default::default(),
+            orbit_layout: Default::default(),
+            prime: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        }]
+    }
+
+    fn inbox_ids(paths: &WorkspacePaths) -> Vec<String> {
+        list_deliveries(paths, DeliveryBox::Inbox, NoteDetail::Brief).unwrap().into_iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn auto_route_sends_along_automatic_edges_and_clears_when_nothing_is_manual() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        let envelope = publish_delivery(&up, "0.1.0", Some("hello".into()), &[], PublishOptions::default()).unwrap();
+
+        let results = auto_route(&up, "0.1.0", &graph(&up, &[(&down, true)]), None).unwrap();
+        assert_eq!(results.len(), 1);
+        let outcome = results[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.delivered, vec!["beta".to_string()]);
+        assert!(outcome.outbox_cleared);
+        assert_eq!(inbox_ids(&down), vec![envelope.id]);
+        let up_log = Ledger::new(up.ledger_file()).recent_of_kind(LedgerKind::DeliveryRouted, 5).unwrap();
+        assert!(up_log[0].message.ends_with(" (auto)"), "policy, not a human press");
+    }
+
+    #[test]
+    fn auto_route_leaves_the_envelope_pending_while_a_manual_edge_remains() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, auto_down) = workspace("beta");
+        let (_gc, manual_down) = workspace("gamma");
+        publish_delivery(&up, "0.1.0", Some("hello".into()), &[], PublishOptions::default()).unwrap();
+
+        let results = auto_route(&up, "0.1.0", &graph(&up, &[(&auto_down, true), (&manual_down, false)]), None).unwrap();
+        let outcome = results[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.delivered, vec!["beta".to_string()]);
+        assert!(!outcome.outbox_cleared, "nobody decided to skip the manual edge");
+        assert_eq!(list_deliveries(&up, DeliveryBox::Outbox, NoteDetail::Brief).unwrap().len(), 1);
+        assert!(inbox_ids(&manual_down).is_empty(), "a manual edge is never sent by policy");
+    }
+
+    #[test]
+    fn auto_route_never_forwards_a_superseded_envelope() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        let wrong = publish_delivery(&up, "0.1.0", Some("v1".into()), &[], PublishOptions::default()).unwrap();
+        let fixed = publish_delivery(
+            &up,
+            "0.1.0",
+            Some("v2".into()),
+            &[],
+            PublishOptions { supersedes: Some(wrong.id.clone()) },
+        )
+        .unwrap();
+
+        auto_route(&up, "0.1.0", &graph(&up, &[(&down, true)]), None).unwrap();
+        assert_eq!(inbox_ids(&down), vec![fixed.id], "only the correction travels");
+        let still: Vec<_> = list_deliveries(&up, DeliveryBox::Outbox, NoteDetail::Brief).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(still, vec![wrong.id], "the wrong one waits, tagged, for a human");
+    }
+
+    #[test]
+    fn auto_route_can_be_narrowed_to_the_envelope_just_published() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        let older = publish_delivery(&up, "0.1.0", Some("older".into()), &[], PublishOptions::default()).unwrap();
+        let newer = publish_delivery(&up, "0.1.0", Some("newer".into()), &[], PublishOptions::default()).unwrap();
+
+        let results = auto_route(&up, "0.1.0", &graph(&up, &[(&down, true)]), Some(&newer.id)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(inbox_ids(&down), vec![newer.id]);
+        // A later full sweep picks up the rest, oldest first.
+        auto_route(&up, "0.1.0", &graph(&up, &[(&down, true)]), None).unwrap();
+        assert!(inbox_ids(&down).contains(&older.id));
+    }
+
+    #[test]
+    fn auto_route_does_nothing_without_an_automatic_edge_or_a_team_identity() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, down) = workspace("beta");
+        // Never published: no workspace id was minted, so no edge can name it.
+        assert!(auto_route(&up, "0.1.0", &[], None).unwrap().is_empty());
+
+        publish_delivery(&up, "0.1.0", Some("hello".into()), &[], PublishOptions::default()).unwrap();
+        assert!(auto_route(&up, "0.1.0", &graph(&up, &[(&down, false)]), None).unwrap().is_empty());
+        assert_eq!(list_deliveries(&up, DeliveryBox::Outbox, NoteDetail::Brief).unwrap().len(), 1);
+        assert!(inbox_ids(&down).is_empty());
+    }
+
+    /// D161 let a team loop, and its safety argument is this test: with both
+    /// a → b and b → a automatic, a delivery crosses once and stops. Arriving
+    /// publishes nothing, and `auto_route` only ever moves the *sender's*
+    /// outbox — so the sweep the app runs over b afterwards has nothing to
+    /// send back. Every further hop takes somebody publishing again.
+    #[test]
+    fn a_loop_of_automatic_edges_does_not_bounce_a_delivery() {
+        use crate::workspace::ops::ensure_workspace_id;
+        use crate::workspace::teams::TeamEdge;
+        let (_ga, a) = workspace("alpha");
+        let (_gb, b) = workspace("beta");
+        let envelope = publish_delivery(&a, "0.1.0", Some("for b".into()), &[], PublishOptions::default()).unwrap();
+        let a_id = load_context(&a.context_file()).unwrap().workspace_id.unwrap();
+        let b_id = ensure_workspace_id(&b, "0.1.0").unwrap();
+
+        let mut teams = graph(&a, &[(&b, true)]);
+        let team = &mut teams[0];
+        team.members[1].workspace_id = b_id.clone();
+        team.edges[0].to = b_id.clone();
+        team.edges.push(TeamEdge { from: b_id, to: a_id, auto_route: true });
+
+        auto_route(&a, "0.1.0", &teams, None).unwrap();
+        assert_eq!(inbox_ids(&b), vec![envelope.id]);
+        assert!(list_deliveries(&b, DeliveryBox::Outbox, NoteDetail::Brief).unwrap().is_empty(), "arriving publishes nothing");
+
+        // The app sweeps every workspace with an automatic edge out of it.
+        assert!(auto_route(&b, "0.1.0", &teams, None).unwrap().is_empty());
+        assert!(auto_route(&a, "0.1.0", &teams, None).unwrap().is_empty());
+        assert!(inbox_ids(&a).is_empty(), "nothing came back round");
     }
 
     #[test]

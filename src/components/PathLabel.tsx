@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api, errorMessage } from "../api";
+import { motionOff } from "../lib/fx";
 import { IconCheck, IconCopy, IconFolder, IconWarn } from "./icons";
 
 /**
@@ -25,11 +26,14 @@ export default function PathLabel({
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
+  // C233: bumped on each successful copy so the sweep replays.
+  const [sweep, setSweep] = useState(0);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(path);
       setCopied(true);
+      if (!motionOff()) setSweep((n) => n + 1);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
       // Clipboard can be refused; the tooltip still carries the full path, so
@@ -52,13 +56,22 @@ export default function PathLabel({
     }
   }
 
+  // While a button reports something the pair stays visible (spec 20 section 4),
+  // so the result is still on screen once the pointer has moved off.
+  const hot = copied || openError !== null;
+  // A fresh key per result remounts the icon, which is what replays its pop.
+  const pop = motionOff() ? undefined : "pop";
+
   return (
-    <span className={`path-label ${className ?? ""}`} title={path}>
-      <span className="path-text">{elidePath(path)}</span>
+    <span className={`path-label ${hot ? "is-hot" : ""} ${className ?? ""}`} title={path}>
+      <span className="path-text">
+        {elidePath(path)}
+        {sweep > 0 && <i key={sweep} className="path-sweep" aria-hidden="true" />}
+      </span>
       {actions && (
         <>
           <button
-            className="btn btn-ghost btn-icon path-action"
+            className={`btn btn-ghost btn-icon path-action${openError ? " path-action--err" : ""}`}
             title={openError ?? t("common.openFolder")}
             aria-label={t("common.openFolder")}
             onClick={(e) => {
@@ -66,10 +79,14 @@ export default function PathLabel({
               void openInFileManager();
             }}
           >
-            {openError ? <IconWarn size={12} /> : <IconFolder size={12} />}
+            {openError ? (
+              <IconWarn key="warn" size={12} className={pop} />
+            ) : (
+              <IconFolder key="folder" size={12} />
+            )}
           </button>
           <button
-            className="btn btn-ghost btn-icon path-action"
+            className={`btn btn-ghost btn-icon path-action${copied ? " path-action--ok" : ""}`}
             title={copied ? t("common.copied") : t("common.copyPath")}
             aria-label={t("common.copyPath")}
             onClick={(e) => {
@@ -77,7 +94,11 @@ export default function PathLabel({
               void copy();
             }}
           >
-            {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
+            {copied ? (
+              <IconCheck key="check" size={12} className={pop} />
+            ) : (
+              <IconCopy key="copy" size={12} />
+            )}
           </button>
         </>
       )}

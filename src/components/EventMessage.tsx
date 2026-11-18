@@ -54,7 +54,7 @@ export default function EventMessage({
     <span className="event-msg" title={message === lead ? undefined : message}>
       {actor !== undefined && actor !== null && <span className="actor-chip">{actor}</span>}
       {taskId ? <span className="mono">[{taskId}] </span> : null}
-      {lead}
+      <span className="event-lead">{lead}</span>
       {tail !== "" && (
         <span ref={tailRef} className={`event-tail${expanded ? " is-open" : ""}`}>
           {tail}

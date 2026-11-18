@@ -86,7 +86,7 @@ export default function ConfirmDanger({
 }) {
   const { t } = useTranslation();
   return (
-    <Modal label={heading} onClose={onCancel}>
+    <Modal label={heading} onClose={onCancel} tone="danger" narrow>
       <div className="form">
         <h2 className="form-heading">{heading}</h2>
         {typeof body === "string" ? <p className="muted">{body}</p> : body}

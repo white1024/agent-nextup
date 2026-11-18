@@ -95,20 +95,21 @@ checked mechanically:
 
 | Folder | What belongs there | Enforced |
 |---|---|---|
-| `lib/` | plain modules: formatting, the ledger's display rules, the notification model, the auto-delivery sweep | no React, no `@tauri-apps` import, no UI imports |
+| `lib/` | plain modules: formatting, the ledger's display rules, the notification model, the auto-delivery sweep, the shared motion plumbing (page transitions, list motion) | no React, no `@tauri-apps` import, no UI imports |
 | `hooks/` | React hooks shared across screens | may not import a component, `shell/`, or a screen |
 | `components/` | pieces that **more than one** screen uses | may not import `shell/` or `views/` |
-| `shell/` | the persistent app shell's own parts: workspace switcher, command palette, toast layer, error boundary | only `App.tsx` may import them |
+| `shell/` | the persistent app shell's own parts: boot splash, the sidebar's project categories, workspace switcher, command palette, toast layer, error boundary | only `App.tsx` may import them |
 | `views/<screen>/` | one screen and the pieces only that screen uses | `index` is the screen; everything else is private to it |
 | `src/*` | entry points (`main.tsx`, `App.tsx`) and the platform boundary (`api.ts`, `types.ts`, `i18n.ts`, `theme.ts`, `zoom.ts`, `styles.css`) | — |
+| `assets/fonts/` | the bundled typefaces `styles.css` loads with `@font-face`, each with its OFL licence text | — (by convention: no code here, and every font listed in `THIRD_PARTY_NOTICES.md`) |
 
 Dependencies run downward through that table. Two of those rules are worth
 spelling out, because they are the ones you are most likely to trip over:
 
 **`lib/` is React-free** so those modules stay testable without a renderer —
 vitest runs here with no DOM. The rule is about what `lib/` may depend on, not
-about where tests live: two pure helpers are tested next to their single caller
-instead (`elidePath` in `components/PathLabel.tsx`, and `views/teams/layout.ts`).
+about where tests live: a pure helper with one home is tested next to it — in
+`components/`, `shell/` or a screen's folder under `views/`.
 
 **A screen's parts stay inside the screen.** Putting a one-caller component in
 `components/` claims it is shared, and the next person to edit it will believe
@@ -132,13 +133,14 @@ accident:
 
 Rust carries most of the suite, inline with the code it covers. On the frontend,
 vitest runs in the node environment with no jsdom, so unit tests cover the pure
-modules in `lib/` plus six cross-cutting guards:
+modules in `lib/`, pure helpers wherever they live, and these cross-cutting guards:
 
 - `layering.test.ts` — the folder rules above
 - `styles.test.ts` — every `var(--x)` resolves
 - `boot.test.ts` — `index.html` is the one file that runs before the bundle
-  loads, so it has to restate a few token values and command names; this test
-  checks each restatement against its real source
+  loads, so it has to restate a few token values, storage keys, command names,
+  the brand mark and the splash timings; this test checks each restatement
+  against its real source
 - `i18n.test.ts` — every static `t("…")` call site names a key that exists. A
   missing key does not throw at runtime, it renders the key itself, so nothing
   else would catch it
@@ -151,7 +153,8 @@ modules in `lib/` plus six cross-cutting guards:
 - `domainChip.test.ts` — the rule for an unset domain lives in one module and
   both screens ask it. The project grid once hid the placeholder with an inline
   literal that the dashboard never got, and a third copy is how the next screen
-  goes wrong the same way
+  goes wrong the same way. This guard holds the dashboard to the rule; the
+  project card's half sits next to the card, in `views/projects/overviewModel.test.ts`
 
 React components are deliberately not unit-tested — that would mean adopting
 jsdom, which has not been judged worth it. If you add a guard of your own, make

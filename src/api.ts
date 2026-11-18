@@ -16,6 +16,7 @@ import type {
   IndexSummary,
   InitProjectParams,
   InitTargetProbe,
+  LayoutSkin,
   LedgerChannel,
   LedgerEvent,
   LedgerKind,
@@ -24,9 +25,11 @@ import type {
   NewTask,
   ContextEdit,
   UpdatePreflight,
+  ProjectActivity,
   ProjectContext,
   SearchHit,
   RouteOutcome,
+  AutoRouted,
   SpecOverview,
   SystemStatus,
   Task,
@@ -301,8 +304,12 @@ export const api = {
     invoke<Team[]>("team_set_prime", { teamId, root }),
   teamRebindWorkspace: (workspaceId: string, newRoot: string) =>
     invoke<Team[]>("team_rebind_workspace", { workspaceId, newRoot }),
-  teamSetLayout: (teamId: string, positions: Record<string, { x: number; y: number }>) =>
-    invoke<Team[]>("team_set_layout", { teamId, positions }),
+  /** `skin` picks which canvas style's saved positions to replace (D157). */
+  teamSetLayout: (
+    teamId: string,
+    positions: Record<string, { x: number; y: number }>,
+    skin: LayoutSkin = "star",
+  ) => invoke<Team[]>("team_set_layout", { teamId, positions, skin }),
   teamAddEdge: (teamId: string, from: string, to: string) =>
     invoke<Team[]>("team_add_edge", { teamId, from, to }),
   teamRemoveEdge: (teamId: string, from: string, to: string) =>
@@ -313,15 +320,9 @@ export const api = {
     root: string,
     id: string,
     destinations: { root: string; teamId: string; teamName: string }[],
-    opts?: { auto?: boolean; keepPending?: boolean },
-  ) =>
-    invoke<RouteOutcome>("team_route_delivery", {
-      root,
-      id,
-      destinations,
-      auto: opts?.auto ?? false,
-      keepPending: opts?.keepPending ?? false,
-    }),
+  ) => invoke<RouteOutcome>("team_route_delivery", { root, id, destinations }),
+  /** The automatic-edge policy (D152, core `exchange::auto_route`) over one workspace's outbox. */
+  teamAutoRoute: (root: string) => invoke<AutoRouted[]>("team_auto_route", { root }),
   exchangeList: (root: string, mailbox: "inbox" | "outbox") =>
     invoke<DeliverySummary[]>("exchange_list", { root, mailbox }),
   exchangeGet: (root: string, mailbox: "inbox" | "outbox", id: string) =>
@@ -333,6 +334,9 @@ export const api = {
   openFolder: (path: string) => invoke<void>("open_folder", { path }),
 
   recentWorkspaces: () => invoke<WorkspaceOverview[]>("recent_workspaces"),
+  /** Agent activity across every registered project (D155); `since` = start of today, RFC 3339. */
+  projectsActivity: (since: string | null) =>
+    invoke<ProjectActivity[]>("projects_activity", { since }),
   removeRecentWorkspace: (root: string) =>
     invoke<WorkspaceOverview[]>("remove_recent_workspace", { root }),
   draftLegacyAdoption: (root: string) =>

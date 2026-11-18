@@ -52,11 +52,24 @@ export const NOTIFY_STRENGTH: Record<NotifyKind, "toast" | "badge"> = {
 export interface Toast {
   id: number;
   kind: NotifyKind;
-  /** Renders as `.toast-info` / `.toast-error`. */
-  tone: "info" | "error";
+  /**
+   * What the toast means, in the D153 colour vocabulary: `you` = something is
+   * waiting on you (amber), `hub` = the hub did something on your behalf
+   * (violet). There is no red toast: nothing a toast reports has a
+   * consequence the user cannot take back.
+   */
+  tone: "you" | "hub";
+  /** Something failed: a warning glyph replaces the plain mark. */
+  warn?: boolean;
+  /**
+   * Where it happened, for the beam that carries it to the toast (C214): the
+   * inbox badge, the way out to all projects, or the app's own logo.
+   */
+  source?: "inbox" | "projects" | "logo";
   message: string;
   /** Optional jump target (e.g. "open the inbox"). */
-  action?: { label: string; run: () => void };
+  /** `from` is the toast itself, for a page change that grows out of it (C173). */
+  action?: { label: string; run: (from: HTMLElement | null) => void };
   /** Repeats folded into this toast; 1 means "seen once". */
   count: number;
   /** Repeats of the same key fold together rather than stacking. */
@@ -118,7 +131,22 @@ export function markDeliveriesSeen(root: string, ids: string[]): void {
   writeJson(SEEN_DELIVERIES_KEY, map);
 }
 
-/** Envelopes in `deliveries` this machine has not seen yet. */
+/**
+ * Is this envelope still waiting for someone to pick it up? The one rule the
+ * toast, the badge and the inbox's bold rows all share.
+ *
+ * Two things end the wait. This machine has seen it — the per-person mark
+ * (D62 ⑤). Or this project's own agent has opened it through the hub
+ * (`agentReadAt`, D160): a toast says "someone is waiting on this project",
+ * and once its agent has read the envelope, nobody is. `seen === null` is a
+ * mailbox this machine has never listed, adopted silently: nothing in it is
+ * news.
+ */
+export function unreadFor(seen: Set<string> | null, delivery: DeliverySummary): boolean {
+  return seen !== null && !seen.has(delivery.id) && !delivery.agentReadAt;
+}
+
+/** Envelopes in `deliveries` nobody has picked up yet — see {@link unreadFor}. */
 export function unseenDeliveries(root: string, deliveries: DeliverySummary[]): DeliverySummary[] {
   const seen = seenDeliveries(root);
   if (seen === null) {
@@ -130,7 +158,7 @@ export function unseenDeliveries(root: string, deliveries: DeliverySummary[]): D
     );
     return [];
   }
-  return deliveries.filter((d) => !seen.has(d.id));
+  return deliveries.filter((d) => unreadFor(seen, d));
 }
 
 // ── Event recognition ───────────────────────────────────────────────────────

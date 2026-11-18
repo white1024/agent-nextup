@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { initialSelection, stageKind } from "./AgentSessions";
-import type { TerminalSessionMeta } from "../types";
+import { initialSelection, launchTarget, stageKind } from "./index";
+import type { TerminalSessionMeta } from "../../types";
 
 function session(over: Partial<TerminalSessionMeta> = {}): TerminalSessionMeta {
   return {
@@ -85,5 +85,33 @@ describe("initialSelection", () => {
   it("selects nothing rather than something unusable", () => {
     expect(initialSelection([session({ id: 1, status: "restored" })], 1)).toBe(null);
     expect(initialSelection([], null)).toBe(null);
+  });
+});
+
+describe("launchTarget", () => {
+  const acme = "C:\\ws\\acme";
+  const beta = "C:\\ws\\beta";
+  const gone = "D:\\gone\\proj";
+  const listed = [acme, beta];
+
+  it("keeps the current target while the picker lists it", () => {
+    expect(launchTarget([beta], listed, acme)).toBe(acme);
+  });
+
+  // The 2026-11-12 incident: a session in a project the registry does not
+  // list came first, and the launcher started there under a picker that
+  // showed another project.
+  it("never picks a project the picker does not list", () => {
+    expect(launchTarget([gone, beta], listed, "")).toBe(beta);
+    expect(launchTarget([gone], listed, "")).toBe(acme);
+    expect(launchTarget([], listed, gone)).toBe(acme);
+  });
+
+  it("matches roots spelled differently and returns the picker's spelling", () => {
+    expect(launchTarget(["c:/ws/beta/"], listed, "")).toBe(beta);
+  });
+
+  it("is empty when nothing can be launched in", () => {
+    expect(launchTarget([acme], [], acme)).toBe("");
   });
 });

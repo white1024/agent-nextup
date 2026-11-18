@@ -334,7 +334,15 @@ export interface TemplateSummary {
   description: string;
   domainHint: string;
   phaseCount: number;
+  /** Each phase's title and exit-gate kinds, in order (D155 ②) — enough to draw the band. */
+  phases: PhaseOutline[];
   source: "built_in" | "custom";
+}
+
+/** Just enough of a template phase to draw it. */
+export interface PhaseOutline {
+  title: string;
+  gates: Gate["kind"][];
 }
 
 /** Full template body — same phase shape the workflow harness runs on. */
@@ -440,14 +448,24 @@ export interface NodePos {
   y: number;
 }
 
-/** One app-level team (~/.nextup/teams.json); edges always form a DAG. */
+/**
+ * A team-canvas style (D157). Which one shows is a per-machine preference;
+ * each keeps its own saved positions: `star` in `Team.layout`, `orbit` in
+ * `Team.orbitLayout`.
+ */
+export type LayoutSkin = "star" | "orbit";
+
+/** One app-level team (~/.nextup/teams.json). */
 export interface Team {
   id: string;
   name: string;
   members: TeamMember[];
+  /** In the order they were drawn — the canvas reads the edge that closed a loop as the flow back (D161). */
   edges: TeamEdge[];
-  /** Saved canvas positions by workspaceId (D53); absent = auto-placed. */
+  /** Saved star-map positions by workspaceId (D53); absent = auto-placed. */
   layout?: Record<string, NodePos>;
+  /** The same for the orbit style (D157); a separate map, never shared. */
+  orbitLayout?: Record<string, NodePos>;
   /**
    * The workspace whose agent may edit this team's graph and route its
    * deliveries (D116). Absent = no prime, humans drive it. Scoped per team:
@@ -503,6 +521,11 @@ export interface DeliverySummary {
   publishedAt: string;
   deliveredAt?: string;
   deliveredVia?: DeliveredVia;
+  /** When this project's own agent first opened the inbox copy through the
+   * hub, and the name it gave (D160). A workspace fact, unlike this machine's
+   * "seen" marks in localStorage — and it counts as read here too. */
+  agentReadAt?: string;
+  agentReadBy?: string;
 }
 
 export interface DeliveryPayload {
@@ -525,6 +548,9 @@ export interface DeliveryEnvelope {
   supersededBy?: string | null;
   deliveredAt?: string;
   deliveredVia?: DeliveredVia;
+  /** See `DeliverySummary.agentReadAt` (D160). */
+  agentReadAt?: string;
+  agentReadBy?: string;
   /** Absolute directory of this envelope's attachment bytes, present only when
    * it has attachments (computed by `exchange_get`, OS-correct separators). */
   attachmentDir?: string;
@@ -541,6 +567,14 @@ export interface RouteOutcome {
   alreadyDelivered: string[];
   failed: RouteFailure[];
   outboxCleared: boolean;
+}
+
+/** One envelope the automatic-edge policy handled (D152). `outcome` is null
+ *  when routing raised outright, and `error` then says why. */
+export interface AutoRouted {
+  envelopeId: string;
+  outcome: RouteOutcome | null;
+  error: string | null;
 }
 
 // ── Shipped workspace assets (D38) ──────────────────────────────────────────
@@ -654,6 +688,7 @@ export interface ProjectContext {
 
 /** The four context fields a person may edit after creation (D142); omit to leave one alone. */
 export interface ContextEdit {
+  name?: string;
   domain?: string;
   description?: string;
   goals?: string[];
@@ -671,9 +706,47 @@ export interface WorkspaceOverview {
   /** Phase display title (D42 pure-Chinese); fall back to currentPhase id. */
   currentPhaseTitle?: string | null;
   workflowCompleted: boolean;
+  /** 0-based position of the current phase, and how many phases there are ("phase 2 / 5"). */
+  currentPhaseIndex?: number | null;
+  phaseCount?: number | null;
   /** Instantiated harness identity (D45); absent when no workflow.json. */
   templateId?: string | null;
   templateName?: string | null;
+}
+
+/** One hub call as the overviews draw it (D155). */
+export interface AgentCall {
+  at: string;
+  actor?: string;
+  tool?: string;
+  outcome?: "ok" | "failed" | "denied";
+  /** The semantic event the same actor wrote since its previous call; absent for reads. */
+  detail?: string;
+  taskId?: string;
+}
+
+/** A denied call still waiting for a person: fresh, still refused, not retried successfully. */
+export interface WaitingCall {
+  at: string;
+  actor?: string;
+  tool: string;
+}
+
+/**
+ * One project's recent agent activity, read from a fixed tail of its ledger
+ * (D155) — cost does not grow with history.
+ */
+export interface ProjectActivity {
+  root: string;
+  /** Newest last, capped. */
+  calls: AgentCall[];
+  /** Calls at or after the `since` passed in. */
+  callsSince: number;
+  /** The tail ran out before `since`: `callsSince` is a floor, not a total. */
+  capped: boolean;
+  waiting: WaitingCall[];
+  /** Set when the project could not be read; rows are empty then. */
+  error?: string;
 }
 
 export interface AdoptionDraft {

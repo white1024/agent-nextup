@@ -4,6 +4,8 @@
  * project, so they follow the user across every workspace.
  */
 
+import type { LayoutSkin } from "../types";
+
 /**
  * JSON-valued preference storage. Started life private to notify.ts (D62) and
  * moved here in D63 when a second structured preference appeared: every one of
@@ -256,4 +258,51 @@ export function grantAllToolsPreferred(): boolean {
 
 export function rememberGrantAllTools(on: boolean): void {
   writeJson(GRANT_ALL_KEY, on);
+}
+
+const TEAM_SKIN_KEY = "nextup-team-skin";
+
+/**
+ * Which way the teams pages are drawn (D157): the star map (the default) or
+ * the orbit. One value for the whole app, kept on this machine — it changes
+ * how a team looks, never what it is, so it belongs to no workspace. Each
+ * style keeps its own saved positions in teams.json (`layout` and
+ * `orbitLayout`), so switching never scrambles the other one.
+ */
+export type TeamSkin = LayoutSkin;
+
+export function teamSkin(): TeamSkin {
+  return readJson<string>(TEAM_SKIN_KEY, "star") === "orbit" ? "orbit" : "star";
+}
+
+/**
+ * The root element carries the choice as `data-tv`, and both styles' CSS hang
+ * off it (the orbit's rules under `:root[data-tv="orbit"]`; the star map is
+ * the unmarked default). Called once at start-up and on every change.
+ */
+export function applyTeamSkin(skin: TeamSkin = teamSkin()): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.tv = skin;
+}
+
+export function setTeamSkin(skin: TeamSkin): void {
+  writeJson(TEAM_SKIN_KEY, skin);
+  applyTeamSkin(skin);
+}
+
+// ── The version this machine last ran (C197) ────────────────────────────────
+
+const LAST_VERSION_KEY = "nextup-last-version";
+
+/**
+ * The app version seen the last time the app ran here, or null on a first run.
+ * After an update the sidebar's version number settles from this one into the
+ * new one (C197); every other start shows it as is.
+ */
+export function lastSeenVersion(): string | null {
+  return readJson<string | null>(LAST_VERSION_KEY, null);
+}
+
+export function rememberVersion(version: string): void {
+  writeJson(LAST_VERSION_KEY, version);
 }

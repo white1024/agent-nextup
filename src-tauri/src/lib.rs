@@ -2,6 +2,7 @@ mod commands;
 mod git;
 mod mcp_deploy;
 mod terminal;
+mod titlebar;
 mod update;
 mod watcher;
 
@@ -42,6 +43,20 @@ pub fn run() {
             };
             app.manage(TerminalState(mgr));
             Ok(())
+        })
+        // The native caption, in the app's colours and without the icon and
+        // title the app already draws (titlebar.rs). Every window — main and
+        // pop-outs — gets it when its page starts loading, then follows its
+        // own effective theme.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                titlebar::setup(&webview.window());
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::ThemeChanged(theme) = event {
+                titlebar::paint(window, *theme);
+            }
         })
         // Sections and order mirror commands.rs exactly — keep them aligned
         // so a diff review can spot a forgotten registration at a glance.
@@ -125,6 +140,7 @@ pub fn run() {
             commands::run_doctor,
             // ── Workspace registry & legacy adoption ──
             commands::recent_workspaces,
+            commands::projects_activity,
             commands::remove_recent_workspace,
             commands::draft_legacy_adoption,
             commands::adopt_legacy_project,
@@ -142,6 +158,7 @@ pub fn run() {
             commands::team_remove_edge,
             commands::team_set_edge_auto_route,
             commands::team_route_delivery,
+            commands::team_auto_route,
             commands::exchange_list,
             commands::exchange_get,
             commands::exchange_publish,

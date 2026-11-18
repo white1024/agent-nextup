@@ -25,6 +25,7 @@ use nextup_core::workspace::layout::WorkspacePaths;
 use nextup_core::workspace::ledger::{Ledger, LedgerEvent, LedgerKind, LedgerPage, LedgerTail};
 use nextup_core::workspace::modules::{self, WorkspaceModules};
 use nextup_core::workspace::ops::{self, ContextEdit, TaskUpdate};
+use nextup_core::workspace::activity::{self, ProjectActivity};
 use nextup_core::workspace::registry::{self, WorkspaceOverview};
 use nextup_core::workspace::settings::{self, WorkspaceSettings};
 use nextup_core::workspace::tasks::{NewTask, Task, TaskEdit, TaskStatus, TaskStore};
@@ -953,9 +954,18 @@ pub async fn get_context(state: tauri::State<'_, AppState>) -> CmdResult<Project
     .await
 }
 
-/// Edit the project's descriptive fields from the GUI (D142). The cached
-/// copy behind `system_status` is refreshed too — the dashboard's domain chip
-/// reads it, and would otherwise keep the old value until the next open.
+/// Edit the project's descriptive fields from the GUI (D142), the name
+/// included since D151. The cached copy behind `system_status` is refreshed
+/// too — the dashboard's domain chip and the sidebar's project name read it,
+/// and would otherwise keep the old value until the next open.
+///
+/// A rename carries into the two app-level copies right after the workspace
+/// write, each under its own lock and never nested inside the workspace one
+/// (`lock.rs`): the team graph's member and prime entries, and the registry
+/// pointer. The context write has already landed by then, so a failure in the
+/// team graph is reported as what it is — renamed, graph not updated — rather
+/// than as a failed save. The registry is best-effort as everywhere else: the
+/// project list re-reads each context anyway.
 #[tauri::command]
 pub async fn edit_context(
     state: tauri::State<'_, AppState>,
@@ -963,8 +973,27 @@ pub async fn edit_context(
 ) -> CmdResult<ProjectContext> {
     let ws = state.require_workspace()?;
     let root = ws.root.clone();
-    let ctx = blocking(move || ops::edit_context(&ws.paths(), APP_VERSION, edit)).await?;
+    let (ctx, renamed) = blocking(move || {
+        let paths = ws.paths();
+        let before = nextup_core::workspace::context::load_context(&paths.context_file())?.name;
+        let ctx = ops::edit_context(&paths, APP_VERSION, edit)?;
+        Ok((ctx.clone(), ctx.name != before))
+    })
+    .await?;
     state.refresh_context(&root, ctx.clone());
+    if renamed {
+        record_recent(&ctx, &root);
+        if let Some(id) = ctx.workspace_id.clone() {
+            let name = ctx.name.clone();
+            blocking(move || teams::rename_workspace(&teams::teams_file()?, &id, &name))
+                .await
+                .map_err(|e| {
+                    NextUpError::Workspace(format!(
+                        "the project is renamed, but its name in the team graph could not be updated: {e}"
+                    ))
+                })?;
+        }
+    }
     Ok(ctx)
 }
 
@@ -1023,6 +1052,25 @@ pub async fn recent_workspaces() -> CmdResult<Vec<WorkspaceOverview>> {
     blocking(move || match registry::default_registry_path() {
         Some(path) => registry::overview(&path),
         None => Ok(Vec::new()),
+    })
+    .await
+}
+
+/// Recent agent activity in every registered workspace (D155): hub calls,
+/// the denials still waiting for a person, and a count of calls since
+/// `since` (the caller's start of today — the GUI owns the time zone).
+///
+/// Read-only, and each project costs a fixed tail of its ledger, so polling
+/// this does not get slower as projects accumulate history. A project that
+/// cannot be read comes back with empty rows and its message.
+#[tauri::command]
+pub async fn projects_activity(since: Option<String>) -> CmdResult<Vec<ProjectActivity>> {
+    blocking(move || {
+        let since = since.as_deref().map(activity::parse_since).transpose()?;
+        match registry::default_registry_path() {
+            Some(path) => activity::registry_activity(&path, since),
+            None => Ok(Vec::new()),
+        }
     })
     .await
 }
@@ -1209,12 +1257,17 @@ pub async fn team_rebind_workspace(
 
 /// Persist the team-canvas node positions (D53). Presentation state only —
 /// the GUI sends the full map after a drag or auto-tidy; opening never writes.
+/// `skin` picks which canvas style's map the positions go into (D157);
+/// omitted means the star map, so a caller that predates the orbit style
+/// behaves exactly as before.
 #[tauri::command]
 pub async fn team_set_layout(
     team_id: String,
     positions: std::collections::HashMap<String, teams::NodePos>,
+    skin: Option<teams::LayoutSkin>,
 ) -> CmdResult<Vec<Team>> {
-    blocking(move || teams::mutate(|path| teams::set_layout(path, &team_id, positions))).await
+    let skin = skin.unwrap_or_default();
+    blocking(move || teams::mutate(|path| teams::set_layout(path, &team_id, skin, positions))).await
 }
 
 #[tauri::command]
@@ -1251,13 +1304,12 @@ pub struct RouteDestinationDto {
 /// Send one outbox envelope to the user-selected destinations (the Send
 /// button — the human is the fan-out point when a workspace sits in several
 /// teams, 09 §5). App-level: the upstream root comes from the team view.
+/// Policy-driven sends do not come through here: they are `team_auto_route`.
 #[tauri::command]
 pub async fn team_route_delivery(
     root: String,
     id: String,
     destinations: Vec<RouteDestinationDto>,
-    auto: Option<bool>,
-    keep_pending: Option<bool>,
 ) -> CmdResult<RouteOutcome> {
     blocking(move || {
         let upstream = WorkspacePaths::new(root.trim());
@@ -1269,14 +1321,24 @@ pub async fn team_route_delivery(
                 team_name: d.team_name,
             })
             .collect();
-        let opts = exchange::RouteOptions {
-            auto: auto.unwrap_or(false),
-            keep_pending: keep_pending.unwrap_or(false),
-            // This command is the human pressing send (or the app's own sweep
-            // when `auto`); a prime route comes through the hub instead.
-            actor: None,
-        };
-        exchange::route_delivery(&upstream, APP_VERSION, &id, &dests, opts)
+        // A human pressing send: no `(auto)`, no actor, and the original
+        // leaves the outbox once every picked destination has it.
+        exchange::route_delivery(&upstream, APP_VERSION, &id, &dests, exchange::RouteOptions::default())
+    })
+    .await
+}
+
+/// Send `root`'s pending envelopes along its automatic edges (D71; the policy
+/// lives in core since D152, where the hub calls it at publish time). The app
+/// calls this on its own triggers — a watcher signal, opening a workspace,
+/// reading the team page, and once per start for every workspace an automatic
+/// edge leaves — which is how anything the hub could not send at publish time
+/// (a downstream offline, say) still goes out.
+#[tauri::command]
+pub async fn team_auto_route(root: String) -> CmdResult<Vec<exchange::AutoRouted>> {
+    blocking(move || {
+        let teams = teams::list_all()?;
+        exchange::auto_route(&WorkspacePaths::new(root.trim()), APP_VERSION, &teams, None)
     })
     .await
 }

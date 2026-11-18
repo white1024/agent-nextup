@@ -1,6 +1,14 @@
 // Aliased: the Esc handler below listens on `document` and needs the DOM
 // `KeyboardEvent`, which an unaliased React import would shadow.
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import { createPortal, flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -10,6 +18,10 @@ import { IconCaretDown, IconX } from "../components/icons";
 import type { SystemStatus, WorkspaceInfo, WorkspaceOverview } from "../types";
 import ConfirmDanger from "../components/ConfirmDanger";
 import { hasOpenModal } from "../components/Modal";
+import Scramble from "../components/Scramble";
+import { motionOff } from "../lib/fx";
+import { EASE_OUT, easeHeight, fadeRowsOut, rowTops, slideRows } from "../lib/listMotion";
+import { switchVeil } from "../lib/transitions";
 
 /**
  * How many recent projects the dropdown lists. Six keeps the popup shorter
@@ -18,8 +30,13 @@ import { hasOpenModal } from "../components/Modal";
  */
 const RECENT_LIMIT = 6;
 
+/** The menu is never narrower than this, even when the sidebar is (D153). */
+const MENU_MIN_W = 272;
+
 interface Props {
   workspace: WorkspaceInfo;
+  /** "phase · template" under the name (D153); null until the overview is read. */
+  meta: string | null;
   onSwitched: (status: SystemStatus) => void;
   /** Jump to the projects home — where the list is complete. */
   onSeeAll: () => void;
@@ -37,9 +54,14 @@ interface Props {
  * home but the wrong shape for a dropdown — past a dozen or so the menu is
  * taller than the screen and the thing you want is rarely down there anyway.
  */
-export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: Props) {
+export default function WorkspaceSwitcher({ workspace, meta, onSwitched, onSeeAll }: Props) {
   const { t } = useTranslation();
   const [openMenu, setOpenMenu] = useState(false);
+  // The menu outlives `openMenu` by its exit animation: closing first marks
+  // it leaving, and it unmounts when that animation ends (instantly under
+  // reduced motion).
+  const [menuShown, setMenuShown] = useState(false);
+  const [menuBox, setMenuBox] = useState<CSSProperties>({});
   const { recent, setRecent, reload: reloadRecent } = useRecentWorkspaces();
   /** Recent entry awaiting removal confirmation. Same API as the overview
       card ×, so it gets the same dialog — one action, one risk story. */
@@ -57,13 +79,50 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
     }
   }, [openMenu, reloadRecent]);
 
+  // Placement. The menu is wider than the sidebar (272px against 236px), so
+  // nothing inside the sidebar may hold it: the scroller's edge fade is a
+  // `mask-image`, and a mask clips every descendant — `position: fixed` ones
+  // included — while the sidebar's own `z-index` caps whatever is in it. Being
+  // fixed was not enough (my-design review F2: ~46px of the right edge, the
+  // "missing" chip and the focus ring were cut off). So the menu is portalled
+  // to `body` and placed from the trigger's box when it opens. Anything that
+  // would move the trigger out from under it closes it instead of chasing it.
+  useLayoutEffect(() => {
+    if (!openMenu) return;
+    const r = triggerRef.current?.getBoundingClientRect();
+    if (r === undefined) return;
+    const top = r.bottom + 6;
+    setMenuBox({
+      top,
+      left: r.left,
+      width: Math.max(r.width, MENU_MIN_W),
+      maxHeight: window.innerHeight - top - 22,
+    });
+    setMenuShown(true);
+    const close = () => setOpenMenu(false);
+    const scroller = triggerRef.current?.closest(".sidebar-scroll");
+    window.addEventListener("resize", close);
+    scroller?.addEventListener("scroll", close, { passive: true });
+    return () => {
+      window.removeEventListener("resize", close);
+      scroller?.removeEventListener("scroll", close);
+    };
+  }, [openMenu]);
+
+  // Closing: let the exit play, then unmount.
+  useEffect(() => {
+    if (openMenu || !menuShown) return;
+    if (motionOff() || menuRef.current === null) setMenuShown(false);
+  }, [openMenu, menuShown]);
+
   // Close when clicking anywhere outside the switcher.
   useEffect(() => {
     if (!openMenu) return;
+    // The menu is portalled out of the switcher, so "inside" is either of them.
     const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setOpenMenu(false);
-      }
+      const at = e.target as Node;
+      if (rootRef.current?.contains(at) || menuRef.current?.contains(at)) return;
+      setOpenMenu(false);
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
@@ -104,6 +163,15 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
   }
 
   function onMenuKey(e: ReactKeyboardEvent<HTMLDivElement>) {
+    // Tab leaves the menu (ARIA's menu pattern). Portalled to the end of
+    // `body`, the menu no longer sits right after the trigger, so the browser's
+    // own next stop would be nowhere near the sidebar: hand focus back to the
+    // trigger and let this same Tab carry on from there.
+    if (e.key === "Tab") {
+      setOpenMenu(false);
+      triggerRef.current?.focus();
+      return;
+    }
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
     const items = menuItems();
     if (items.length === 0) return;
@@ -156,7 +224,12 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
       setError(null);
       const status = await api.openWorkspace(root);
       setOpenMenu(false);
-      onSwitched(status);
+      // C221: the menu gets its moment to fold away, then the old page is
+      // pictured and wiped off over the new one. The swap itself is the same
+      // `onSwitched` as always — the page stays (invariant 19) and every
+      // workspace view remounts under the picture.
+      if (!motionOff()) await new Promise((r) => window.setTimeout(r, 200));
+      switchVeil(document.querySelector<HTMLElement>("main.content"), () => onSwitched(status));
     });
   }
 
@@ -167,11 +240,26 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
     await switchTo(dir);
   }
 
+  /**
+   * C217 in the menu (my-design review F4): once confirmed, the row fades where
+   * it stands, then the rows after it close the gap and the menu shortens with
+   * them. The removal itself has already happened; this is only where the
+   * row goes. Reduced motion: the list just changes.
+   */
   async function removeRecent(root: string) {
     setError(null);
     try {
-      setRecent(await api.removeRecentWorkspace(root));
+      const next = await api.removeRecentWorkspace(root);
       setConfirmRemove(null);
+      const menu = menuRef.current;
+      const row = menu?.querySelector<HTMLElement>(`[data-row="${CSS.escape(root)}"]`) ?? null;
+      const before = rowTops(menu);
+      const height = menu?.getBoundingClientRect().height ?? 0;
+      await fadeRowsOut([row]);
+      flushSync(() => setRecent(next));
+      const timing = { duration: 340, easing: EASE_OUT };
+      slideRows(menu, before, timing);
+      easeHeight(menu, height, timing);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -187,13 +275,25 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
         aria-expanded={openMenu}
         onClick={() => setOpenMenu((v) => !v)}
       >
-        <span className="ws-dot" aria-hidden="true" />
-        <span className="ws-name">{workspace.name}</span>
+        <span className="ws-lines">
+          <Scramble className="ws-name" value={workspace.name} durationMs={760} />
+          {meta !== null && <Scramble className="ws-meta" value={meta} durationMs={760} />}
+        </span>
         <IconCaretDown size={14} className="caret" />
       </button>
 
-      {openMenu && (
-        <div className="switcher-menu" role="menu" ref={menuRef} onKeyDown={onMenuKey}>
+      {menuShown &&
+        createPortal(
+        <div
+          className={`switcher-menu${openMenu ? "" : " switcher-menu--leaving"}`}
+          role="menu"
+          ref={menuRef}
+          style={menuBox}
+          onKeyDown={onMenuKey}
+          onAnimationEnd={(e) => {
+            if (!openMenu && e.target === e.currentTarget) setMenuShown(false);
+          }}
+        >
           {error && <div className="alert alert-error switcher-error">{error}</div>}
           {busy && <div className="muted switcher-hint">{t("switcher.switching")}</div>}
 
@@ -203,7 +303,7 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
               {listed.map((ws) => {
                 const isCurrent = ws.root === workspace.root;
                 return (
-                  <div className="switcher-row" key={ws.root}>
+                  <div className="switcher-row" key={ws.root} data-row={ws.root}>
                     <button
                       className={`switcher-item ${isCurrent ? "current" : ""}`}
                       role="menuitem"
@@ -233,6 +333,7 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
               })}
               {hidden > 0 && (
                 <button
+                  data-row="__more"
                   className="switcher-item switcher-more"
                   role="menuitem"
                   disabled={busy}
@@ -249,6 +350,7 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
           )}
 
           <button
+            data-row="__open"
             className="switcher-item"
             role="menuitem"
             disabled={busy}
@@ -257,8 +359,9 @@ export default function WorkspaceSwitcher({ workspace, onSwitched, onSeeAll }: P
             <span className="ws-dot" aria-hidden="true" />
             {t("switcher.openOther")}
           </button>
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
       {confirmRemove !== null && (
         <ConfirmDanger
           heading={t("welcome.removeConfirmHeading")}

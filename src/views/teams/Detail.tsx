@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import { api } from "../../api";
 import { readBoxes, sameRoot } from "../../lib/exchange";
 import { useGuardedMutation } from "../../hooks";
+import { useFreshKeys } from "../../hooks/anim";
 import ConfirmDanger from "../../components/ConfirmDanger";
 import EmptyState from "../../components/EmptyState";
 import Modal from "../../components/Modal";
@@ -14,17 +15,23 @@ import {
   IconArrowRight,
   IconCaretDown,
   IconCheck,
+  IconEnvelope,
   IconFolder,
   IconMinus,
   IconPlus,
   IconStar,
   IconX,
 } from "../../components/icons";
-import Canvas from "./Canvas";
-import { autoPositions, canConnect } from "./layout";
+import Canvas, { type CanvasApi } from "./Canvas";
+import { canConnect } from "./layout";
 import TimeAgo from "../../components/TimeAgo";
 import { relativeTime } from "../../lib/time";
+import { splitAroundCount } from "../../lib/format";
+import { centreOf, fx, motionOff, type Point } from "../../lib/fx";
+import { fadeRowsOut } from "../../lib/listMotion";
 import PathLabel from "../../components/PathLabel";
+import { BACK_OUT_MS, arriveAt, fadeDialog, foldLetter, peekStars, replay, sendTiming } from "./motion";
+import { teamSkin } from "../../lib/prefs";
 import type {
   DeliverySummary,
   RouteOutcome,
@@ -42,7 +49,9 @@ interface Props {
   refreshKey: number;
   /** Every mutation returns the full list; push it up so list + detail stay one source. */
   onTeams: (teams: Team[]) => void;
-  onBack: () => void;
+  /** Back to the list, handing over where the stars stood (C56) — null for no flight. */
+  /** `scale` is the canvas's zoom as it was left — the orbit's cube flies home from that size (C62). */
+  onBack: (stars: Record<string, Point> | null, scale?: number) => void;
   /** App-level toast sink — the auto-send sweep announces through it (D71). */
   pushToast: (spec: ToastSpec) => void;
 }
@@ -69,15 +78,29 @@ interface ArrivalRow {
   note: string | null;
 }
 
+/**
+ * A send result as the page shows it (spec 50 §9): which envelope, from whom,
+ * and one row per downstream with the team it went through. The core's
+ * outcome carries names only; the picked candidates fill in the rest.
+ */
+interface ShownOutcome {
+  envelope: { id: string; note: string | null; at: string };
+  from: string;
+  delivered: { workspaceId: string; teamId: string; name: string; teamName: string }[];
+  alreadyDelivered: string[];
+  failed: RouteOutcome["failed"];
+  /** Rows appear as the light reaches them (C58); false = at once. */
+  live: boolean;
+}
+
 /** History rows shown at once — honest cap, D47 precedent. */
 const HISTORY_CAP = 50;
 
 /**
- * Full-page team canvas (D53, 12 §2): the flow canvas is the page. Clicking a
- * member node opens the right inspector (path / liveness / pending envelopes
- * with Send / removal); delivery history lives in a collapsible bottom dock
- * (n8n's executions slot). Routing still happens here and only here — the
- * human at the Send button is the fan-out point (team module design §5).
+ * Full-page team canvas (D53, 12 §2; drawn as the D153 star map, spec 50
+ * §3–§9): a summary line, the member rail, the flow canvas with its inspector,
+ * and the delivery history under it. Routing still happens here and only here
+ * — the human at the Send button is the fan-out point (team module design §5).
  */
 export default function TeamDetail({
   team,
@@ -127,17 +150,44 @@ export default function TeamDetail({
   /** Inspector's "send to" picker — the keyboard-reachable way to draw an edge. */
   const [edgeDraft, setEdgeDraft] = useState("");
 
-  // Bottom history dock.
+  // Bottom history dock; `dockIn` marks the moment it opens (C52 plays once).
   const [dockOpen, setDockOpen] = useState(false);
+  const [dockIn, setDockIn] = useState(false);
 
   // Send modal: the envelope being routed + per-candidate checkboxes.
   const [routing, setRouting] = useState<{
     root: string;
+    workspaceId: string;
     delivery: DeliverySummary;
     candidates: RouteCandidate[];
     checked: Set<string>;
   } | null>(null);
-  const [outcome, setOutcome] = useState<RouteOutcome | null>(null);
+  const [outcome, setOutcome] = useState<ShownOutcome | null>(null);
+  /** A result row is hovered: its member's star lights up on the canvas. */
+  const [hl, setHl] = useState<string | null>(null);
+
+  // C54 / C59 triggers for the canvas, and what the page drives on it.
+  const [tidy, setTidy] = useState(0);
+  const [freshEdge, setFreshEdge] = useState<string | null>(null);
+  /** The inspector row of a flow just created (C51) — kept past the canvas's own draw. */
+  const [flowFresh, setFlowFresh] = useState<string | null>(null);
+  const canvasApi = useRef<CanvasApi | null>(null);
+  /** Star map or orbit (D157): read once — Settings is another page, so it cannot change under this one. */
+  const [skin] = useState(teamSkin);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const railRef = useRef<HTMLDivElement>(null);
+  const noteRef = useRef<HTMLParagraphElement>(null);
+  const sendFormRef = useRef<HTMLDivElement>(null);
+
+  // C56: arriving from the card, the page's blocks rise while the stars fly;
+  // leaving, its words fade first.
+  const [entering, setEntering] = useState(() => peekStars(team.id, "open"));
+  const [leaving, setLeaving] = useState(false);
+  useEffect(() => {
+    if (!entering) return;
+    const id = window.setTimeout(() => setEntering(false), 1400);
+    return () => window.clearTimeout(id);
+  }, [entering]);
 
   // Pending outboxes of the members (per-member reads so one offline folder
   // cannot hide the others).
@@ -157,14 +207,13 @@ export default function TeamDetail({
     void loadOutboxes().then(async (result) => {
       if (cancelled) return;
       setOutboxes(result);
-      // Auto-send sweep (D71), call site ②: this fan-out already paid for the
-      // outbox reads, so hand them over. Converge with one re-read — never by
+      // Auto-send sweep (D71), call site ②: only members with something
+      // waiting are worth a sweep. Converge with one re-read — never by
       // subscribing this effect to the state it writes.
       let moved = false;
       for (const box of result) {
         if (box.error !== null || box.rows.length === 0) continue;
-        moved =
-          (await autoRouteSweep(box.root, { pushToast, t }, { teams, outbox: box.rows })) || moved;
+        moved = (await autoRouteSweep(box.root, { pushToast, t })) || moved;
       }
       if (moved && !cancelled) {
         const fresh = await loadOutboxes();
@@ -316,7 +365,17 @@ export default function TeamDetail({
 
   // Stable canvas callbacks (the edge-sync effect in Canvas depends on them).
   const addEdge = useCallback(
-    (from: string, to: string) => void runFlow(() => api.teamAddEdge(team.id, from, to)),
+    (from: string, to: string) =>
+      void runFlow(async () => {
+        const list = await api.teamAddEdge(team.id, from, to);
+        // C59: the new line draws itself once the canvas has it; C51: its row
+        // slides into the inspector.
+        const key = `${from}->${to}`;
+        setFreshEdge(key);
+        setFlowFresh(key);
+        window.setTimeout(() => setFlowFresh((k) => (k === key ? null : k)), 1200);
+        return list;
+      }),
     [runFlow, team.id],
   );
   const removeEdge = useCallback(
@@ -342,11 +401,12 @@ export default function TeamDetail({
   }
   const persistLayout = useCallback(
     (positions: Record<string, { x: number; y: number }>) =>
-      void runFlow(() => api.teamSetLayout(team.id, positions)),
-    [runFlow, team.id],
+      void runFlow(() => api.teamSetLayout(team.id, positions, skin)),
+    [runFlow, team.id, skin],
   );
+  /** Null until the outboxes are read — the canvas keeps every star violet till then. */
   const pendingCount = useMemo(
-    () => new Map((outboxes ?? []).map((box) => [box.workspaceId, box.rows.length])),
+    () => (outboxes === null ? null : new Map(outboxes.map((box) => [box.workspaceId, box.rows.length]))),
     [outboxes],
   );
 
@@ -380,6 +440,9 @@ export default function TeamDetail({
     await run(() => api.teamRebindWorkspace(member.workspaceId, dir));
   }
 
+  const railRow = (id: string) =>
+    railRef.current?.querySelector<HTMLElement>(`[data-member="${CSS.escape(id)}"]`) ?? null;
+
   // The one place the ref gate is not a nicety: `teamRouteDelivery` is not
   // idempotent and it writes into *other* workspaces, so a same-tick double
   // click used to drop the same envelope into a teammate's inbox twice, with
@@ -388,20 +451,80 @@ export default function TeamDetail({
     if (routing === null) return;
     const picked = routing.candidates.filter((c) => routing.checked.has(candidateKey(c)));
     if (picked.length === 0) return;
+    const sending = routing;
     return runMutation(async () => {
       setError(null);
       const result = await api.teamRouteDelivery(
-        routing.root,
-        routing.delivery.id,
+        sending.root,
+        sending.delivery.id,
         picked.map((c) => ({ root: c.root, teamId: c.teamId, teamName: c.teamName })),
       );
-      setOutcome(result);
+      // C58 starts where the dialog is: measure the envelope before it goes
+      // (an envelope with no note folds out of the dialog's title instead).
+      const form = sendFormRef.current;
+      const noteBox = (noteRef.current ?? form?.querySelector(".form-heading"))?.getBoundingClientRect() ?? null;
+      const live = !motionOff() && noteBox !== null;
+      if (live) fadeDialog(form?.closest<HTMLElement>(".modal-backdrop") ?? null);
+      const shown = toShown(result, sending, picked, live);
+      setOutcome(shown);
       setRouting(null);
+      if (live) playSend(sending, shown, noteBox);
       onTeams(await api.teamsList());
       setOutboxes(await loadOutboxes());
     });
   }
 
+  /**
+   * C58: the envelope folds into light and flies to the sender's star; from
+   * there one light per delivered downstream runs along its flow, 130ms
+   * apart, and blooms on arrival. A downstream reached through another team
+   * has no line here — its light runs between the two rail rows instead.
+   *
+   * C64 on the orbit: the same, with the lights leaving 40ms apart (one light
+   * splitting) and the cube flaring once, the first moment any of them passes
+   * through it.
+   */
+  function playSend(sending: NonNullable<typeof routing>, shown: ShownOutcome, noteBox: DOMRect | null) {
+    const api = canvasApi.current;
+    if (api === null || noteBox === null) return;
+    const send = sendTiming(skin);
+    api.frame([sending.workspaceId, ...shown.delivered.map((d) => d.workspaceId)]);
+    void foldLetter(noteBox, sending.delivery.note ?? sending.delivery.id.slice(0, 8), () =>
+      api.starOf(sending.workspaceId),
+    );
+    window.setTimeout(() => {
+      let flare = Infinity;
+      shown.delivered.forEach((d, k) => {
+        const delay = k * send.stag;
+        const local = d.teamId === team.id ? api.comet(sending.workspaceId, d.workspaceId, delay, send.along) : null;
+        if (local !== null) {
+          if (local.core !== null) flare = Math.min(flare, delay + local.core * send.along);
+          window.setTimeout(() => {
+            api.bloom(d.workspaceId);
+            replay(railRow(d.workspaceId), "lit", 800);
+          }, send.along + delay);
+          return;
+        }
+        const a = centreOf(railRow(sending.workspaceId)?.querySelector(".tmr-dot"));
+        const b = centreOf(railRow(d.workspaceId)?.querySelector(".tmr-dot"));
+        if (a !== null && b !== null) fx.beam(a, b, { dur: send.along, delay, bend: 0.5, width: 2.2 });
+      });
+      if (Number.isFinite(flare)) window.setTimeout(() => api.flare(), Math.round(flare));
+    }, send.fold + send.fly);
+  }
+
+  /** Leaving for the list: words fade, the stars stay to fly home (C56). */
+  function goBack() {
+    if (leaving) return;
+    const stars = canvasApi.current?.stars() ?? {};
+    const scale = canvasApi.current?.zoom() ?? 1;
+    if (motionOff() || team.members.length === 0 || Object.keys(stars).length === 0) {
+      onBack(null);
+      return;
+    }
+    setLeaving(true);
+    window.setTimeout(() => onBack(stars, scale), BACK_OUT_MS);
+  }
 
   const lastDeliveryBy = useMemo(() => {
     const map = new Map<string, string>();
@@ -454,11 +577,29 @@ export default function TeamDetail({
     }
   }, [flowsOf, edgeDraft]);
 
-  /** Node/rail status dot: missing wins, then pending, else idle. */
-  function dotOf(workspaceId: string): string {
+  // C51: a member just added drops into the rail with a sweep, and its star is
+  // born on the canvas (C59); a flow just created slides into the inspector.
+  const freshMembers = useFreshKeys(
+    team.members.map((m) => m.workspaceId),
+    1200,
+    true,
+  );
+
+  /** Node/rail status: missing wins, then pending (once read), else idle. */
+  function dotOf(workspaceId: string): "missing" | "pending" | "ok" {
     if (missing.has(workspaceId)) return "missing";
-    return (pendingCount.get(workspaceId) ?? 0) > 0 ? "pending" : "ok";
+    return (pendingCount?.get(workspaceId) ?? 0) > 0 ? "pending" : "ok";
   }
+
+  /** Each delivered member's ring shows when its light lands (C58). */
+  const got = useMemo(() => {
+    if (outcome === null) return null;
+    const map = new Map<string, number>();
+    outcome.delivered.forEach((d, k) => {
+      if (d.teamId === team.id) map.set(d.workspaceId, outcome.live ? arriveAt(k, skin) : 0);
+    });
+    return map;
+  }, [outcome, team.id, skin]);
 
   // Whole-team auto-route state — the header tri-state doubles as the at-a-glance
   // indicator (D71 walkthrough feedback: the per-edge switches were the only way
@@ -469,12 +610,17 @@ export default function TeamDetail({
   const allAuto = edgeTotal > 0 && autoCount === edgeTotal;
   const someAuto = autoCount > 0 && autoCount < edgeTotal;
 
+  const [fromBefore, fromAfter] = splitAroundCount((n) => t("teams.resultFrom", { name: n }));
+
   return (
-    <div className="view view--canvas">
-      <header className="view-header">
+    <div
+      ref={pageRef}
+      className={["view tmd", entering ? "tv-in" : "", leaving ? "tv-leaving" : ""].filter((c) => c !== "").join(" ")}
+    >
+      <header className="view-header tmd-head">
         <div className="vh-main">
           {renaming ? (
-            <div className="field-row">
+            <div className="field-row tmd-rename">
               <input
                 autoFocus
                 aria-label={t("teams.rename")}
@@ -497,14 +643,14 @@ export default function TeamDetail({
             {/* Who runs the team is a team-level fact, so it reads next to the
                 team's own subtitle rather than on any node (D117). */}
             {team.prime && (
-              <span className="chip team-prime-chip">
+              <span className="team-prime-chip">
                 <IconStar size={11} /> {t("teams.primeChip", { name: team.prime.name })}
               </span>
             )}
           </p>
         </div>
         <div className="header-actions">
-          <button className="btn" onClick={onBack}>
+          <button className="btn" onClick={goBack}>
             {t("teams.back")}
           </button>
           {!renaming && (
@@ -521,7 +667,7 @@ export default function TeamDetail({
           <button
             className="btn"
             disabled={busy || team.members.length === 0}
-            onClick={() => void runFlow(() => api.teamSetLayout(team.id, autoPositions(team)))}
+            onClick={() => setTidy((n) => n + 1)}
           >
             {t("teams.autoTidy")}
           </button>
@@ -560,7 +706,7 @@ export default function TeamDetail({
 
       {error && confirmRemove === null && <div className="alert alert-error">{error}</div>}
       {outcome && (
-        <section className="panel">
+        <section className={`panel tmd-result${outcome.live ? " live" : ""}`}>
           <div className="panel-head">
             <h2 className="panel-title">{t("teams.routeResult")}</h2>
             <div className="spacer" />
@@ -568,37 +714,72 @@ export default function TeamDetail({
               className="btn btn-ghost btn-icon"
               title={t("common.close")}
               aria-label={t("common.close")}
-              onClick={() => setOutcome(null)}
+              onClick={() => {
+                setOutcome(null);
+                setHl(null);
+              }}
             >
               <IconX size={14} />
             </button>
           </div>
-          <ul className="route-result">
-            {outcome.delivered.map((name) => (
-              <li key={`ok-${name}`}>
-                <span className="chip route-chip--ok">{t("teams.routeOk")}</span>
-                <span>{name}</span>
-              </li>
-            ))}
-            {outcome.alreadyDelivered.map((name) => (
-              <li key={`dup-${name}`}>
-                <span className="chip">{t("teams.routeDupe")}</span>
-                <span>{name}</span>
-              </li>
-            ))}
-            {outcome.failed.map((f) => (
-              <li key={`fail-${f.root}`}>
-                <span className="chip route-chip--fail">{t("teams.routeFail")}</span>
-                <span>
-                  {f.root} — {f.message}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <div className="tv-res-body">
+            <div className="tv-res-env">
+              <span className="tv-res-ic" aria-hidden="true">
+                <IconEnvelope size={18} />
+              </span>
+              <div>
+                <p className="tv-res-note">{outcome.envelope.note ?? outcome.envelope.id.slice(0, 8)}</p>
+                <p className="tv-res-meta">
+                  <code>{outcome.envelope.id.slice(0, 8)}</code>
+                  {" · "}
+                  {fromBefore}
+                  <b>{outcome.from}</b>
+                  {fromAfter}
+                  {" · "}
+                  {t("teams.resultDownstream", { n: outcome.delivered.length })}
+                  {" · "}
+                  <TimeAgo at={outcome.envelope.at} />
+                </p>
+              </div>
+            </div>
+            <ul className="tv-res-list">
+              {outcome.delivered.map((d, k) => (
+                <li
+                  key={`ok-${d.teamId}-${d.workspaceId}`}
+                  style={{ "--arr": `${outcome.live ? arriveAt(k, skin) : 0}ms` } as CSSProperties}
+                  onPointerEnter={() => setHl(d.teamId === team.id ? d.workspaceId : null)}
+                  onPointerLeave={() => setHl(null)}
+                >
+                  <i className="tv-res-dot" aria-hidden="true" />
+                  <span className="chip route-chip--ok">{t("teams.routeOk")}</span>
+                  <span className="tv-res-name">{d.name}</span>
+                  <span className="tv-res-via">
+                    {t("teams.viaTeam")} {d.teamName}
+                  </span>
+                </li>
+              ))}
+              {outcome.alreadyDelivered.map((name) => (
+                <li key={`dup-${name}`}>
+                  <i className="tv-res-dot" aria-hidden="true" />
+                  <span className="chip">{t("teams.routeDupe")}</span>
+                  <span className="tv-res-name">{name}</span>
+                </li>
+              ))}
+              {outcome.failed.map((f) => (
+                <li key={`fail-${f.root}`}>
+                  <i className="tv-res-dot off" aria-hidden="true" />
+                  <span className="chip route-chip--fail">{t("teams.routeFail")}</span>
+                  <span className="tv-res-name">
+                    {f.root} — {f.message}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
         </section>
       )}
 
-      <div className="team-summary">
+      <div className="tmd-sum">
         <span>{t("teams.cardMembers", { n: team.members.length })}</span>
         <span className="ts-sep" aria-hidden="true">
           ·
@@ -607,17 +788,24 @@ export default function TeamDetail({
         <span className="ts-sep" aria-hidden="true">
           ·
         </span>
-        <span className={pendingTotal > 0 ? "ts-hot" : ""}>
-          {t("teams.cardPending", { n: pendingTotal })}
-        </span>
+        {/* Not "0 pending" before the outboxes are read (invariant 10(a)). */}
+        {outboxes === null ? (
+          <span className="tm-pending tm-pending--skel" aria-label={t("common.loading")} />
+        ) : (
+          <span className={pendingTotal > 0 ? "ts-hot" : ""}>{t("teams.cardPending", { n: pendingTotal })}</span>
+        )}
         <span className="ts-sep" aria-hidden="true">
           ·
         </span>
-        <span>
-          {lastOverall === null
-            ? t("teams.summaryNever")
-            : t("teams.summaryLast", { at: lastOverall })}
-        </span>
+        {history === null ? (
+          <span className="tm-pending tm-pending--skel tm-skel-wide" aria-label={t("common.loading")} />
+        ) : (
+          <span>
+            {lastOverall === null
+              ? t("teams.summaryNever")
+              : t("teams.summaryLast", { at: lastOverall })}
+          </span>
+        )}
         {missing.size > 0 && (
           <span className="chip team-missing-chip ts-missing">
             {t("teams.summaryMissing", { n: missing.size })}
@@ -625,13 +813,13 @@ export default function TeamDetail({
         )}
       </div>
 
-      <div className="team-stage">
-        <aside className="team-rail">
-          <div className="tr-head">
+      <div className="tmd-stage">
+        <aside className="panel tmd-rail">
+          <div className="tmr-head">
             {t("teams.membersHeading")}
-            <span className="canvas-dock-count">{team.members.length}</span>
+            <span className="tmr-n">{team.members.length}</span>
           </div>
-          <div className="tr-list">
+          <div className="tmr-list" ref={railRef}>
             {team.members.length === 0 && (
               <EmptyState
                 className="tr-empty"
@@ -639,82 +827,87 @@ export default function TeamDetail({
                 hint={t("teams.railEmptyHint")}
               />
             )}
-            {team.members.map((member) => (
-              <div
-                key={member.workspaceId}
-                className={`tr-row ${selectedId === member.workspaceId ? "tr-row--on" : ""}`}
-              >
-                <button
-                  className="tr-main"
-                  title={member.root}
-                  onClick={() => {
-                    setSelectedId(member.workspaceId);
-                    setFocus((cur) => ({
-                      id: member.workspaceId,
-                      nonce: (cur?.nonce ?? 0) + 1,
-                    }));
-                  }}
+            {team.members.map((member) => {
+              const dot = dotOf(member.workspaceId);
+              const n = pendingCount?.get(member.workspaceId) ?? 0;
+              return (
+                <div
+                  key={member.workspaceId}
+                  data-member={member.workspaceId}
+                  className={[
+                    "tmr",
+                    selectedId === member.workspaceId ? "on" : "",
+                    freshMembers.has(member.workspaceId) ? "fresh" : "",
+                  ]
+                    .filter((c) => c !== "")
+                    .join(" ")}
                 >
-                  {/* This row carries only a name, so the status has no
-                      equivalent visible text to lean on — unlike a canvas
-                      node, where cn-meta already spells it out. Hence the
-                      sr-only text (D64). */}
-                  <span
-                    aria-hidden="true"
-                    className={`cn-dot cn-dot--${dotOf(member.workspaceId)}`}
-                  />
-                  <span className="sr-only">
-                    {t(
-                      dotOf(member.workspaceId) === "missing"
-                        ? "teams.missing"
-                        : dotOf(member.workspaceId) === "pending"
-                          ? "teams.pending"
-                          : "teams.nodeIdle",
-                    )}
-                  </span>
-                  <span className="tr-name">{member.name}</span>
-                  {(pendingCount.get(member.workspaceId) ?? 0) > 0 && (
-                    <span className="canvas-dock-count">
-                      {pendingCount.get(member.workspaceId)}
+                  <button
+                    className="tmr-main"
+                    title={member.root}
+                    onClick={() => {
+                      setSelectedId(member.workspaceId);
+                      setFocus((cur) => ({
+                        id: member.workspaceId,
+                        nonce: (cur?.nonce ?? 0) + 1,
+                      }));
+                    }}
+                  >
+                    {/* This row carries only a name, so the status has no
+                        equivalent visible text to lean on — unlike a canvas
+                        node, where cn-meta already spells it out. Hence the
+                        sr-only text (D64). */}
+                    <span aria-hidden="true" className="tmr-dot" data-dot={dot} />
+                    <span className="sr-only">
+                      {t(
+                        dot === "missing"
+                          ? "teams.missing"
+                          : dot === "pending"
+                            ? "teams.pending"
+                            : "teams.nodeIdle",
+                      )}
                     </span>
-                  )}
-                </button>
-                {/* In-row removal: goes through the same confirmation
-                    dialog as the one at the bottom of the inspector
-                    (including the "this also removes N flows" warning) — it
-                    never bypasses confirmation. Appears on hover or when
-                    the row takes keyboard focus (:focus-within lets the
-                    keyboard summon it), and its space is always reserved so
-                    the name never shifts. */}
-                <button
-                  className="btn btn-ghost btn-icon tr-remove danger-trigger"
-                  disabled={busy}
-                  title={t("teams.removeTitle")}
-                  aria-label={t("teams.removeMemberOf", { name: member.name })}
-                  onClick={() => {
-                    setError(null);
-                    setConfirmRemove(member);
-                  }}
-                >
-                  <IconX size={13} />
-                </button>
-              </div>
-            ))}
+                    <span className="tmr-name">{member.name}</span>
+                    {n > 0 && <span className="tmr-n tmr-n--hot">{n}</span>}
+                  </button>
+                  {/* In-row removal: goes through the same confirmation
+                      dialog as the one at the bottom of the inspector
+                      (including the "this also removes N flows" warning) — it
+                      never bypasses confirmation. Appears on hover or when
+                      the row takes keyboard focus (:focus-within lets the
+                      keyboard summon it), and its space is always reserved so
+                      the name never shifts. */}
+                  <button
+                    className="btn btn-ghost btn-icon tmr-x danger-trigger"
+                    disabled={busy}
+                    title={t("teams.removeTitle")}
+                    aria-label={t("teams.removeMemberOf", { name: member.name })}
+                    onClick={() => {
+                      setError(null);
+                      setConfirmRemove(member);
+                    }}
+                  >
+                    <IconX size={13} />
+                  </button>
+                </div>
+              );
+            })}
           </div>
           {/* The same action as the header's, in reach of the end of the
               list. It is a convenience, not a second main action, so it does
               not wear the same coat — two identical primaries on one screen
               read as two different things (r2 3-3). */}
-          <div className="tr-foot">
+          <div className="tmr-foot">
             <button className="btn btn-small btn-ghost" onClick={() => setAdding(true)}>
               <IconPlus size={13} /> {t("teams.addMember")}
             </button>
           </div>
         </aside>
 
-        <div className="team-canvas">
+        <div className={`team-canvas${selectedMember !== null ? " team-canvas--inspecting" : ""}`}>
           <Canvas
             team={team}
+            skin={skin}
             missing={missing}
             pending={pendingCount}
             lastDelivery={lastDeliveryBy}
@@ -727,6 +920,13 @@ export default function TeamDetail({
             onAddEdge={addEdge}
             onRemoveEdge={removeEdge}
             onPersistLayout={persistLayout}
+            tidy={tidy}
+            freshEdge={freshEdge}
+            onFreshEdgeDone={() => setFreshEdge(null)}
+            born={freshMembers}
+            got={got}
+            highlight={hl}
+            apiRef={canvasApi}
           />
 
           {team.members.length === 0 && (
@@ -766,10 +966,10 @@ export default function TeamDetail({
               <PathLabel className="ci-path" path={selectedMember.root} />
 
               {missing.has(selectedMember.workspaceId) && (
-                <div>
-                  <div className="team-member-hint">{t("teams.missingHint")}</div>
+                <div className="tmi-miss">
+                  <p>{t("teams.missingHint")}</p>
                   <button
-                    className="btn team-rebind"
+                    className="btn btn-small"
                     disabled={busy}
                     onClick={() => void rebind(selectedMember)}
                   >
@@ -787,11 +987,17 @@ export default function TeamDetail({
                 <div className="ci-section-title">
                   {t("teams.pending")}
                   {selectedBox !== null && selectedBox.rows.length > 0 && (
-                    <span className="canvas-dock-count">{selectedBox.rows.length}</span>
+                    <span className="tmr-n tmr-n--hot">{selectedBox.rows.length}</span>
                   )}
                 </div>
+                {outboxes === null && (
+                  <div aria-label={t("common.loading")}>
+                    <span className="skel-bar" />
+                    <span className="skel-bar skel-bar--short" />
+                  </div>
+                )}
                 {selectedBox?.error != null && (
-                  <p className="muted">
+                  <p className="tmi-hint">
                     {/* ASCII parentheses, not fullwidth: they wrap a Latin
                         technical error string in both locales. */}
                     {t("teams.outboxUnreadable")} ({selectedBox.error})
@@ -803,9 +1009,9 @@ export default function TeamDetail({
                     <EmptyState title={t("teams.noPending")} hint={t("teams.noPendingHint")} />
                   )}
                 {(selectedBox?.rows ?? []).map((row) => (
-                  <div className="settings-row" key={row.id}>
-                    <div className="sr-body">
-                      <div className="sr-title">
+                  <div className={`tmi-row${row.supersededBy ? " superseded" : ""}`} key={row.id}>
+                    <div className="tmi-rb">
+                      <div className="tmi-rt">
                         {row.note ?? row.id.slice(0, 8)}
                         {/* The publisher corrected itself: a later envelope in
                             this same outbox replaces this one. Marked rather
@@ -814,7 +1020,7 @@ export default function TeamDetail({
                           <span className="pill superseded">{t("teams.superseded")}</span>
                         )}
                       </div>
-                      <div className="sr-desc">
+                      <div className="tmi-rd">
                         <TimeAgo at={row.publishedAt} />
                         {row.supersededBy && ` · ${t("teams.supersededBy", { id: row.supersededBy.slice(0, 8) })}`}
                       </div>
@@ -824,7 +1030,7 @@ export default function TeamDetail({
                         which envelope it acts on — the one thing the row's
                         visual position was carrying (2026-08-01 UI review). */}
                     <button
-                      className={row.supersededBy ? "btn" : "btn btn-primary"}
+                      className={row.supersededBy ? "btn btn-small" : "btn btn-small btn-primary"}
                       disabled={busy}
                       aria-label={t("teams.routeOf", {
                         summary: (row.note ?? row.id).split("\n")[0].slice(0, 60),
@@ -833,6 +1039,7 @@ export default function TeamDetail({
                         const candidates = candidatesFor(selectedMember.workspaceId);
                         setRouting({
                           root: selectedMember.root,
+                          workspaceId: selectedMember.workspaceId,
                           delivery: row,
                           candidates,
                           checked: new Set(candidates.map(candidateKey)),
@@ -859,21 +1066,24 @@ export default function TeamDetail({
                     <EmptyState
                       title={t("teams.flowNone")}
                       hint={
-                        flowsOf.targets.length > 0
-                          ? t("teams.flowNoneHint")
-                          : t("teams.flowNoTarget")
+                        flowsOf.targets.length === 0
+                          ? t("teams.flowNoTarget")
+                          : skin === "orbit"
+                            ? t("teams.flowNoneHintOrbit")
+                            : t("teams.flowNoneHint")
                       }
                     />
                   )}
 
                   {flowsOf.upstream.map((edge) => (
-                    <div className="settings-row ci-flow-row" key={`up-${edge.from}`}>
-                      <div className="sr-body">
-                        <div className="sr-title ci-flow-line">
-                          <span className="ci-flow-peer">{nameOf(edge.from)}</span>
-                          <IconArrowRight size={13} aria-hidden="true" />
-                          <span className="muted">{t("teams.flowThisOne")}</span>
-                        </div>
+                    <div
+                      className={`tmi-flow${flowFresh === `${edge.from}->${edge.to}` ? " fresh" : ""}`}
+                      key={`up-${edge.from}`}
+                    >
+                      <div className="tmi-fl">
+                        <b>{nameOf(edge.from)}</b>
+                        <IconArrowRight size={13} aria-hidden="true" />
+                        <span className="tmi-me">{t("teams.flowThisOne")}</span>
                       </div>
                       <button
                         className="btn btn-ghost btn-icon"
@@ -891,13 +1101,14 @@ export default function TeamDetail({
                   ))}
 
                   {flowsOf.downstream.map((edge) => (
-                    <div className="settings-row ci-flow-row" key={`down-${edge.to}`}>
-                      <div className="sr-body">
-                        <div className="sr-title ci-flow-line">
-                          <span className="muted">{t("teams.flowThisOne")}</span>
-                          <IconArrowRight size={13} aria-hidden="true" />
-                          <span className="ci-flow-peer">{nameOf(edge.to)}</span>
-                        </div>
+                    <div
+                      className={`tmi-flow${flowFresh === `${edge.from}->${edge.to}` ? " fresh" : ""}`}
+                      key={`down-${edge.to}`}
+                    >
+                      <div className="tmi-fl">
+                        <span className="tmi-me">{t("teams.flowThisOne")}</span>
+                        <IconArrowRight size={13} aria-hidden="true" />
+                        <b>{nameOf(edge.to)}</b>
                       </div>
                       {/* Sending is the from-side's decision, so only these
                           downstream rows carry the auto toggle — on an
@@ -924,11 +1135,11 @@ export default function TeamDetail({
                   ))}
 
                   {flowsOf.downstream.length > 0 && (
-                    <p className="section-hint">{t("teams.autoRouteHint")}</p>
+                    <p className="tmi-hint">{t("teams.autoRouteHint")}</p>
                   )}
 
                   {flowsOf.targets.length > 0 && (
-                    <div className="ci-add-flow">
+                    <div className="tmi-add">
                       <label className="field">
                         <span>{t("teams.addFlowLabel")}</span>
                         <select
@@ -945,7 +1156,7 @@ export default function TeamDetail({
                         </select>
                       </label>
                       <button
-                        className="btn"
+                        className="btn btn-small"
                         disabled={busy || edgeDraft === ""}
                         onClick={() => {
                           addEdge(selectedMember.workspaceId, edgeDraft);
@@ -979,48 +1190,58 @@ export default function TeamDetail({
       {/* Below the canvas, not floating over it: as an overlay the bar covered
           whatever node sat at the bottom of the graph (reported during the
           D53 walkthrough). */}
-      <div className={`canvas-dock ${dockOpen ? "canvas-dock--open" : ""}`}>
-        <button className="canvas-dock-bar" onClick={() => setDockOpen((v) => !v)}>
+      <div className={`panel tmd-dock${dockOpen ? " open" : ""}`}>
+        <button
+          className="tmd-dock-bar"
+          aria-expanded={dockOpen}
+          onClick={() => {
+            const next = !dockOpen;
+            setDockOpen(next);
+            // C52: the rows float up as the dock opens, not on later re-reads.
+            if (next && !motionOff()) {
+              setDockIn(true);
+              window.setTimeout(() => setDockIn(false), 900);
+            }
+          }}
+        >
           <span>{t("teams.history")}</span>
-          <span className="canvas-dock-count">{historyTotal}</span>
-          <span className={`canvas-dock-caret ${dockOpen ? "up" : ""}`}>
+          <span className="tmr-n">{historyTotal}</span>
+          <span className="caret" aria-hidden="true">
             <IconCaretDown size={14} />
           </span>
         </button>
         {dockOpen && (
-          <div className="canvas-dock-body">
-            {missing.size > 0 && <p className="section-hint">{t("teams.historyMissing")}</p>}
+          <div className={`tmd-dock-body${dockIn ? " in" : ""}`}>
+            {missing.size > 0 && <p className="tmi-hint">{t("teams.historyMissing")}</p>}
             {history !== null && history.length === 0 && (
               <EmptyState title={t("teams.noHistory")} hint={t("teams.noHistoryHint")} />
             )}
-            {(history ?? []).map((row) => (
-              <div className="settings-row mail-row" key={row.key}>
-                <div className="sr-body">
-                  {/* Same clipping as the inbox rows, for the same reason: the
-                      note is unbounded prose and used to set the row's height
-                      (2026-08-01 UI review, P1 1-1 — this list has the defect
-                      the review found next door). */}
-                  <div className="sr-title mail-line">
-                    <span className="mail-from">
-                      {row.from} <IconArrowRight size={13} /> {row.to}
+            {(history ?? []).length > 0 && (
+              <ul>
+                {(history ?? []).map((row, j) => (
+                  <li className="arr" key={row.key} style={{ "--j": j } as CSSProperties}>
+                    {/* Same clipping as the inbox rows, for the same reason: the
+                        note is unbounded prose and used to set the row's height
+                        (2026-08-01 UI review, P1 1-1 — this list has the defect
+                        the review found next door). */}
+                    <span className="arr-route">
+                      {row.from} <IconArrowRight size={13} aria-hidden="true" /> {row.to}
                     </span>
-                    {row.note && <span className="mail-note">{row.note}</span>}
-                  </div>
-                </div>
-                <div className="mail-meta">
-                  <TimeAgo at={row.at} />
-                </div>
-              </div>
-            ))}
+                    <span className="arr-note">{row.note ?? ""}</span>
+                    <TimeAgo className="arr-at" at={row.at} />
+                  </li>
+                ))}
+              </ul>
+            )}
             {historyTotal > HISTORY_CAP && (
-              <p className="section-hint">{t("teams.historyCap", { n: HISTORY_CAP })}</p>
+              <p className="tmi-hint">{t("teams.historyCap", { n: HISTORY_CAP })}</p>
             )}
           </div>
         )}
       </div>
 
       {adding && (
-        <Modal label={t("teams.addMemberTitle")} onClose={() => setAdding(false)}>
+        <Modal label={t("teams.addMemberTitle")} narrow onClose={() => setAdding(false)}>
           <div className="form">
             <h2 className="form-heading">{t("teams.addMemberTitle")}</h2>
             <label className="field">
@@ -1032,7 +1253,7 @@ export default function TeamDetail({
                 onChange={(e) => setFilter(e.target.value)}
               />
             </label>
-            <div className="team-pick-list">
+            <div className={`dlg-picks${filtered.length > 0 ? " dlg-picks--fade" : ""}`}>
               {/* "Nothing left to add" and "your search matched nothing" are
                   different states — the old copy blamed the registry for both
                   and never mentioned the box the user just typed in (D65). */}
@@ -1049,7 +1270,7 @@ export default function TeamDetail({
               {filtered.map((row) => (
                 <button
                   key={row.root}
-                  className="team-pick-row"
+                  className="dlg-pick"
                   disabled={busy}
                   onClick={() => {
                     setAdding(false);
@@ -1057,12 +1278,12 @@ export default function TeamDetail({
                     void run(() => api.teamAddMember(team.id, row.root));
                   }}
                 >
-                  <span className="team-member-name">{row.name}</span>
-                  <PathLabel className="team-member-path" path={row.root} actions={false} />
+                  <b>{row.name}</b>
+                  <PathLabel className="dlg-pick-path" path={row.root} actions={false} />
                 </button>
               ))}
             </div>
-            <p className="section-hint">{t("teams.addMemberHint")}</p>
+            <p className="dlg-hint">{t("teams.addMemberHint")}</p>
             <div className="form-actions">
               <button className="btn" onClick={() => setAdding(false)}>
                 {t("common.cancel")}
@@ -1075,6 +1296,7 @@ export default function TeamDetail({
       {primePicking && (
         <Modal
           label={t("teams.primeTitle")}
+          narrow
           onClose={() => {
             setPrimePicking(false);
             setPrimeFilter("");
@@ -1085,14 +1307,14 @@ export default function TeamDetail({
             <p className="muted">{team.prime ? t("teams.primeOn") : t("teams.primeOff")}</p>
 
             {team.prime && (
-              <div className="settings-row">
-                <div className="sr-body">
-                  <div className="sr-title">{team.prime.name}</div>
-                  <PathLabel className="team-member-path" path={team.prime.root} actions={false} />
+              <div className="dlg-prime">
+                <div>
+                  <b>{team.prime.name}</b>
+                  <PathLabel className="dlg-pick-path" path={team.prime.root} actions={false} />
                 </div>
                 {/* Clearing takes authority away and deletes nothing — the
                     reversible tier of D102, so no red and no confirmation. */}
-                <button className="btn" disabled={busy} onClick={() => void setPrime(null)}>
+                <button className="btn btn-small" disabled={busy} onClick={() => void setPrime(null)}>
                   {t("teams.primeClear")}
                 </button>
               </div>
@@ -1107,7 +1329,7 @@ export default function TeamDetail({
                 onChange={(e) => setPrimeFilter(e.target.value)}
               />
             </label>
-            <div className="team-pick-list">
+            <div className={`dlg-picks${primeFiltered.length > 0 ? " dlg-picks--fade" : ""}`}>
               {primeFiltered.length === 0 &&
                 (joinable.length === 0 ? (
                   <EmptyState title={t("teams.noPrimeable")} hint={t("teams.noPrimeableHint")} />
@@ -1121,16 +1343,16 @@ export default function TeamDetail({
               {primeFiltered.map((row) => (
                 <button
                   key={row.root}
-                  className="team-pick-row"
+                  className="dlg-pick"
                   disabled={busy}
                   onClick={() => void setPrime(row.root)}
                 >
-                  <span className="team-member-name">{row.name}</span>
-                  <PathLabel className="team-member-path" path={row.root} actions={false} />
+                  <b>{row.name}</b>
+                  <PathLabel className="dlg-pick-path" path={row.root} actions={false} />
                 </button>
               ))}
             </div>
-            <p className="section-hint">{t("teams.primeHint")}</p>
+            <p className="dlg-hint">{t("teams.primeHint")}</p>
             <div className="form-actions">
               <button
                 className="btn"
@@ -1170,41 +1392,45 @@ export default function TeamDetail({
             const id = confirmRemove.workspaceId;
             setConfirmRemove(null);
             if (selectedId === id) setSelectedId(null);
-            void run(() => api.teamRemoveMember(team.id, id));
+            void run(async () => {
+              const list = await api.teamRemoveMember(team.id, id);
+              // C217: the rail row fades where it stands before it goes.
+              await fadeRowsOut([railRow(id)]);
+              return list;
+            });
           }}
           onCancel={() => setConfirmRemove(null)}
         />
       )}
 
       {routing && (
-        <Modal label={t("teams.route")} onClose={() => setRouting(null)}>
-          <div className="form">
+        <Modal label={t("teams.route")} narrow onClose={() => setRouting(null)}>
+          <div className="form" ref={sendFormRef}>
             <h2 className="form-heading">{t("teams.route")}</h2>
-            {routing.delivery.note && <p>{routing.delivery.note}</p>}
+            {routing.delivery.note && (
+              <p className="dlg-note" ref={noteRef}>
+                {routing.delivery.note}
+              </p>
+            )}
             {routing.candidates.length === 0 ? (
               <EmptyState title={t("teams.noRoutes")} hint={t("teams.noRoutesHint")} />
             ) : (
               <>
-                <p className="section-hint">{t("teams.routeHint")}</p>
-                <div>
+                <p className="dlg-hint">{t("teams.routeHint")}</p>
+                <div className="dlg-cands">
                   {routing.candidates.map((candidate) => {
                     const key = candidateKey(candidate);
                     return (
-                      <label key={key} className="settings-row" style={{ cursor: "pointer" }}>
-                        <div className="sr-body">
-                          <div className="sr-title">
-                            {candidate.name}{" "}
-                            {candidate.autoRoute && (
-                              <span className="chip">{t("teams.autoChip")}</span>
-                            )}
-                          </div>
-                          <div className="sr-desc">
+                      <label key={key} className="dlg-cand">
+                        <span>
+                          <b>{candidate.name}</b>
+                          {candidate.autoRoute && <span className="chip">{t("teams.autoChip")}</span>}
+                          <small>
                             {t("teams.viaTeam")} {candidate.teamName}
-                          </div>
-                        </div>
+                          </small>
+                        </span>
                         <input
                           type="checkbox"
-                          style={{ accentColor: "var(--accent)" }}
                           checked={routing.checked.has(key)}
                           onChange={(e) => {
                             const next = new Set(routing.checked);
@@ -1217,20 +1443,22 @@ export default function TeamDetail({
                     );
                   })}
                 </div>
-                <div className="form-actions">
-                  <button className="btn" onClick={() => setRouting(null)}>
-                    {t("common.cancel")}
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    disabled={busy || routing.checked.size === 0}
-                    onClick={() => void routeNow()}
-                  >
-                    {t("teams.routeConfirm")}
-                  </button>
-                </div>
               </>
             )}
+            <div className="form-actions">
+              <button className="btn" onClick={() => setRouting(null)}>
+                {t("common.cancel")}
+              </button>
+              {routing.candidates.length > 0 && (
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || routing.checked.size === 0}
+                  onClick={() => void routeNow()}
+                >
+                  {t("teams.routeConfirm")}
+                </button>
+              )}
+            </div>
           </div>
         </Modal>
       )}
@@ -1240,6 +1468,43 @@ export default function TeamDetail({
 
 function candidateKey(c: RouteCandidate): string {
   return `${c.teamId}:${c.workspaceId}`;
+}
+
+/**
+ * The core answers with downstream names in three buckets, in the order the
+ * destinations were given. Walk the picked candidates in that same order to
+ * put each delivered name back with the member and the team it went through.
+ */
+function toShown(
+  result: RouteOutcome,
+  sending: { workspaceId: string; delivery: DeliverySummary },
+  picked: RouteCandidate[],
+  live: boolean,
+): ShownOutcome {
+  const reached = picked.filter((c) => !result.failed.some((f) => sameRoot(f.root, c.root)));
+  const delivered: ShownOutcome["delivered"] = [];
+  let di = 0;
+  let ai = 0;
+  for (const c of reached) {
+    if (result.alreadyDelivered[ai] !== undefined && result.alreadyDelivered[ai] === c.name) {
+      ai++;
+      continue;
+    }
+    if (result.delivered[di] !== undefined) {
+      delivered.push({ workspaceId: c.workspaceId, teamId: c.teamId, name: result.delivered[di], teamName: c.teamName });
+      di++;
+    } else {
+      ai++;
+    }
+  }
+  return {
+    envelope: { id: sending.delivery.id, note: sending.delivery.note ?? null, at: new Date().toISOString() },
+    from: sending.delivery.from.name,
+    delivered,
+    alreadyDelivered: result.alreadyDelivered,
+    failed: result.failed,
+    live,
+  };
 }
 
 /** Split an absolute root into parent + folder for the probe IPC. */

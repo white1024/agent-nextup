@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -12,8 +13,13 @@ import { api, errorMessage } from "../api";
 import { useGuardedMutation } from "../hooks";
 import { baseName } from "../lib/format";
 import EmptyState from "../components/EmptyState";
-import TeachingHint from "../components/TeachingHint";
-import { IconPopout, IconStopSquare, IconX } from "../components/icons";
+import ErrorBar from "../components/ErrorBar";
+import IdentityField from "../components/IdentityField";
+import InfoTip from "../components/InfoTip";
+import TermCard, { retractErrorThen } from "../components/TermCard";
+import { IconPlay, IconPopout, IconStopSquare, IconX } from "../components/icons";
+import { motionOff } from "../lib/fx";
+import { viewSwap } from "../lib/listMotion";
 import {
   TERMINAL_FONT_DEFAULT,
   lastActiveTerminal,
@@ -62,14 +68,20 @@ const CLOSE_ARM_MS = 4000;
  *  usable again before the user can finish reaching for the keyboard. */
 const DRAG_SETTLE_MS = 150;
 
-/** Fixed dark scheme: a terminal is a terminal in both app themes. Values
- *  mirror the app's dark surface/step tokens (design source claude-design). */
+/** Fixed dark scheme: a terminal is a terminal in both app themes (spec 40:
+ *  the design's cold near-black, not the old warm one). The cursor and the
+ *  selection are the text colour — orange now means "waiting on you", and a
+ *  blinking orange block would say that all the time. */
 const TERM_THEME = {
-  background: "#1a1815",
-  foreground: "#e8e2d9",
-  cursor: "#e07a3f",
-  selectionBackground: "#e07a3f44",
+  background: "#0b0b12",
+  foreground: "#d9d6ee",
+  cursor: "#d9d6ee",
+  selectionBackground: "#d9d6ee44",
 };
+
+/** The bundled mono first (D153 ②); the rest are what was here before. */
+const TERM_FONT = "'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace";
+const TERM_FONT_FALLBACK = "'Cascadia Mono', Consolas, 'Courier New', monospace";
 
 /** Session ids we've already fired an on-view resume for this app session
  *  (D69 / G3). Module-level so it survives the terminal view unmounting when
@@ -121,6 +133,12 @@ export default function TerminalView({
   const [knownIdentities, setKnownIdentities] = useState<string[]>(() => recentIdentities());
   const [identity, setIdentity] = useState(() => recentIdentities()[0] ?? "");
   const tablistRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  /** Sessions whose popped-out flag just flipped (C222's main-window half):
+   *  their card or pane fades in instead of appearing. */
+  const [flipped, setFlipped] = useState<ReadonlySet<number>>(() => new Set());
+  const sessionsRef = useRef<TerminalSessionMeta[] | null>(null);
+  sessionsRef.current = sessions;
 
   /** Tabs to render — `sessions` keeps `null` for the "not read yet" case. */
   const tabs = sessions ?? [];
@@ -148,12 +166,30 @@ export default function TerminalView({
             : idx === 0
               ? last
               : idx - 1;
-    setActive(tabs[next].id);
-    // tabIndex is recomputed from `active`, so focusing has to wait for
-    // React to commit before the newly focusable tab exists.
-    requestAnimationFrame(() => {
-      tablistRef.current?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
-    });
+    focusTabNext.current = true;
+    activate(tabs[next].id);
+  }
+
+  // The tab moved to by keyboard takes focus once `active` has committed —
+  // which, inside C28's View Transition, is a frame or two after the key. A
+  // parent effect, so it runs after the pane's own (which focuses xterm on
+  // activation) and the keyboard stays on the tab row.
+  const focusTabNext = useRef(false);
+  useEffect(() => {
+    if (!focusTabNext.current) return;
+    focusTabNext.current = false;
+    tablistRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
+  }, [active]);
+
+  /**
+   * C28: another tab becomes the active one. The line under the selected tab
+   * slides to it and the terminal cross-fades, inside a View Transition
+   * (`tabi` and `pane`, named only for its duration). xterm draws its own
+   * glyphs, so the pane only fades as a whole — never row by row.
+   */
+  function activate(id: number) {
+    if (id === active) return;
+    viewSwap("tm", panelRef.current, () => flushSync(() => setActive(id)));
   }
 
   // Sessions of this workspace only; the app-level overview (step ⑤ of the
@@ -162,6 +198,9 @@ export default function TerminalView({
     try {
       const all = await api.terminalList();
       const mine = all.filter((s) => s.root === root);
+      const before = new Map((sessionsRef.current ?? []).map((s) => [s.id, s.poppedOut]));
+      const flips = mine.filter((s) => before.has(s.id) && before.get(s.id) !== s.poppedOut);
+      if (flips.length > 0 && !motionOff()) setFlipped(new Set(flips.map((s) => s.id)));
       setSessions(mine);
       setActive((cur) => {
         if (cur !== null && mine.some((s) => s.id === cur)) return cur;
@@ -226,8 +265,14 @@ export default function TerminalView({
       // rejected must not come back as a suggestion next time.
       rememberIdentity(name);
       setKnownIdentities(recentIdentities());
-      setSessions((cur) => [...(cur ?? []), meta]);
-      setActive(meta.id);
+      // The new tab arrives inside C28's transition: the line slides from the
+      // tab that was selected (or from the dashed placeholder, C224).
+      viewSwap("tm", panelRef.current, () =>
+        flushSync(() => {
+          setSessions((cur) => [...(cur ?? []), meta]);
+          setActive(meta.id);
+        }),
+      );
       onSessionsChanged?.();
     });
   }
@@ -298,6 +343,12 @@ export default function TerminalView({
     setConfirmingClose(null);
   }, [active]);
 
+  useEffect(() => {
+    if (flipped.size === 0) return;
+    const id = window.setTimeout(() => setFlipped(new Set()), 700);
+    return () => window.clearTimeout(id);
+  }, [flipped]);
+
   async function closeSession(meta: TerminalSessionMeta) {
     // Closing a live process is destructive: two-step confirm, same pattern
     // as catalog deletes. Exited tabs dismiss immediately.
@@ -320,6 +371,35 @@ export default function TerminalView({
     }
   }
 
+  /** One tab's placeholder card when it cannot hold a live pane. */
+  function restoredCard(s: TerminalSessionMeta) {
+    // D69: a restored tab keeps no scrollback — render a placeholder card,
+    // never TerminalPane. When revive flips it to running the element type
+    // changes at the same key, so React remounts a fresh xterm (this is what
+    // avoids the stale-seq black screen, G1). The card carries the on-view
+    // resume's loading/failure.
+    const rv = reviving[s.id];
+    if (rv === "loading") return <TermCard title={t("term.resuming")} />;
+    const failed = rv !== undefined;
+    return (
+      <TermCard
+        title={t("term.restoredTitle", { agent: s.title })}
+        hint={t("term.restoredHint")}
+        error={failed ? `${t("term.resumeFailed")}: ${rv.error}` : null}
+      >
+        <button
+          className="btn btn-small btn-primary"
+          onClick={(e) => retractErrorThen(e.currentTarget, () => void doRevive(s))}
+        >
+          {failed ? t("term.retry") : t("term.resume")}
+        </button>
+        <button className="btn btn-small btn-ghost" onClick={() => void closeSession(s)}>
+          {t("term.closeTab")}
+        </button>
+      </TermCard>
+    );
+  }
+
   return (
     <div className="view view--term">
       <header className="view-header">
@@ -329,10 +409,13 @@ export default function TerminalView({
         </div>
       </header>
 
-      {error && <div className="alert alert-error">{error}</div>}
+      <ErrorBar error={error} />
 
-      <div className="term-toolbar">
-        <span className="muted">{t("term.launchLabel")}</span>
+      <div className="panel lb">
+        <span className="lb-l">
+          {t("term.launchLabel")}
+          <InfoTip label={t("term.manageLabel")}>{t("term.manageAgents")}</InfoTip>
+        </span>
         {agents.map((agent) => (
           <button
             key={agent.id}
@@ -341,85 +424,73 @@ export default function TerminalView({
             title={agent.installed ? [agent.command, ...agent.args].join(" ") : t("term.notInstalledTip")}
             onClick={() => void launch(agent.id)}
           >
+            <IconPlay size={11} />
             {agent.title}
           </button>
         ))}
         {/* Identity (D63) applies to the *next* launch, so it sits beside the
-            buttons rather than inside a per-agent menu. Free text with a
-            datalist of past names, because Agent NextUp has no identity registry to
+            buttons rather than inside a per-agent menu. Free text with the
+            names used before, because Agent NextUp has no identity registry to
             populate a real dropdown from — a name is whatever an agent
             reports, and inventing a roster here would imply otherwise. */}
-        <span className="term-identity">
-          <label className="muted" htmlFor="term-identity-input">
-            {t("term.identityLabel")}
-          </label>
-          <input
-            id="term-identity-input"
-            list="term-identity-options"
-            maxLength={64}
-            value={identity}
-            placeholder={t("term.identityPlaceholder")}
-            onChange={(e) => setIdentity(e.target.value)}
-          />
-          <datalist id="term-identity-options">
-            {knownIdentities.map((name) => (
-              <option key={name} value={name} />
-            ))}
-          </datalist>
-        </span>
+        <IdentityField
+          id="term-identity"
+          value={identity}
+          onChange={setIdentity}
+          options={knownIdentities}
+        />
       </div>
-      <TeachingHint id="term-identity" className="term-identity-hint">
-        {t("term.identityHint")}
-      </TeachingHint>
 
-      {sessions === null ? null : tabs.length === 0 ? (
-        /* Wrapper, not a bare EmptyState: every direct child of `.view--term`
-           is put on a centred, content-width track. The card wants its own
-           460px, so as a direct child it either stretched to that track's full
-           width or — once pinned to 460px — sat flush against the viewport
-           edge while the header above it stayed centred. The wrapper takes the
-           track; the card keeps its width and starts at the track's left edge,
-           lining up with the toolbar. Removing this div reopens both bugs. */
-        <div className="term-empty-slot">
-          <EmptyState
-            variant="guide"
-            title={t("term.empty")}
-            hint={t("term.manageAgents")}
-            steps={[t("term.step1"), t("term.step2"), t("term.step3")]}
-          />
-        </div>
-      ) : (
-        <>
-          <div className="term-tabs" role="tablist" aria-label={t("term.heading")} ref={tablistRef}>
-            {tabs.map((s) => (
+      {/* `null` = not read yet: the panel's bare frame only — no dashed tab,
+          no "no sessions" copy, nothing that claims an answer (invariant 10).
+          The frame is there so the agent overview's page change has somewhere
+          to grow into before the list arrives (C27 / C291). Empty = a dashed
+          placeholder tab over a dark terminal with the three steps in it
+          (spec 40, C224), so a first launch fills in a shape already there. */}
+      <section className="panel term" data-vt="term" ref={panelRef}>
+        <div className="term-tabs" role="tablist" aria-label={t("term.heading")} ref={tablistRef}>
+          {sessions !== null && tabs.length === 0 && (
+            <div className="term-tab term-tab--empty active" aria-hidden="true">
+              <span className="term-tab-ph" />
+              <i className="tab-i" data-vt-name="tabi" />
+            </div>
+          )}
+          {tabs.map((s) => {
+            const on = active === s.id;
+            const armed = s.status === "running" && confirmingClose === s.id;
+            return (
               /* role="tab" stays on the div rather than becoming a
                  <button>: the close button nests inside it, and a button
                  inside a button is invalid HTML. Instead this uses the
                  standard ARIA tabs pattern — roving tabindex (only the
                  selected tab is reachable by Tab) plus arrow keys to move
-                 between tabs and switch immediately. This used to be the
-                 only clickable thing in the whole app that wasn't a button,
-                 so the keyboard could reach "close tab" but not "select
-                 tab". */
+                 between tabs and switch immediately. */
               <div
                 key={s.id}
                 role="tab"
-                tabIndex={active === s.id ? 0 : -1}
-                aria-selected={active === s.id}
-                className={`term-tab ${active === s.id ? "active" : ""} ${s.status !== "running" ? "exited" : ""}`}
-                onClick={() => setActive(s.id)}
+                tabIndex={on ? 0 : -1}
+                aria-selected={on}
+                className={`term-tab${on ? " active" : ""}${s.status !== "running" ? " exited" : ""}`}
+                onClick={() => activate(s.id)}
                 onKeyDown={(e) => onTabKey(e, s.id)}
               >
+                {s.status === "running" ? (
+                  <i className={`dot-run${motionOff() ? "" : " amb"}`} aria-hidden="true" />
+                ) : (
+                  <i className="mk-o" aria-hidden="true" />
+                )}
                 <span className="term-tab-title">{s.title}</span>
                 {/* Which identity this session reports as — the tab is the
-                    only place it stays visible once the CLI takes over. */}
+                    only place it stays visible once the CLI takes over. No
+                    identity, no word: "anonymous" on every tab is noise. */}
                 {s.identity !== null && (
-                  <span className="chip term-tab-identity" title={t("term.identityLabel")}>
+                  <small className="term-tab-identity" title={t("term.identityLabel")}>
                     {s.identity}
-                  </span>
+                  </small>
                 )}
+                {s.status === "restored" && <span className="chip">{t("term.restored")}</span>}
                 {s.status === "exited" && (
-                  <span className="chip template-badge">
+                  <span className="chip">
                     {s.exitCode !== null && s.exitCode !== 0
                       ? t("term.exitedWithCode", { n: s.exitCode })
                       : t("term.exited")}
@@ -444,18 +515,10 @@ export default function TerminalView({
                     stop square also says what the next click does — it kills a
                     process, it does not dismiss a tab. */}
                 <button
-                  className={`term-tab-close${
-                    s.status === "running" && confirmingClose === s.id
-                      ? " term-tab-close--armed"
-                      : ""
-                  }`}
-                  title={
-                    s.status === "running" && confirmingClose === s.id
-                      ? t("term.closeConfirm")
-                      : t("term.closeTab")
-                  }
+                  className={`term-tab-close${armed ? " term-tab-close--armed" : ""}`}
+                  title={armed ? t("term.closeConfirm") : t("term.closeTab")}
                   aria-label={
-                    s.status === "running" && confirmingClose === s.id
+                    armed
                       ? t("term.closeArmed", { name: s.title })
                       : t("term.closeTabOf", { name: s.title })
                   }
@@ -464,100 +527,71 @@ export default function TerminalView({
                     void closeSession(s);
                   }}
                 >
-                  {s.status === "running" && confirmingClose === s.id ? (
-                    <IconStopSquare size={12} />
-                  ) : (
-                    <IconX size={12} />
-                  )}
+                  {armed ? <IconStopSquare size={12} /> : <IconX size={12} />}
                 </button>
+                {on && <i className="tab-i" data-vt-name="tabi" aria-hidden="true" />}
               </div>
-            ))}
-          </div>
-          {confirmingClose !== null && (
-            <p className="muted term-close-hint">{t("term.closeConfirm")}</p>
+            );
+          })}
+        </div>
+        {confirmingClose !== null && (
+          <p className="term-close-hint">{t("term.closeConfirm")}</p>
+        )}
+        <div className="term-pane-host" data-vt-name="pane">
+          {sessions !== null && tabs.length === 0 && (
+            <div className="term-pane term-rest">
+              <EmptyState
+                variant="guide"
+                title={t("term.empty")}
+                hint={t("term.manageAgents")}
+                steps={[t("term.step1"), t("term.step2"), t("term.step3")]}
+              />
+            </div>
           )}
-          <div className="term-pane-host">
-            {tabs.map((s) => {
-              if (s.poppedOut) {
-                // Live pane lives in the pop-out window; here we only hold the
-                // slot and offer to dock it back (B16-C move semantics).
-                return (
-                  <div
-                    key={s.id}
-                    className={`term-pane term-popped ${active === s.id ? "" : "term-pane-hidden"}`}
-                    role="tabpanel"
-                  >
-                    <div className="term-popped-card">
-                      <p className="muted">{t("term.poppedOut")}</p>
-                      <button className="btn btn-small" onClick={() => void dockBack(s)}>
-                        {t("term.dockBack")}
-                      </button>
-                    </div>
-                  </div>
-                );
-              }
-              if (s.status === "restored") {
-                // D69: a restored tab keeps no scrollback — render a placeholder
-                // card, never TerminalPane. When revive flips it to running the
-                // element type changes at the same key, so React remounts a
-                // fresh xterm (this is what avoids the stale-seq black screen,
-                // G1). The card carries the on-view resume's loading/failure.
-                const rv = reviving[s.id];
-                return (
-                  <div
-                    key={s.id}
-                    className={`term-pane term-restored-card ${active === s.id ? "" : "term-pane-hidden"}`}
-                    role="tabpanel"
-                  >
-                    <div className="term-restored-inner">
-                      {rv === "loading" ? (
-                        <p className="muted">{t("term.resuming")}</p>
-                      ) : rv ? (
-                        <>
-                          <p className="term-restored-title">{t("term.resumeFailed")}</p>
-                          <p className="muted">{rv.error}</p>
-                          <div className="term-restored-actions">
-                            <button className="btn btn-small" onClick={() => void doRevive(s)}>
-                              {t("term.retry")}
-                            </button>
-                            <button
-                              className="btn btn-small btn-ghost"
-                              onClick={() => void closeSession(s)}
-                            >
-                              {t("term.closeTab")}
-                            </button>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <p className="term-restored-title">
-                            {t("term.restoredTitle", { agent: s.title })}
-                          </p>
-                          <p className="muted">{t("term.restoredHint")}</p>
-                          <div className="term-restored-actions">
-                            <button className="btn btn-small" onClick={() => void doRevive(s)}>
-                              {t("term.resume")}
-                            </button>
-                            <button
-                              className="btn btn-small btn-ghost"
-                              onClick={() => void closeSession(s)}
-                            >
-                              {t("term.closeTab")}
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
-              // running or exited: the live/last pane, replayed from the
-              // in-memory ring (which a restored tab does not have).
-              return <TerminalPane key={s.id} meta={s} active={active === s.id} />;
-            })}
-          </div>
-        </>
-      )}
+          {tabs.map((s) => {
+            const flip = flipped.has(s.id) ? " is-flip" : "";
+            if (s.poppedOut) {
+              // Live pane lives in the pop-out window; here we only hold the
+              // slot and offer to dock it back (B16-C move semantics).
+              return (
+                <div
+                  key={s.id}
+                  className={`term-pane term-rest term-popped${flip} ${active === s.id ? "" : "term-pane-hidden"}`}
+                  role="tabpanel"
+                >
+                  <TermCard title={t("term.poppedOut")}>
+                    <button className="btn btn-small" onClick={() => void dockBack(s)}>
+                      <IconPopout size={13} />
+                      {t("term.dockBack")}
+                    </button>
+                  </TermCard>
+                </div>
+              );
+            }
+            if (s.status === "restored") {
+              return (
+                <div
+                  key={s.id}
+                  className={`term-pane term-rest ${active === s.id ? "" : "term-pane-hidden"}`}
+                  role="tabpanel"
+                >
+                  {restoredCard(s)}
+                </div>
+              );
+            }
+            // running or exited: the live/last pane, replayed from the
+            // in-memory ring (which a restored tab does not have).
+            return (
+              <TerminalPane
+                key={s.id}
+                meta={s}
+                active={active === s.id}
+                className={flip}
+              />
+            );
+          })}
+        </div>
+      </section>
     </div>
   );
 }
@@ -642,9 +676,12 @@ export function TerminalPane({
   active,
   role = "tabpanel",
   label,
+  className = "",
 }: {
   meta: TerminalSessionMeta;
   active: boolean;
+  /** Extra classes for the pane (a fade-in after docking back, C222). */
+  className?: string;
   /** `tabpanel` where the pane really is one of a tablist's panels (the
    *  workspace terminal's tabs). The agent overview selects from a list of
    *  sessions, not a tablist, so it passes `region` and a label — claiming a
@@ -678,7 +715,7 @@ export function TerminalPane({
     const term = new XTerm({
       cursorBlink: true,
       fontSize: terminalFontSize(),
-      fontFamily: "'Cascadia Mono', Consolas, 'Courier New', monospace",
+      fontFamily: TERM_FONT,
       scrollback: 5000,
       theme: TERM_THEME,
     });
@@ -692,6 +729,21 @@ export function TerminalPane({
     term.open(node);
     termRef.current = term;
     fitRef.current = fit;
+
+    // xterm measures its cell from the font it has *now*. The bundled face is
+    // loaded on first use, so a pane opened before anything else needed it (a
+    // fresh pop-out window) would keep the fallback's cell under the real
+    // glyphs. Once it is in, step the family off and back — xterm re-measures
+    // on a family change, not on a font load.
+    const probe = `${terminalFontSize()}px 'JetBrains Mono'`;
+    if (!document.fonts.check(probe)) {
+      void document.fonts.load(probe).then(() => {
+        if (termRef.current !== term) return;
+        term.options.fontFamily = TERM_FONT_FALLBACK;
+        term.options.fontFamily = TERM_FONT;
+        if (node.clientHeight > 0 && node.clientWidth > 0) fit.fit();
+      });
+    }
 
     // Ctrl/⌘ +/− resizes the font, Ctrl/⌘ 0 restores it — the binding every
     // terminal emulator uses, and the one the webview does not provide: Tauri
@@ -888,7 +940,7 @@ export function TerminalPane({
   return (
     <div
       ref={containerRef}
-      className={`term-pane ${active ? "" : "term-pane-hidden"}`}
+      className={`term-pane ${active ? "" : "term-pane-hidden"}${className}`}
       role={role}
       aria-label={label}
     />

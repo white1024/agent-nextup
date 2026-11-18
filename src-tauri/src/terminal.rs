@@ -550,6 +550,11 @@ impl TerminalManager {
         if let Some(path) = self.session_path(id) {
             let _ = std::fs::remove_file(path);
         }
+        // Tell every window. The session is already out of the table, so the
+        // waiter thread finds nothing and sends no Exit — without this a
+        // pop-out of a session closed from the main window was never told and
+        // sat there with a dead terminal (spec 40, C222 / R-40-26).
+        (self.sink)(TerminalEvent::SessionsChanged);
         Ok(())
     }
 
@@ -1152,6 +1157,26 @@ mod tests {
         mgr.set_popped_out(4, false).expect("toggle back");
         assert!(!mgr.list()[0].popped_out);
         assert_eq!(mgr.set_popped_out(999, true).unwrap_err().kind(), "not_found");
+    }
+
+    /// Closing broadcasts a reload, so a pop-out of the closed session learns
+    /// it is gone — the waiter thread cannot say so, the session having
+    /// already left the table.
+    #[test]
+    fn close_broadcasts_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = sample_meta(5, dir.path(), TerminalStatus::Restored);
+        atomic_write_json(
+            &dir.path().join("5.json"),
+            &PersistedSession { schema_version: TERMINAL_PERSIST_SCHEMA_VERSION, meta },
+        )
+        .expect("seed");
+        let (mgr, rx) = channel_manager_persistent(dir.path());
+        mgr.close(5).expect("close");
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(1)), Ok(TerminalEvent::SessionsChanged)),
+            "closing tells every window to reload"
+        );
     }
 
     #[test]

@@ -4,8 +4,12 @@
 //! Teams are the first app-level structure with real semantics (the registry
 //! is pointers only). Members reference workspaces by their stable
 //! `workspaceId` — root/name are display caches, so a moved folder breaks
-//! nothing a re-link cannot fix. Edges must stay a DAG: on a cycle, "who is
-//! downstream" has no answer, and routing expands deliveries along edges.
+//! nothing a re-link cannot fix. Edges may loop (D161): "downstream" here is
+//! always one hop — the members this one has an edge *to* — which a cycle does
+//! not blur, and a delivery never travels more than that one hop on its own:
+//! arriving in an inbox publishes nothing, so every further hop is somebody's
+//! publish. A reviewer sending findings back upstream is a loop, and drawing
+//! it is what the graph is for.
 //!
 //! Every mutation below reads the whole file, edits it and writes it back, so
 //! each one runs inside [`with_app_lock`] — `atomic_write` keeps each *file*
@@ -52,11 +56,18 @@ pub struct Team {
     pub members: Vec<TeamMember>,
     #[serde(default)]
     pub edges: Vec<TeamEdge>,
-    /// Saved canvas positions keyed by member workspaceId (D53). Presentation
-    /// state, not semantics — absent entries are auto-placed by the GUI, and
-    /// opening a team never writes this (only drags / auto-tidy do).
+    /// Saved canvas positions keyed by member workspaceId (D53), for the star
+    /// map — the default canvas style. Presentation state, not semantics —
+    /// absent entries are auto-placed by the GUI, and opening a team never
+    /// writes this (only drags / auto-tidy do).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub layout: HashMap<String, NodePos>,
+    /// The same, for the orbit canvas style (D157). Same shape and rules as
+    /// `layout`; a separate map because the two styles place members in
+    /// different coordinate systems, so one shared map would scramble the
+    /// other style on every switch. Pre-D157 files load it empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub orbit_layout: HashMap<String, NodePos>,
     /// This team's prime workspace (D116, 21 §4.1): the workspace whose agent
     /// may edit *this* team's graph and route *this* team's deliveries.
     /// Authority is scoped per team, not per workspace — a workspace can be
@@ -82,6 +93,20 @@ pub struct Team {
 pub struct NodePos {
     pub x: f64,
     pub y: f64,
+}
+
+/// Which canvas style a set of positions belongs to (D157). The style itself
+/// is a per-machine GUI preference; the core only needs to know which map a
+/// save goes into.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutSkin {
+    /// The star map, stored in `layout` — the default, and where every
+    /// pre-D157 caller's saves still go.
+    #[default]
+    Star,
+    /// Members orbiting the hub, stored in `orbit_layout`.
+    Orbit,
 }
 
 /// One member workspace. `workspace_id` is the identity key; `root` and
@@ -152,7 +177,8 @@ pub struct RosterMember {
 /// makes that instruction followable.
 ///
 /// What it deliberately does NOT do is let the agent act on the answer:
-/// `publish_delivery` still names no recipient and still cannot send. This is
+/// `publish_delivery` still names no recipient — where it goes is the edges a
+/// human drew, sent at once only on an edge a human made automatic (D152). This is
 /// the read half only, and it is scoped to the asker's own teams — a member of
 /// one team learns nothing about any other team's existence.
 ///
@@ -290,6 +316,7 @@ pub fn create_team(path: &Path, name: &str) -> Result<Team> {
             members: Vec::new(),
             edges: Vec::new(),
             layout: HashMap::new(),
+            orbit_layout: HashMap::new(),
             prime: None,
             created_at: now.clone(),
             updated_at: now,
@@ -371,6 +398,7 @@ pub fn remove_member(path: &Path, team_id: &str, workspace_id: &str) -> Result<(
         }
         team.edges.retain(|e| e.from != workspace_id && e.to != workspace_id);
         team.layout.remove(workspace_id);
+        team.orbit_layout.remove(workspace_id);
         // The prime is never a member (D117), so leaving a team cannot strip a
         // designation — that is `set_prime(None)`, a separate deliberate act.
         team.updated_at = now_rfc3339();
@@ -413,10 +441,17 @@ fn reject_member_as_prime(team: &Team, workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist the team-canvas node positions (D53). The GUI sends the full map;
-/// ids that are not current members are dropped silently (tidies up after
-/// departed members). Presentation state only — no ledger, no workspace I/O.
-pub fn set_layout(path: &Path, team_id: &str, positions: HashMap<String, NodePos>) -> Result<()> {
+/// Persist the team-canvas node positions (D53) for one canvas style (D157).
+/// The GUI sends the full map for that style; the other style's map is left
+/// untouched. Ids that are not current members are dropped silently (tidies
+/// up after departed members). Presentation state only — no ledger, no
+/// workspace I/O.
+pub fn set_layout(
+    path: &Path,
+    team_id: &str,
+    skin: LayoutSkin,
+    positions: HashMap<String, NodePos>,
+) -> Result<()> {
     with_app_lock(path, || {
         let mut file = load_teams(path)?;
         let team = team_mut(&mut file, team_id)?;
@@ -424,15 +459,19 @@ pub fn set_layout(path: &Path, team_id: &str, positions: HashMap<String, NodePos
             .into_iter()
             .filter(|(id, _)| team.members.iter().any(|m| &m.workspace_id == id))
             .collect();
-        team.layout = kept;
+        match skin {
+            LayoutSkin::Star => team.layout = kept,
+            LayoutSkin::Orbit => team.orbit_layout = kept,
+        }
         team.updated_at = now_rfc3339();
         save(path, file)
     })
 }
 
 /// Add a directed edge `from → to`. Both endpoints must be members; self
-/// loops, duplicates and anything that would close a cycle are refused — the
-/// graph stays a DAG so "who is downstream" always has an answer (09 §3).
+/// loops and duplicates are refused. An edge that closes a cycle is allowed
+/// (D161, overturning 09 §12 Q3): see the module doc for why a loop neither
+/// blurs "downstream" nor runs by itself.
 pub fn add_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<()> {
     with_app_lock(path, || {
         let mut file = load_teams(path)?;
@@ -449,11 +488,6 @@ pub fn add_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<()> 
         }
         if team.edges.iter().any(|e| e.from == from && e.to == to) {
             return Err(NextUpError::InvalidInput("this edge already exists".into()));
-        }
-        if reaches(&team.edges, to, from) {
-            return Err(NextUpError::InvalidInput(format!(
-                "adding {from} → {to} would create a cycle — team flows must stay a DAG"
-            )));
         }
         team.edges.push(TeamEdge { from: from.to_string(), to: to.to_string(), auto_route: false });
         team.updated_at = now_rfc3339();
@@ -552,6 +586,43 @@ pub fn rebind_workspace(
             )));
         }
         save(path, file)?;
+        Ok(touched)
+    })
+}
+
+/// Carry a project rename into the team graph (D151): every member entry and
+/// every prime slot for `workspace_id` takes `new_name`. Answers how many teams
+/// changed. Unlike [`rebind_workspace`], belonging to no team is not an error —
+/// most projects are in none, and renaming one must not fail for it. Nothing
+/// is written when nothing matched or the name was already current, so a
+/// rename never creates `teams.json` on a machine that has no teams.
+pub fn rename_workspace(path: &Path, workspace_id: &str, new_name: &str) -> Result<usize> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(NextUpError::InvalidInput("project name cannot be empty".into()));
+    }
+    if !path.is_file() {
+        return Ok(0);
+    }
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let now = now_rfc3339();
+        let mut touched = 0usize;
+        for team in file.teams.iter_mut() {
+            let mut hit = false;
+            let entries = team.members.iter_mut().chain(team.prime.iter_mut());
+            for entry in entries.filter(|m| m.workspace_id == workspace_id && m.name != new_name) {
+                entry.name = new_name.to_string();
+                hit = true;
+            }
+            if hit {
+                team.updated_at = now.clone();
+                touched += 1;
+            }
+        }
+        if touched > 0 {
+            save(path, file)?;
+        }
         Ok(touched)
     })
 }
@@ -669,24 +740,6 @@ pub fn designate_prime(
     let member = TeamMember { workspace_id, root: root.to_string(), name: context.name };
     set_prime(teams_path, team_id, Some(member.clone()))?;
     Ok(member)
-}
-
-/// Is `goal` reachable from `start` along the directed edges?
-fn reaches(edges: &[TeamEdge], start: &str, goal: &str) -> bool {
-    let mut stack = vec![start];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(node) = stack.pop() {
-        if node == goal {
-            return true;
-        }
-        if !seen.insert(node) {
-            continue;
-        }
-        for edge in edges.iter().filter(|e| e.from == node) {
-            stack.push(&edge.to);
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1103,22 +1156,43 @@ mod tests {
     }
 
     #[test]
-    fn edges_must_be_a_dag_between_members() {
+    fn edges_run_between_members_and_may_loop() {
         let (_g, path, team) = seeded();
         add_edge(&path, &team.id, "a", "b").unwrap();
         add_edge(&path, &team.id, "b", "c").unwrap();
 
-        // Self loop, non-member endpoint, duplicate, cycle — all refused.
+        // Self loop, non-member endpoint, duplicate — refused.
         assert_eq!(add_edge(&path, &team.id, "a", "a").unwrap_err().kind(), "invalid_input");
         assert_eq!(add_edge(&path, &team.id, "a", "zz").unwrap_err().kind(), "invalid_input");
         assert_eq!(add_edge(&path, &team.id, "a", "b").unwrap_err().kind(), "invalid_input");
-        let cycle = add_edge(&path, &team.id, "c", "a").unwrap_err();
-        assert_eq!(cycle.kind(), "invalid_input");
-        assert!(cycle.to_string().contains("cycle"));
 
-        // A diamond (a→b, a→c... here a→c alongside a→b→c) is NOT a cycle.
-        add_edge(&path, &team.id, "a", "c").unwrap();
-        assert_eq!(load_teams(&path).unwrap().teams[0].edges.len(), 3);
+        // A loop is not (D161): the reviewer at the end sends findings back
+        // to the start, and a pair can answer each other directly.
+        add_edge(&path, &team.id, "c", "a").unwrap();
+        add_edge(&path, &team.id, "b", "a").unwrap();
+        let edges = load_teams(&path).unwrap().teams[0].edges.clone();
+        assert_eq!(edges.len(), 4);
+        // Creation order is kept: the canvas reads the edge that closed a
+        // loop as the one that runs back, so the order is part of the data.
+        let order: Vec<_> = edges.iter().map(|e| format!("{}{}", e.from, e.to)).collect();
+        assert_eq!(order, ["ab", "bc", "ca", "ba"]);
+    }
+
+    #[test]
+    fn a_member_on_a_loop_is_downstream_of_whoever_it_sends_to() {
+        let (_g, path, team) = seeded();
+        add_edge(&path, &team.id, "a", "b").unwrap();
+        add_edge(&path, &team.id, "b", "a").unwrap();
+        let teams = load_teams(&path).unwrap().teams;
+
+        // One hop, both ways: each is downstream of the other, and the third
+        // member — on the team, on no flow — is downstream of neither.
+        for (me, other) in [("a", "b"), ("b", "a")] {
+            let roster = roster_for(&teams, me);
+            let marks: Vec<_> = roster[0].members.iter().map(|m| (m.workspace_id.as_str(), m.downstream)).collect();
+            assert!(marks.contains(&(other, true)), "{me}: {marks:?}");
+            assert!(marks.contains(&("c", false)), "{me}: {marks:?}");
+        }
     }
 
     #[test]
@@ -1174,6 +1248,49 @@ mod tests {
     }
 
     #[test]
+    fn rename_reaches_every_member_entry_and_prime_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        let one = create_team(&path, "one").unwrap();
+        let two = create_team(&path, "two").unwrap();
+        let three = create_team(&path, "three").unwrap();
+        add_member(&path, &one.id, member("a")).unwrap();
+        add_member(&path, &one.id, member("b")).unwrap();
+        add_member(&path, &two.id, member("a")).unwrap();
+        // `a` coordinates a team it is not a member of (D117).
+        set_prime(&path, &three.id, Some(member("a"))).unwrap();
+
+        assert_eq!(rename_workspace(&path, "a", "  Alpha ").unwrap(), 3);
+        let loaded = load_teams(&path).unwrap();
+        for team in &loaded.teams {
+            let entries: Vec<_> = team.members.iter().chain(team.prime.iter()).collect();
+            for m in entries.iter().filter(|m| m.workspace_id == "a") {
+                assert_eq!(m.name, "Alpha");
+                assert_eq!(m.root, "C:/ws/a", "a rename is not a move");
+            }
+        }
+        let b = loaded.teams[0].members.iter().find(|m| m.workspace_id == "b").unwrap();
+        assert_eq!(b.name, "b", "other members keep their names");
+
+        // Already current: nothing to write, nothing touched.
+        assert_eq!(rename_workspace(&path, "a", "Alpha").unwrap(), 0);
+        assert_eq!(rename_workspace(&path, "a", " ").unwrap_err().kind(), "invalid_input");
+    }
+
+    #[test]
+    fn renaming_a_project_in_no_team_is_quiet_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        assert_eq!(rename_workspace(&path, "a", "Alpha").unwrap(), 0);
+        assert!(!path.exists(), "no teams.json on a machine that never made a team");
+
+        create_team(&path, "one").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(rename_workspace(&path, "ghost", "Alpha").unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "not a member: file untouched");
+    }
+
+    #[test]
     fn rebind_updates_caches_across_every_team() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("teams.json");
@@ -1210,7 +1327,7 @@ mod tests {
         let mut pos = HashMap::new();
         pos.insert("a".to_string(), NodePos { x: 40.0, y: 80.0 });
         pos.insert("ghost".to_string(), NodePos { x: 1.0, y: 2.0 });
-        set_layout(&path, &team.id, pos).unwrap();
+        set_layout(&path, &team.id, LayoutSkin::Star, pos).unwrap();
 
         let layout = load_teams(&path).unwrap().teams[0].layout.clone();
         assert_eq!(layout.len(), 1, "unknown ids are dropped silently");
@@ -1222,7 +1339,7 @@ mod tests {
             "removing a member tidies its saved position"
         );
         assert_eq!(
-            set_layout(&path, "ghost-team", HashMap::new()).unwrap_err().kind(),
+            set_layout(&path, "ghost-team", LayoutSkin::Star, HashMap::new()).unwrap_err().kind(),
             "not_found"
         );
     }
@@ -1242,8 +1359,8 @@ mod tests {
             ]);
             std::thread::scope(|scope| {
                 scope.spawn(|| add_edge(&path, &team.id, "a", "b").unwrap());
-                scope.spawn(|| set_layout(&path, &team.id, pos.clone()).unwrap());
-                scope.spawn(|| set_layout(&path, &team.id, pos.clone()).unwrap());
+                scope.spawn(|| set_layout(&path, &team.id, LayoutSkin::Star, pos.clone()).unwrap());
+                scope.spawn(|| set_layout(&path, &team.id, LayoutSkin::Star, pos.clone()).unwrap());
             });
 
             let loaded = load_teams(&path).unwrap();
@@ -1263,11 +1380,69 @@ mod tests {
         let path = dir.path().join("teams.json");
         let team = create_team(&path, "t").unwrap();
         assert!(team.layout.is_empty());
+        assert!(team.orbit_layout.is_empty());
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !raw.contains("layout"),
+            !raw.contains("\"layout\"") && !raw.contains("\"orbitLayout\""),
             "pre-D53 file shape is preserved until a layout is actually saved"
         );
+    }
+
+    /// D157: each canvas style keeps its own positions. A save for one style
+    /// must leave the other's map exactly as it was — sharing one map is what
+    /// would scramble the star map every time someone looked at the orbit.
+    #[test]
+    fn each_skin_keeps_its_own_layout() {
+        let (_g, path, team) = seeded();
+        let star = HashMap::from([("a".to_string(), NodePos { x: 60.0, y: 60.0 })]);
+        let orbit = HashMap::from([
+            ("a".to_string(), NodePos { x: -120.0, y: 30.0 }),
+            ("b".to_string(), NodePos { x: 90.0, y: -45.0 }),
+            ("ghost".to_string(), NodePos { x: 1.0, y: 2.0 }),
+        ]);
+        set_layout(&path, &team.id, LayoutSkin::Star, star.clone()).unwrap();
+        set_layout(&path, &team.id, LayoutSkin::Orbit, orbit).unwrap();
+
+        let saved = load_teams(&path).unwrap().teams[0].clone();
+        assert_eq!(saved.layout, star, "an orbit save leaves the star map alone");
+        assert_eq!(saved.orbit_layout.len(), 2, "unknown ids are dropped from the orbit map too");
+        assert_eq!(saved.orbit_layout["b"], NodePos { x: 90.0, y: -45.0 });
+
+        set_layout(&path, &team.id, LayoutSkin::Star, HashMap::new()).unwrap();
+        let saved = load_teams(&path).unwrap().teams[0].clone();
+        assert!(saved.layout.is_empty());
+        assert_eq!(saved.orbit_layout.len(), 2, "a star save leaves the orbit map alone");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"orbitLayout\""), "the field is camelCase on disk");
+        assert!(!raw.contains("\"layout\""), "an empty star map is still not written");
+
+        remove_member(&path, &team.id, "a").unwrap();
+        let saved = load_teams(&path).unwrap().teams[0].clone();
+        assert!(!saved.orbit_layout.contains_key("a"), "removing a member clears both maps");
+        assert!(saved.orbit_layout.contains_key("b"));
+    }
+
+    /// A pre-D157 file has no `orbitLayout`; it loads with an empty one and
+    /// its star map intact, and the skin parameter's wire names are the ones
+    /// the GUI's style preference uses.
+    #[test]
+    fn pre_d157_file_loads_and_skin_names_match_the_gui() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":1,"teams":[{"id":"t1","name":"t","members":[{"workspaceId":"a","root":"C:/ws/a","name":"a"}],"edges":[],"layout":{"a":{"x":60.0,"y":60.0}},"createdAt":"2026-07-18T00:00:00Z","updatedAt":"2026-07-18T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let team = load_teams(&path).unwrap().teams[0].clone();
+        assert_eq!(team.layout["a"], NodePos { x: 60.0, y: 60.0 });
+        assert!(team.orbit_layout.is_empty());
+
+        assert_eq!(LayoutSkin::default(), LayoutSkin::Star, "old callers keep saving the star map");
+        assert_eq!(serde_json::to_string(&LayoutSkin::Star).unwrap(), "\"star\"");
+        assert_eq!(serde_json::from_str::<LayoutSkin>("\"orbit\"").unwrap(), LayoutSkin::Orbit);
+        assert!(serde_json::from_str::<LayoutSkin>("\"now\"").is_err(), "unknown styles are refused");
     }
 
     #[test]

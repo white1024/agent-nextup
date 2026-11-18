@@ -37,6 +37,12 @@ tauri-plugin-updater = "~2.12"
 # macOS quit path only (G065). Already in the tree via tao, so this pulls in
 # nothing new — it just lets us name `NSApplication terminate:` directly,
 # which is the one shutdown sequence AppKit does not crash on.
+# Native title bar colour and caption (titlebar.rs). This exact version is
+# already in the tree through tauri's own dependencies, so it pulls in nothing
+# new — it only lets us name the two Win32 calls directly.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }

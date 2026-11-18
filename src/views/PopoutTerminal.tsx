@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { api } from "../api";
+import { motionOff } from "../lib/fx";
 import { workspaceName } from "../lib/format";
 import type { TerminalSessionMeta, WorkspaceOverview } from "../types";
 import { TerminalPane } from "./Terminal";
+
+/** How long "this session has closed" stays up before the window goes
+ *  (spec 40, C222: long enough to be read, not long enough to wait on). */
+const GONE_HOLD_MS = 2600;
 
 /** A single terminal session rendered in its own OS window (B16-C, "pop-out").
  *  The session lives in Rust and its output is broadcast to every window, so
@@ -24,6 +29,13 @@ export default function PopoutTerminal({ sessionId }: { sessionId: number }) {
   // overview does. `null` until it resolves; workspaceName falls back to the
   // folder name meanwhile, so the bar never renders nameless.
   const [overview, setOverview] = useState<WorkspaceOverview[] | null>(null);
+  /** The last meta seen, so a closed session's pane can stay behind the
+   *  notice (dimmed) instead of vanishing under it. */
+  const [last, setLast] = useState<TerminalSessionMeta | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (meta) setLast(meta);
+  }, [meta]);
 
   const reload = useCallback(async () => {
     try {
@@ -64,8 +76,24 @@ export default function PopoutTerminal({ sessionId }: { sessionId: number }) {
   }, []);
 
   // The session was dismissed from the main window — nothing left to render.
+  // It used to destroy the window at once, so "this session has closed" was
+  // on screen for a frame. Now the pane dims behind that line, it holds, the
+  // window fades and only then goes (C222; reduced motion: no fade).
   useEffect(() => {
-    if (meta === null) void getCurrentWindow().destroy();
+    if (meta !== null) return;
+    const destroy = () => void getCurrentWindow().destroy();
+    const id = window.setTimeout(() => {
+      const el = rootRef.current;
+      if (el === null || motionOff()) {
+        destroy();
+        return;
+      }
+      el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 460, fill: "forwards" }).finished.then(
+        destroy,
+        destroy,
+      );
+    }, GONE_HOLD_MS);
+    return () => window.clearTimeout(id);
   }, [meta]);
 
   // Closing this window (dock button or the OS close) hands the session back:
@@ -83,8 +111,10 @@ export default function PopoutTerminal({ sessionId }: { sessionId: number }) {
     };
   }, [sessionId]);
 
+  const shown = meta ?? last;
+
   return (
-    <div className="popout">
+    <div className="popout" ref={rootRef}>
       <header className="popout-bar">
         {/* The three things the main window's tab row carries and a detached
             window otherwise drops: which project, which agent, whose identity.
@@ -92,18 +122,18 @@ export default function PopoutTerminal({ sessionId }: { sessionId: number }) {
             scanned for, and the other two are identical across them by
             construction (the same CLI, launched the same way). */}
         <span className="popout-ident">
-          {meta && (
-            <span className="popout-project" title={meta.root}>
-              {workspaceName(overview, meta.root)}
+          {shown && (
+            <span className="popout-project" title={shown.root}>
+              {workspaceName(overview, shown.root)}
             </span>
           )}
-          <span className="popout-title">{meta?.title ?? t("term.heading")}</span>
-          {meta && (
+          <span className="popout-title">{shown?.title ?? t("term.heading")}</span>
+          {shown && (
             <span
-              className={`chip term-tab-identity${meta.identity === null ? " is-anon" : ""}`}
+              className={`chip${shown.identity === null ? " is-anon" : ""}`}
               title={t("term.identityLabel")}
             >
-              {meta.identity ?? t("term.identityAnon")}
+              {shown.identity ?? t("term.identityAnon")}
             </span>
           )}
         </span>
@@ -111,12 +141,10 @@ export default function PopoutTerminal({ sessionId }: { sessionId: number }) {
           {t("term.dockBack")}
         </button>
       </header>
-      <div className="popout-body">
-        {meta ? (
-          <TerminalPane meta={meta} active />
-        ) : meta === null ? (
-          <p className="muted popout-gone">{t("term.popoutGone")}</p>
-        ) : null}
+      <div className={`popout-body${meta === null ? " is-gone" : ""}`}>
+        {/* Same session id, so the same mounted pane — it only dims. */}
+        {shown && <TerminalPane meta={shown} active />}
+        {meta === null && <p className="popout-gone">{t("term.popoutGone")}</p>}
       </div>
     </div>
   );

@@ -47,16 +47,25 @@ export const BOOT_HOLD_MS = 260;
  *  moment existed only in `pnpm tauri dev`. Shown on request: the screen is
  *  wanted for its own sake, not as an apology for a wait.
  *
- *  It is one number. Drop it to 0 and the behaviour is exactly what it was
- *  before — splash only when the machine is actually slow.
+ *  D154 ④ made it the whole C1 sequence, every launch: the hold, then 2150ms
+ *  of cube, icon, name and subtitle (index.html's `--boot-t0` timeline) before
+ *  the mark may fly into the sidebar (C2, `BOOT_EXIT_MS` more). The owner chose
+ *  the full sequence every time over a shortened or first-run-only one, knowing
+ *  it adds about 1.7s to each start.
  *
- *  ⚠️ Paired with the `boot-pulse` period in index.html, and the pairing is
- *  the whole point of the value. The mark's pulse is only legible if the
- *  screen stays up for at least one full cycle: at 800ms against a 1.8s pulse
- *  a packaged boot showed 38% of a cycle, entirely within the rising half, so
- *  the mark just brightened once and left — running, animated, and reading as
- *  a plain fade-in. **Shorten this and the pulse stops being a pulse.** */
-export const BOOT_MIN_VISIBLE_MS: number = 1200;
+ *  It is one number. Drop it to 0 and the splash shows only when the machine
+ *  is actually slow.
+ *
+ *  ⚠️ Still paired with the `boot-pulse` period in index.html: the pulse is
+ *  the slow-boot signal now (C226), and a pulse nobody sees turn around reads
+ *  as a fade-in — 800ms against a 1.8s cycle once shipped as exactly that.
+ *  src/boot.test.ts holds the showing to at least one full cycle. */
+export const BOOT_MIN_VISIBLE_MS: number = BOOT_HOLD_MS + 2150;
+
+/** The C2 exit that follows the showing: the mark flies into the sidebar logo,
+ *  the splash fades, the sidebar slides in. The shell is already rendered under
+ *  it, so this is the length of an overlay, not of a wait. */
+export const BOOT_EXIT_MS = 750;
 
 /** When the boot stops looking merely slow and starts looking stuck.
  *
@@ -70,8 +79,11 @@ export const BOOT_MIN_VISIBLE_MS: number = 1200;
  *  covering that is the design working — telling that user something is wrong
  *  would be a lie the app cannot support, and a worse one than silence. So the
  *  threshold sits far above any plausible healthy boot, and what it produces is
- *  a way out rather than a diagnosis. */
-export const BOOT_SLOW_MS = 10_000;
+ *  a way out rather than a diagnosis.
+ *
+ *  12s since D154 ④: it has to stay well clear of the (now 2.4s) minimum
+ *  showing — boot.test.ts asks for more than four times it. */
+export const BOOT_SLOW_MS = 12_000;
 
 /** Milliseconds since the document origin, or null when there is no mark to
  *  measure from (outside Tauri, or in a test that never ran the inline
@@ -111,22 +123,21 @@ export function bootSlowDelay(): number {
  *
  *  The handoff renders the same markup under the same class, and the styles
  *  survive it — index.html's inline `<style>` is in `<head>`, so only the
- *  `#root` children were replaced. The *animations* do not survive it. A
- *  freshly mounted element restarts both of them from zero, and each breaks
- *  differently on a boot slow enough to have shown the splash already:
+ *  `#root` children were replaced. The *animations* do not survive it: a
+ *  freshly mounted element restarts every one of them from zero, so on a boot
+ *  slow enough to have shown the splash already the cube would turn in a
+ *  second time and the name would blink out and arrive again.
  *
- *    `hold`   the container's fade would run its 260ms hold a second time, so
- *             the mark blinks out and fades back in. A negative value instead
- *             drops it in at the opacity it had reached, and past the fade
- *             entirely once enough time has gone by. Clamped at 0, never
- *             positive: index.html's copy holds back because a fast boot may
- *             not want a splash at all, but by the time App is mounting that
- *             question is already settled — BOOT_MIN_VISIBLE_MS says it is
- *             being shown, so waiting again would only eat into the showing.
- *    `shift`  the mark's pulse would jump back to the start of its cycle —
- *             visible as a step in brightness, since 0% is its dimmest frame.
- *             Offsetting an infinite animation shifts its phase rather than
- *             its start, so the cycle simply continues.
+ *    `hold`  the container's fade would run its 260ms hold a second time, so
+ *            the screen blinks out and fades back in. A negative value instead
+ *            drops it in at the opacity it had reached. Clamped at 0, never
+ *            positive: index.html's copy holds back because a fast boot may
+ *            not want a splash at all, but by the time App is mounting that
+ *            question is already settled — BOOT_MIN_VISIBLE_MS says it is being
+ *            shown, so waiting again would only eat into the showing.
+ *    `t0`    where the C1 sequence starts (`--boot-t0`, D154). Every C1 delay is
+ *            counted from it, so one negative offset carries the whole sequence
+ *            on from wherever index.html's copy had got to.
  *
  *  Both undefined when there is no mark to measure from, which leaves the
  *  stylesheet's own values in place — the pre-handoff behaviour.
@@ -134,15 +145,15 @@ export function bootSlowDelay(): number {
  *  ⚠️ Call this **once per mounted element**, not once per render. The values
  *  position the animations against the document origin, so handing an element
  *  a freshly computed pair on a later render moves that origin out from under
- *  a running animation and steps the pulse forward. The splash outlives at
- *  least one re-render by design (BOOT_MIN_VISIBLE_MS keeps it up past the
- *  arrival of `status`), so this is reachable, not theoretical. */
-export function bootSplashDelays(): { hold?: string; shift?: string } {
+ *  a running sequence. The splash outlives at least one re-render by design
+ *  (BOOT_MIN_VISIBLE_MS keeps it up past the arrival of `status`), so this is
+ *  reachable, not theoretical. */
+export function bootSplashDelays(): { hold?: string; t0?: string } {
   if (typeof window === "undefined") return {};
   const started = window.__boot?.html;
   if (started === undefined) return {};
   const elapsed = Date.now() - started;
-  return { hold: `${Math.min(0, BOOT_HOLD_MS - elapsed)}ms`, shift: `-${elapsed}ms` };
+  return { hold: `${Math.min(0, BOOT_HOLD_MS - elapsed)}ms`, t0: `${BOOT_HOLD_MS - elapsed}ms` };
 }
 
 export function markBoot(mark: BootMark) {

@@ -60,6 +60,23 @@ pub enum Gate {
     DoctorClean,
 }
 
+impl Gate {
+    /// The wire tag (`kind`) alone — for surfaces that draw a gate's *shape*
+    /// (engine-checked vs. a person confirms) without its parameters. Kept
+    /// honest by a test against the actual serialization.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Gate::MinTasks { .. } => "min_tasks",
+            Gate::AllTasksDone => "all_tasks_done",
+            Gate::NoBlockedTasks => "no_blocked_tasks",
+            Gate::ArtifactExists { .. } => "artifact_exists",
+            Gate::MinDecisions { .. } => "min_decisions",
+            Gate::ManualConfirm { .. } => "manual_confirm",
+            Gate::DoctorClean => "doctor_clean",
+        }
+    }
+}
+
 /// `.nextup/workflow.json` — the instantiated harness: template phases plus
 /// live position, transition history and human confirmations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

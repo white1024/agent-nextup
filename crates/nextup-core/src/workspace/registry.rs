@@ -55,6 +55,13 @@ pub struct WorkspaceOverview {
     pub current_phase_title: Option<String>,
     #[serde(default)]
     pub workflow_completed: bool,
+    /// 0-based position of the current phase and how many there are, for
+    /// "phase 2 / 5". None when there is no workflow or the state points at
+    /// an unknown phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_count: Option<usize>,
     /// Instantiated harness identity (D45 — the project catalog groups by
     /// template). None when the workspace has no workflow.json yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +158,10 @@ pub fn overview(path: &Path) -> Result<Vec<WorkspaceOverview>> {
                         .find(|p| p.id == w.state.current_phase)
                         .map(|p| p.title.clone())
                 }),
+                current_phase_index: workflow.as_ref().and_then(|w| {
+                    w.phases.iter().position(|p| p.id == w.state.current_phase)
+                }),
+                phase_count: workflow.as_ref().map(|w| w.phases.len()),
                 template_id: workflow.as_ref().map(|w| w.template_id.clone()),
                 template_name: workflow.as_ref().map(|w| w.template_name.clone()),
                 workflow_completed: workflow.map(|w| w.state.completed).unwrap_or(false),
@@ -248,6 +259,8 @@ mod tests {
         assert!(real.task_counts.is_some());
         assert!(real.current_phase.is_some());
         assert!(real.current_phase_title.is_some(), "phase title resolved for card display");
+        assert_eq!(real.current_phase_index, Some(0), "a fresh workspace sits on its first phase");
+        assert!(real.phase_count.is_some_and(|n| n > 1));
         assert_eq!(real.template_id.as_deref(), Some("generic-v1"));
         assert!(real.template_name.is_some());
 

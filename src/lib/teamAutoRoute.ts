@@ -1,25 +1,26 @@
 /**
  * Auto-send sweep (D71, 13 §3): route pending outbox envelopes along the
- * edges the user marked autoRoute. App-layer automation — the moving is done
- * by this GUI process, never by an agent (09 §1), and only when the app
- * happens to look: a watcher signal, a workspace open, or a team-page read.
+ * edges the user marked autoRoute. The *policy* — which edges, which
+ * envelopes, whether the original stays pending — lives in core
+ * (`exchange::auto_route`, D152), the same copy the hub runs the moment an
+ * agent publishes. What lives here is the app's half: when to sweep, and what
+ * the user hears about it.
+ *
+ * The app sweeps on its own triggers — a watcher signal, a workspace open, a
+ * team-page read, and once per start for every workspace an automatic edge
+ * leaves — so a delivery the hub could not send at publish time (downstream
+ * offline, say) still goes out without anyone pressing send.
  */
 import { api } from "../api";
-import { normRoot, sameRoot } from "./exchange";
+import { normRoot } from "./exchange";
 import type { Toast } from "./notify";
-import type { DeliverySummary, Team } from "../types";
+import type { Team } from "../types";
 
 export type ToastSpec = Omit<Toast, "id" | "count">;
 
 export interface SweepIo {
   pushToast: (spec: ToastSpec) => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
-}
-
-/** Reads a call site already paid for (the team page's outbox fan-out). */
-export interface SweepPre {
-  teams?: Team[];
-  outbox?: DeliverySummary[];
 }
 
 // One gate per workspace root: concurrent triggers merge into a re-run
@@ -41,7 +42,7 @@ function failKey(envelopeId: string, destRoot: string): string {
  * Route every pending envelope of `root` along its auto edges. Resolves true
  * when something was newly delivered, so callers refresh their outbox reads.
  */
-export async function autoRouteSweep(root: string, io: SweepIo, pre?: SweepPre): Promise<boolean> {
+export async function autoRouteSweep(root: string, io: SweepIo): Promise<boolean> {
   const key = normRoot(root);
   const gate = gates.get(key) ?? { busy: false, pending: false };
   gates.set(key, gate);
@@ -51,102 +52,79 @@ export async function autoRouteSweep(root: string, io: SweepIo, pre?: SweepPre):
   }
   gate.busy = true;
   try {
-    return await sweepOnce(root, io, pre);
+    return await sweepOnce(root, io);
   } finally {
     gate.busy = false;
     if (gate.pending) {
       gate.pending = false;
-      // The merged re-run re-reads reality — preloaded rows are stale by now.
       void autoRouteSweep(root, io);
     }
   }
 }
 
-async function sweepOnce(root: string, io: SweepIo, pre?: SweepPre): Promise<boolean> {
-  const teams = pre?.teams ?? (await api.teamsList());
-
-  // This workspace's stable ids. Member roots are display caches, but for the
-  // workspace a sweep was triggered on they are current (rebind refreshes).
-  const mine = new Set<string>();
-  for (const team of teams) {
-    for (const member of team.members) {
-      if (sameRoot(member.root, root)) mine.add(member.workspaceId);
-    }
-  }
-  if (mine.size === 0) return false;
-
-  // Outgoing edges across every team, split by policy. Auto only speaks for
-  // its own edges: while manual edges remain, the envelope must stay pending
-  // — nobody decided to skip them (keep_pending, 13 §3).
-  const autoDests: { root: string; teamId: string; teamName: string }[] = [];
-  let manualEdges = 0;
+/**
+ * The workspaces at least one automatic edge leaves, by root — what the
+ * start-up sweep visits. Edges name members by id; roots are the graph's own
+ * display caches, which is also what routing writes through.
+ */
+export function autoSources(teams: Team[]): string[] {
+  const roots = new Map<string, string>();
   for (const team of teams) {
     for (const edge of team.edges) {
-      if (!mine.has(edge.from)) continue;
-      if (!edge.autoRoute) {
-        manualEdges += 1;
-        continue;
-      }
-      const target = team.members.find((m) => m.workspaceId === edge.to);
-      if (target) autoDests.push({ root: target.root, teamId: team.id, teamName: team.name });
+      if (!edge.autoRoute) continue;
+      const from = team.members.find((m) => m.workspaceId === edge.from);
+      if (from) roots.set(normRoot(from.root), from.root);
     }
   }
-  if (autoDests.length === 0) return false;
+  return [...roots.values()];
+}
 
-  const outbox = pre?.outbox ?? (await api.exchangeList(root, "outbox"));
+async function sweepOnce(root: string, io: SweepIo): Promise<boolean> {
+  const results = await api.teamAutoRoute(root);
   let deliveredAny = false;
-  for (const envelope of outbox) {
-    // A superseded envelope is one its own publisher has declared wrong. On a
-    // manual edge the Replaced tag lets the user not send it; an automatic
-    // edge has nobody to read the tag, so it would forward the mistake into
-    // another project — and a delivery cannot be recalled. Skipping leaves it
-    // pending forever, which is the right outcome: the correction is what
-    // should travel, and it will, on the next sweep.
-    if (envelope.supersededBy) continue;
-    try {
-      const outcome = await api.teamRouteDelivery(root, envelope.id, autoDests, {
-        auto: true,
-        keepPending: manualEdges > 0,
+  for (const { envelopeId, outcome } of results) {
+    if (outcome === null) {
+      // Routing this envelope raised outright (unreadable envelope, a failed
+      // write on this side). Announce it once, like an unreachable destination.
+      if (!failureToasted.has(failKey(envelopeId, "!thrown"))) {
+        failureToasted.add(failKey(envelopeId, "!thrown"));
+        io.pushToast({
+          kind: "autoRouteFailed",
+          tone: "you",
+          warn: true,
+          source: "logo",
+          message: io.t("notify.autoRouteFailed"),
+          dedupeKey: `autoroute-fail:${envelopeId}`,
+        });
+      }
+      continue;
+    }
+    if (outcome.delivered.length > 0) {
+      deliveredAny = true;
+      // A delivery is a state change: re-arm the failure memory so what
+      // fails from here on announces itself again.
+      for (const k of [...failureToasted]) {
+        if (k.startsWith(`${envelopeId}:`)) failureToasted.delete(k);
+      }
+      io.pushToast({
+        kind: "autoRouted",
+        tone: "hub",
+        source: "logo",
+        message: io.t("notify.autoRouted", { to: outcome.delivered.join(", ") }),
+        dedupeKey: `autoroute:${envelopeId}`,
       });
-      if (outcome.delivered.length > 0) {
-        deliveredAny = true;
-        // A delivery is a state change: re-arm the failure memory so what
-        // fails from here on announces itself again.
-        for (const k of [...failureToasted]) {
-          if (k.startsWith(`${envelope.id}:`)) failureToasted.delete(k);
-        }
-        io.pushToast({
-          kind: "autoRouted",
-          tone: "info",
-          message: io.t("notify.autoRouted", { to: outcome.delivered.join(", ") }),
-          dedupeKey: `autoroute:${envelope.id}`,
-        });
-      }
-      const freshFails = outcome.failed.filter((f) => !failureToasted.has(failKey(envelope.id, f.root)));
-      if (freshFails.length > 0) {
-        for (const f of freshFails) failureToasted.add(failKey(envelope.id, f.root));
-        io.pushToast({
-          kind: "autoRouteFailed",
-          tone: "error",
-          message: io.t("notify.autoRouteFailed"),
-          dedupeKey: `autoroute-fail:${envelope.id}`,
-        });
-      }
-    } catch (e) {
-      // Errors cross the IPC bridge as { kind, message } objects (api.ts) —
-      // never match on String(e), that is "[object Object]". A not_found here
-      // means a concurrent send already moved this envelope: done, not an
-      // error, and the failure toast would be a lie.
-      if ((e as { kind?: unknown } | null)?.kind === "not_found") continue;
-      if (!failureToasted.has(failKey(envelope.id, "!thrown"))) {
-        failureToasted.add(failKey(envelope.id, "!thrown"));
-        io.pushToast({
-          kind: "autoRouteFailed",
-          tone: "error",
-          message: io.t("notify.autoRouteFailed"),
-          dedupeKey: `autoroute-fail:${envelope.id}`,
-        });
-      }
+    }
+    const freshFails = outcome.failed.filter((f) => !failureToasted.has(failKey(envelopeId, f.root)));
+    if (freshFails.length > 0) {
+      for (const f of freshFails) failureToasted.add(failKey(envelopeId, f.root));
+      io.pushToast({
+        kind: "autoRouteFailed",
+        tone: "you",
+        warn: true,
+        source: "logo",
+        message: io.t("notify.autoRouteFailed"),
+        dedupeKey: `autoroute-fail:${envelopeId}`,
+      });
     }
   }
   return deliveredAny;

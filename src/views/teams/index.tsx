@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { api } from "../../api";
-import { normRoot, readBoxes } from "../../lib/exchange";
+import { normRoot, readBoxes, sameRoot } from "../../lib/exchange";
 import { useGuardedMutation, useWorkspaceData } from "../../hooks";
 import ConfirmDanger from "../../components/ConfirmDanger";
 import EmptyState from "../../components/EmptyState";
@@ -11,7 +11,14 @@ import Modal from "../../components/Modal";
 import { IconPlus, IconRefresh, IconX } from "../../components/icons";
 import type { Team, WorkspaceOverview } from "../../types";
 import type { ToastSpec } from "../../lib/teamAutoRoute";
+import { motionOff, type Point } from "../../lib/fx";
+import { afterPaint, fadeRowsOut, rowTops, slideRows, EASE_OUT } from "../../lib/listMotion";
+import { growTo } from "../../lib/transitions";
 import TeamDetail from "./Detail";
+import TeamSky from "./TeamSky";
+import TeamOrbit from "./TeamOrbit";
+import { BACK_FLY_MS, OPEN_OUT_MS, flyStars, orbitFlight, parkStars, starCentres, takeStars, type StarState } from "./motion";
+import { teamSkin } from "../../lib/prefs";
 
 interface Props {
   refreshKey: number;
@@ -19,13 +26,23 @@ interface Props {
   pushToast: (spec: ToastSpec) => void;
 }
 
+/** Member names shown on a card before the rest fold into "+N more" (invariant 16). */
+const CARD_NAMES = 6;
+
 /**
  * App-level teams home (D52 — promoted from a seg switcher to the app-wide
- * card-list → full-page-detail convention): every team as a card with member /
- * edge / pending counts; opening one lands in the full-page detail.
+ * card-list → full-page-detail convention): every team as a card with its
+ * constellation (D153 star map, spec 50 §1), member / edge / pending counts and
+ * member names; opening one lands in the full-page detail, the card's stars
+ * flying to their places on the canvas (C56).
+ *
+ * With the orbit style (D157) the card's picture is a small orbit instead
+ * (TeamOrbit, C61/C134) and its cube flies along with the planets (C62).
  */
 export default function TeamsHome({ refreshKey, pushToast }: Props) {
   const { t } = useTranslation();
+  /** Star map or orbit (D157): read once — Settings is another page, so it cannot change under this one. */
+  const [skin] = useState(teamSkin);
   /** Pending-envelope count per outbox root (normalized); missing key = unread yet. */
   const [pendingByRoot, setPendingByRoot] = useState<Map<string, number>>(new Map());
   /** Has the cross-workspace fan-out landed at least once? Never goes back to
@@ -35,6 +52,12 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
   const [creating, setCreating] = useState(false);
   const [teamName, setTeamName] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<Team | null>(null);
+  /** C55: the cards and their stars come in once, when the page is entered. */
+  const [entering, setEntering] = useState(true);
+  /** C56 in progress: which card is opening (the rest sink), or the team flown back to. */
+  const [leaving, setLeaving] = useState<string | null>(null);
+  const [landing, setLanding] = useState<{ id: string; phase: "landing" | "landed" } | null>(null);
+  const gridRef = useRef<HTMLUListElement>(null);
   /**
    * Extra refresh signal for cross-workspace data (D62 walkthrough feedback).
    *
@@ -58,7 +81,7 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     refreshKey + crossRefresh,
   );
   const teams = data?.teams ?? null;
-  const registry: WorkspaceOverview[] = data?.registry ?? [];
+  const registry: WorkspaceOverview[] = useMemo(() => data?.registry ?? [], [data]);
   // Every team mutation answers with the whole list; adopt it without waiting
   // for a re-read (unchanged behaviour — the registry half is untouched by it).
   const setTeams = useCallback(
@@ -77,6 +100,11 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     return () => {
       void unlisten.then((f) => f());
     };
+  }, []);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => setEntering(false), 1600);
+    return () => window.clearTimeout(id);
   }, []);
 
   // Card badges: one outbox read per unique member root (error-isolated —
@@ -108,6 +136,29 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     [pendingByRoot],
   );
 
+  /**
+   * Is a member's folder gone? The list only asks the registry — a positive
+   * "no longer exists" — and does not probe: a member the registry has never
+   * seen is not accused here (the detail view probes, as before).
+   */
+  const goneOf = useCallback(
+    (root: string) => registry.some((r) => sameRoot(r.root, root) && !r.exists),
+    [registry],
+  );
+
+  /** A member's star: amber only once the outbox read has landed. */
+  const stateOf = useCallback(
+    (team: Team) =>
+      (id: string): StarState => {
+        const m = team.members.find((x) => x.workspaceId === id);
+        if (m === undefined) return "ok";
+        if (goneOf(m.root)) return "missing";
+        if (!pendingLoaded) return "ok";
+        return (pendingByRoot.get(normRoot(m.root)) ?? 0) > 0 ? "pending" : "ok";
+      },
+    [goneOf, pendingLoaded, pendingByRoot],
+  );
+
   const open = useMemo(
     () => teams?.find((team) => team.id === openId) ?? null,
     [teams, openId],
@@ -118,6 +169,79 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     if (openId !== null && teams !== null && open === null) setOpenId(null);
   }, [openId, teams, open]);
 
+  const cardOf = (id: string) =>
+    gridRef.current?.querySelector<HTMLElement>(`[data-team="${CSS.escape(id)}"]`) ?? null;
+
+  /**
+   * C56: the other cards sink, this card's words fade, and its stars are
+   * measured and handed to the canvas, which flies them in. A team with no
+   * members has no stars to fly — the card grows into the page instead (C49),
+   * which is also what happens when the card is scrolled out of sight.
+   */
+  function openTeam(team: Team) {
+    if (leaving !== null) return;
+    const card = cardOf(team.id);
+    if (motionOff() || card === null) {
+      setOpenId(team.id);
+      return;
+    }
+    const r = card.getBoundingClientRect();
+    const seen = r.bottom > 0 && r.top < window.innerHeight;
+    const from = starCentres(card);
+    if (team.members.length === 0 || !seen || Object.keys(from).length === 0) {
+      void growTo(
+        { from: card, to: () => document.querySelector("main.content .view"), look: "card", lift: 0.03 },
+        () => setOpenId(team.id),
+      );
+      return;
+    }
+    setLeaving(team.id);
+    window.setTimeout(() => {
+      parkStars(team.id, "open", from);
+      setLeaving(null);
+      setOpenId(team.id);
+    }, OPEN_OUT_MS);
+  }
+
+  /** Back from the detail: stars fly home to the card (C56 / C62), or the page folds into it (C49). */
+  function backFrom(team: Team, stars: Record<string, Point> | null, scale = 1) {
+    if (stars === null || motionOff()) {
+      if (motionOff() || team.members.length > 0) {
+        setOpenId(null);
+        return;
+      }
+      void growTo({ from: null, back: true, look: "card", to: () => cardOf(team.id) }, () => setOpenId(null));
+      return;
+    }
+    parkStars(team.id, "back", stars, scale);
+    setLanding({ id: team.id, phase: "landing" });
+    setOpenId(null);
+  }
+
+  // The list is back on screen: its card's stars are hidden until the canvas's
+  // stars land on them.
+  useLayoutEffect(() => {
+    if (landing === null || landing.phase !== "landing" || openId !== null) return;
+    const team = teams?.find((x) => x.id === landing.id);
+    const parked = takeStars(landing.id, "back");
+    const card = cardOf(landing.id);
+    if (team === undefined || parked === null || card === null) {
+      setLanding(null);
+      return;
+    }
+    const to = starCentres(card);
+    const ids = team.members.map((m) => m.workspaceId);
+    const flight =
+      skin === "orbit"
+        ? orbitFlight(ids, parked.scale, true, stateOf(team))
+        : { ids, state: stateOf(team), edges: team.edges };
+    void flyStars(flight.ids, parked.from, to, { dur: BACK_FLY_MS, back: true, ...flight }).then(() => {
+      setLanding({ id: team.id, phase: "landed" });
+      window.setTimeout(() => setLanding((l) => (l?.id === team.id && l.phase === "landed" ? null : l)), 900);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [landing, openId]);
+
   function createTeam() {
     const name = teamName.trim();
     if (name === "") return;
@@ -125,26 +249,41 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
       setError(null);
       const before = new Set((teams ?? []).map((team) => team.id));
       const list = await api.teamCreate(name);
+      // The dialog does not sink: the new card grows into its page (C49).
+      for (const el of document.querySelectorAll<HTMLElement>(".modal-backdrop")) el.dataset.exit = "none";
       setTeams(list);
       setTeamName("");
       setCreating(false);
       // Land straight in the fresh team (D51 create→editor precedent).
       const fresh = list.find((team) => !before.has(team.id));
-      if (fresh) setOpenId(fresh.id);
+      if (fresh === undefined) return;
+      await afterPaint();
+      void growTo(
+        { from: cardOf(fresh.id), to: () => document.querySelector("main.content .view"), look: "card", lift: 0.03 },
+        () => setOpenId(fresh.id),
+      );
     });
   }
 
   function removeTeam() {
     if (confirmDelete === null) return;
+    const gone = confirmDelete;
     return run(async () => {
       setError(null);
-      setTeams(await api.teamDelete(confirmDelete.id));
+      const list = await api.teamDelete(gone.id);
       setConfirmDelete(null);
+      // C217: the card fades where it stands, then the rest close the gap.
+      const before = rowTops(gridRef.current);
+      await fadeRowsOut([cardOf(gone.id)]);
+      setTeams(list);
+      await afterPaint();
+      slideRows(gridRef.current, before, { duration: 360, easing: EASE_OUT });
     });
   }
 
   if (teams === null) {
-    return <div className="view muted">{t("common.loading")}</div>;
+    // Local JSON, read in a blink: blank, no skeleton (invariant 10(c)).
+    return <div className="view tms" />;
   }
 
   if (open !== null) {
@@ -157,14 +296,23 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
         // view's cross-workspace reads refresh on focus too.
         refreshKey={refreshKey + crossRefresh}
         onTeams={setTeams}
-        onBack={() => setOpenId(null)}
+        onBack={(stars, scale) => backFrom(open, stars, scale)}
         pushToast={pushToast}
       />
     );
   }
 
   return (
-    <div className="view">
+    <div
+      className={[
+        "view tms",
+        entering && landing === null ? "enter" : "",
+        leaving !== null ? "tv-leaving" : "",
+        landing !== null ? "tv-back" : "",
+      ]
+        .filter((c) => c !== "")
+        .join(" ")}
+    >
       <header className="view-header">
         <div className="vh-main">
           <h1>{t("teams.heading")}</h1>
@@ -172,7 +320,7 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
         </div>
         <div className="header-actions">
           <button
-            className="btn btn-ghost btn-icon"
+            className="btn btn-ghost btn-icon tm-refresh"
             title={t("teams.refresh")}
             aria-label={t("teams.refresh")}
             onClick={() => setCrossRefresh((k) => k + 1)}
@@ -185,7 +333,7 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
         </div>
       </header>
 
-      {error && confirmDelete === null && <div className="alert alert-error">{error}</div>}
+      {error && confirmDelete === null && !creating && <div className="alert alert-error">{error}</div>}
 
       {teams.length === 0 ? (
         <section className="panel">
@@ -200,38 +348,71 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
           />
         </section>
       ) : (
-        <ul className="ws-card-grid">
-          {teams.map((team) => {
+        <ul className="tm-grid" ref={gridRef}>
+          {teams.map((team, j) => {
             const pending = pendingOf(team);
+            const names = team.members.slice(0, CARD_NAMES);
+            const more = team.members.length - names.length;
+            const land = landing?.id === team.id ? landing.phase : null;
             return (
-              <li key={team.id} className="ws-card">
-                <button className="ws-card-open" onClick={() => setOpenId(team.id)}>
-                  <span className="ws-card-name">
-                    {team.name}
+              <li
+                key={team.id}
+                data-team={team.id}
+                data-row={team.id}
+                className={[
+                  "panel tm-card",
+                  leaving === team.id ? "tv-picked" : "",
+                  land === "landing" ? "tv-landing" : "",
+                  land === "landed" ? "tv-landed" : "",
+                ]
+                  .filter((c) => c !== "")
+                  .join(" ")}
+                style={{ "--j": j } as CSSProperties}
+              >
+                <button className="tm-card-open" onClick={() => openTeam(team)}>
+                  {skin === "orbit" ? (
+                    <TeamOrbit team={team} state={stateOf(team)} j={j} />
+                  ) : (
+                    <TeamSky team={team} state={stateOf(team)} />
+                  )}
+                  <span className="tm-card-name">
+                    <b>{team.name}</b>
                     {/* The only genuinely slow read in the app: one outbox per
                         member root, across workspaces the watcher does not
                         follow. Until it lands, an absent chip would read as
                         "nothing pending" — so hold the slot instead (D65). */}
                     {!pendingLoaded && team.members.length > 0 ? (
-                      <span
-                        className="chip skel skel-chip"
-                        aria-label={t("common.loading")}
-                      />
+                      <span className="tm-pending tm-pending--skel" aria-label={t("common.loading")} />
                     ) : (
                       pending > 0 && (
-                        <span className="chip team-pending-chip">
+                        <span className="tm-pending">
+                          <i className="mk-y" aria-hidden="true" />
                           {t("teams.cardPending", { n: pending })}
                         </span>
                       )
                     )}
                   </span>
-                  <span className="ws-card-meta">
+                  <span className="tm-card-meta">
                     {t("teams.cardMembers", { n: team.members.length })} ·{" "}
                     {t("teams.cardEdges", { n: team.edges.length })}
                   </span>
+                  {team.members.length > 0 && (
+                    <span className="tm-card-ws">
+                      {names.map((m) => {
+                        const gone = goneOf(m.root);
+                        return (
+                          <span key={m.workspaceId} className={gone ? "gone" : undefined}>
+                            {m.name}
+                            {gone && <span className="sr-only"> ({t("teams.missing")})</span>}
+                          </span>
+                        );
+                      })}
+                      {more > 0 && <span className="tm-card-more">{t("teams.cardMore", { n: more })}</span>}
+                    </span>
+                  )}
                 </button>
                 <button
-                  className="btn btn-ghost btn-icon ws-card-remove danger-trigger"
+                  className="btn btn-ghost btn-icon tm-card-x danger-trigger"
                   title={t("teams.deleteTeam")}
                   aria-label={t("teams.deleteTeam")}
                   onClick={() => {
@@ -248,9 +429,11 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
       )}
 
       {creating && (
-        <Modal label={t("teams.create")} onClose={() => setCreating(false)}>
+        <Modal label={t("teams.create")} narrow onClose={() => setCreating(false)}>
           <div className="form">
             <h2 className="form-heading">{t("teams.create")}</h2>
+            {/* The dialog covers the page header, so a failure has to be said in here. */}
+            {error && <div className="alert alert-error">{error}</div>}
             <label className="field">
               <span>{t("teams.nameLabel")}</span>
               <input
@@ -301,4 +484,3 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     </div>
   );
 }
-

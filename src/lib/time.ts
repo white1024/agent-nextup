@@ -34,6 +34,18 @@ export function clockTime(at: string, lang: string): string {
   ).format(new Date(at));
 }
 
+/** Clock time with seconds ("21:04:37") — the live stream, where calls land seconds apart. */
+export function clockSeconds(at: string, lang: string): string {
+  return cached(`clocks:${lang}`, () =>
+    new Intl.DateTimeFormat(lang, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }),
+  ).format(new Date(at));
+}
+
 /** Full date + time — the tooltip behind every relative label. */
 export function absoluteTime(at: string, lang: string): string {
   return cached(`full:${lang}`, () =>

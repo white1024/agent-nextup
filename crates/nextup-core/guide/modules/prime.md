@@ -71,6 +71,6 @@ Every dispatch has two jobs: get this piece of work done, and leave the team bet
 
 Every tool call lands in this workspace's ledger, and a route you performed is marked as yours in **both** workspaces' ledgers — distinct from a human pressing send and from an automatic edge.
 
-**A member's deliveries follow the flow graph.** Routing one to a project the graph does not put downstream of its sender is refused, so if it should go somewhere else, the edge is what needs changing — and say so, because changing a flow changes what happens to every later delivery, not just this one.
+**A member's deliveries follow the flow graph.** Routing one to a project the graph does not put downstream of its sender is refused, so if it should go somewhere else, the edge is what needs changing — and say so, because changing a flow changes what happens to every later delivery, not just this one. Flows may loop: when work has to come back — a reviewer's findings to the project that built it — add the return edge and leave the forward one where it is. A graph with the forward edge unwired to make room no longer shows how the work actually moves.
 
 **Your own deliveries do not need an edge.** Publish to your outbox and route it to any member: you have no node in the graph to draw an edge from. Being unconstrained here is not licence to be quiet about it — a member that receives a brief it did not expect should be able to read in its own ledger who sent it and why.

@@ -29,9 +29,9 @@ function declared(sheet: string): Set<string> {
 /** Custom properties read anywhere in the sheet.
  *
  *  Deliberately blind to `var(--x, fallback)`: a fallback changes what renders
- *  when `--x` is missing, not whether the reference is a typo. Four rules use
- *  one today (`--accent-line`, `--red-line`, `--red-soft`, `--s-1`, all
- *  declared in `:root`), and they are covered by the same rule as the rest. */
+ *  when `--x` is missing, not whether the reference is a typo. Rules that use
+ *  one (mostly per-element variables like `--i`, `--k`) are covered by the
+ *  same rule as the rest. */
 function referenced(sheet: string): string[] {
   return [...sheet.matchAll(/var\(\s*(--[a-z0-9-]+)/g)].map((m) => m[1]);
 }
@@ -159,5 +159,21 @@ describe("terminal pane geometry", () => {
     // Both regexes matching nothing would compare undefined to undefined.
     expect(token("--term-bg")).toMatch(/^#/);
     expect(themeValue("foreground")).toMatch(/^#/);
+  });
+});
+
+/**
+ * The hub's ring plane is 660 px square around a 250 px-tall hub, so it
+ * reaches about 200 px above and below its own box. Being positioned, it
+ * paints over everything earlier in the page that is not: on the overview
+ * that was all four header buttons, on the Agents page the empty state's two
+ * buttons. Nothing looked wrong; the clicks just landed on the rings
+ * (2026-11-17, found by hand in `pnpm tauri dev`).
+ */
+describe("hub rings", () => {
+  it("never take a click", () => {
+    expect(ruleBody(css, ".hub-rings")).toMatch(/pointer-events:\s*none/);
+    // The orb's halo reaches 70 px past it at z-index 3: same hazard, not yet hit.
+    expect(ruleBody(css, ".orb")).toMatch(/pointer-events:\s*none/);
   });
 });

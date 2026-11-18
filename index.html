@@ -20,7 +20,7 @@
          swapped for a differently-shaped second loading screen. It carries an
          offset animation-delay to stay on one timeline; see lib/boot.ts.
 
-         Everything here is inline and re-states four token values, because
+         Everything here is inline and re-states token values, because
          styles.css arrives with that same bundle. Keep them in sync with the
          Colour block of src/styles.css — src/boot.test.ts fails if they
          drift. -->
@@ -107,40 +107,145 @@
       }
       body {
         margin: 0;
-        background: light-dark(#f6f5f3, #0d0d0f); /* --bg-app */
-        color: light-dark(#6e6b64, #918f89); /* --text-3 */
-        font-family: system-ui, "Segoe UI", "Noto Sans TC", sans-serif; /* --font */
+        background: light-dark(#f3f2fa, #030306); /* --boot-bg */
+        color: light-dark(#615e7c, #8e8aab); /* --text-3 */
+        font-family: "Inter Tight", "Noto Sans TC", system-ui, "Microsoft JhengHei", sans-serif; /* --font */
       }
+
+      /* C1 (D153/D154): a wireframe cube turns in and settles at the mark's
+         angle, the app icon grows out of it with a flash, the name arrives
+         letter by letter, then the subtitle. Pure CSS on purpose — this runs
+         before the bundle exists, so the Web Animations API the rest of the
+         design uses is not available yet.
+
+         Every delay is counted from --boot-t0, the end of the hold. index.html
+         leaves it at the hold itself; App re-renders this markup after
+         createRoot() clears it and passes the elapsed time as a negative
+         offset, so the one timeline carries on instead of restarting. */
       .boot {
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 14px;
+        --boot-t0: 260ms;
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        display: grid;
+        place-items: center;
+        background: light-dark(#f3f2fa, #030306); /* --boot-bg */
         /* Late enough that a fast boot never flashes it, early enough that a
            slow one stops looking broken. */
         animation: boot-in 200ms ease-out 260ms both;
       }
-      .boot svg {
-        color: light-dark(#5b53d1, #837bf0); /* --accent */
-        /* One second, not the 1.8s this started at, and the reason is the
-           showing rather than the rhythm: a pulse is only legible if the
-           screen is up for at least one full cycle, and BOOT_MIN_VISIBLE_MS
-           is what decides that. At 1.8s a packaged boot showed 38% of a cycle
-           — all of it inside the rising half — which reads as a fade-in with
-           no pulse in it at all. Change one of these two and check the other. */
-        animation: boot-pulse 1s ease-in-out infinite;
-        /* Shifted rather than restarted when App re-renders this markup after
-           the handoff: 0% is the dimmest frame, so a restart reads as a step
-           in brightness. Zero for the copy index.html paints, which starts at
-           the origin by definition; App passes the elapsed time as a negative
-           offset and the cycle carries on. See lib/boot.ts. */
-        animation-delay: var(--boot-shift, 0s);
+      .boot-c {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 22px;
       }
-      .boot span {
-        font-size: 13px;
-        letter-spacing: 0.04em;
+      .boot-mark {
+        position: relative;
+        width: 168px;
+        height: 168px;
+      }
+      .boot-flash {
+        position: absolute;
+        inset: -160px;
+        border-radius: 50%;
+        background: radial-gradient(
+          closest-side,
+          light-dark(rgba(91, 79, 224, 0.45), rgba(255, 255, 255, 0.9)),
+          light-dark(rgba(91, 79, 224, 0.14), rgba(160, 152, 255, 0.35)) 35%,
+          transparent 70%
+        );
+        opacity: 0;
+        pointer-events: none;
+        animation: boot-flash 900ms ease-out calc(var(--boot-t0) + 1250ms) both;
+      }
+      .boot-cube-wrap {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        perspective: 2400px;
+        /* Opacity lives on this wrapper, never on the cube: fading an element
+           with preserve-3d flattens it to a single face in Chromium. */
+        animation:
+          boot-cube-in 160ms linear var(--boot-t0) both,
+          boot-cube-out 260ms linear calc(var(--boot-t0) + 1250ms) forwards;
+      }
+      .boot-cube {
+        position: relative;
+        width: 54px;
+        height: 54px;
+        transform-style: preserve-3d;
+        animation: boot-cube-turn 1300ms cubic-bezier(0.15, 0.7, 0.2, 1) var(--boot-t0) both;
+      }
+      .boot-cube i {
+        position: absolute;
+        inset: 0;
+        border: 4.5px solid;
+        border-color: light-dark(#4f43d6, #ffffff); /* --cube-line */
+        border-radius: 3px;
+        backface-visibility: hidden;
+        box-shadow: 0 0 14px rgba(91, 79, 224, 0.35), inset 0 0 14px rgba(91, 79, 224, 0.18); /* --cube-glow */
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) .boot-cube i {
+          box-shadow: 0 0 18px rgba(170, 164, 255, 0.8), inset 0 0 18px rgba(170, 164, 255, 0.5);
+        }
+      }
+      :root[data-theme="dark"] .boot-cube i {
+        box-shadow: 0 0 18px rgba(170, 164, 255, 0.8), inset 0 0 18px rgba(170, 164, 255, 0.5);
+      }
+      .boot-cube i:nth-child(1) { transform: translateZ(27px); }
+      .boot-cube i:nth-child(2) { transform: rotateY(180deg) translateZ(27px); }
+      .boot-cube i:nth-child(3) { transform: rotateY(90deg) translateZ(27px); }
+      .boot-cube i:nth-child(4) { transform: rotateY(-90deg) translateZ(27px); }
+      .boot-cube i:nth-child(5) { transform: rotateX(90deg) translateZ(27px); }
+      .boot-cube i:nth-child(6) { transform: rotateX(-90deg) translateZ(27px); }
+      .boot-icon {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        animation: boot-icon-on 250ms linear calc(var(--boot-t0) + 1250ms) forwards;
+      }
+      .boot-icon svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      .boot-icon .lg-bg {
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: boot-icon-grow 650ms cubic-bezier(0.3, 1.4, 0.5, 1) calc(var(--boot-t0) + 1250ms) both;
+      }
+      .boot-name {
+        color: light-dark(#17152b, #efedf9); /* --text-1 */
+        font-size: 30px;
+        font-weight: 800;
+        line-height: 1;
+        letter-spacing: -0.01em;
+        white-space: pre;
+      }
+      .boot-name .ch {
+        display: inline-block;
+        animation: boot-ch 700ms cubic-bezier(0.16, 1, 0.3, 1)
+          calc(var(--boot-t0) + 1450ms + var(--k) * 40ms) both;
+      }
+      .boot-sub {
+        font-family: "JetBrains Mono", ui-monospace, Consolas, monospace;
+        font-size: 11.5px;
+        font-weight: 500;
+        line-height: 1;
+        letter-spacing: 0.3em;
+        text-transform: uppercase;
+        animation: boot-sub 700ms cubic-bezier(0.16, 1, 0.3, 1) calc(var(--boot-t0) + 1750ms) both;
+      }
+      /* C226: a boot that is taking long keeps the mark beating once a second
+         under the "taking longer than usual" line. Only App adds the class —
+         by then the bundle is in — but the keyframes live here with the rest
+         of the splash. */
+      .boot.is-slow .boot-mark {
+        animation: boot-pulse 1s ease-in-out infinite;
       }
       @keyframes boot-in {
         from {
@@ -150,24 +255,90 @@
           opacity: 1;
         }
       }
-      @keyframes boot-pulse {
-        0%,
-        100% {
-          opacity: 0.45;
+      @keyframes boot-cube-in {
+        from {
+          opacity: 0;
         }
-        50% {
+      }
+      @keyframes boot-cube-out {
+        to {
+          opacity: 0;
+        }
+      }
+      @keyframes boot-cube-turn {
+        from {
+          transform: rotateX(250deg) rotateY(-470deg) scale(0.35);
+        }
+        to {
+          transform: rotateX(-35.264deg) rotateY(45deg) scale(1);
+        }
+      }
+      @keyframes boot-icon-on {
+        to {
           opacity: 1;
         }
       }
+      @keyframes boot-icon-grow {
+        from {
+          transform: scale(0);
+          opacity: 0;
+        }
+      }
+      @keyframes boot-flash {
+        0% {
+          opacity: 0;
+          transform: scale(0.3);
+        }
+        20% {
+          opacity: 1;
+        }
+        100% {
+          opacity: 0;
+          transform: scale(1.4);
+        }
+      }
+      @keyframes boot-ch {
+        from {
+          opacity: 0;
+          transform: translateY(24px) scale(0.9);
+          filter: blur(10px);
+        }
+      }
+      @keyframes boot-sub {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+      }
+      @keyframes boot-pulse {
+        0%,
+        100% {
+          transform: scale(1);
+          opacity: 1;
+        }
+        50% {
+          transform: scale(1.045);
+          opacity: 0.78;
+        }
+      }
       @media (prefers-reduced-motion: reduce) {
-        /* Drop the motion, keep the delay. `animation: none` on .boot would
-           also drop the 260ms hold, so a fast boot would flash the mark at
-           full opacity — the one thing the hold exists to prevent. */
+        /* The result, at once: no cube, the icon and the words already there.
+           `.boot` keeps its fade with a 1ms duration, so the hold still
+           suppresses the splash on a fast boot instead of flashing it. */
         .boot {
           animation-duration: 1ms;
         }
-        .boot svg {
+        .boot-cube-wrap,
+        .boot-flash {
+          display: none;
+        }
+        .boot-icon,
+        .boot-icon .lg-bg,
+        .boot-name .ch,
+        .boot-sub,
+        .boot.is-slow .boot-mark {
           animation: none;
+          opacity: 1;
         }
       }
     </style>
@@ -176,22 +347,44 @@
   <body>
     <div id="root">
       <div class="boot" role="status" aria-live="polite" aria-label="Starting Agent NextUp">
-        <!-- Brand mark, identical to IconLogo in src/components/icons.tsx -->
-        <svg
-          width="34"
-          height="34"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M4 7l8-4 8 4v10l-8 4-8-4z" />
-          <path d="M4 7l8 4 8-4M12 11v10" />
-        </svg>
-        <span>Agent NextUp</span>
+        <div class="boot-c">
+          <div class="boot-mark">
+            <i class="boot-flash"></i>
+            <div class="boot-cube-wrap"><div class="boot-cube"><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+            <!-- The app icon, identical to AppMark / IconLogo in src/components/icons.tsx -->
+            <div class="boot-icon">
+              <svg viewBox="0 0 1024 1024" aria-hidden="true">
+                <defs>
+                  <linearGradient id="boot-lga" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0" stop-color="#6b63e8" />
+                    <stop offset="1" stop-color="#4a42c0" />
+                  </linearGradient>
+                  <linearGradient id="boot-lgb" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#fff" stop-opacity=".16" />
+                    <stop offset=".3" stop-color="#fff" stop-opacity="0" />
+                  </linearGradient>
+                </defs>
+                <g class="lg-bg">
+                  <rect width="1024" height="1024" rx="228" fill="url(#boot-lga)" />
+                  <rect width="1024" height="1024" rx="228" fill="url(#boot-lgb)" />
+                </g>
+                <g
+                  transform="translate(152 152) scale(30)"
+                  fill="none"
+                  stroke="#fff"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+                  <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+                </g>
+              </svg>
+            </div>
+          </div>
+          <div class="boot-name" aria-hidden="true"><span class="ch" style="--k: 0">A</span><span class="ch" style="--k: 1">g</span><span class="ch" style="--k: 2">e</span><span class="ch" style="--k: 3">n</span><span class="ch" style="--k: 4">t</span> <span class="ch" style="--k: 6">N</span><span class="ch" style="--k: 7">e</span><span class="ch" style="--k: 8">x</span><span class="ch" style="--k: 9">t</span><span class="ch" style="--k: 10">U</span><span class="ch" style="--k: 11">p</span></div>
+          <div class="boot-sub" aria-hidden="true">nextup hub</div>
+        </div>
       </div>
     </div>
     <script type="module" src="/src/main.tsx"></script>

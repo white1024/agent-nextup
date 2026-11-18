@@ -25,7 +25,12 @@ export default function StatTile({ label, value, tone }: Props) {
   return (
     <div className={`stat-tile ${tone === "serious" ? "stat-tile--warn" : ""}`}>
       <div className={`stat-num ${ticking ? "ticking" : ""}`}>{value}</div>
-      <div className="stat-label">{label}</div>
+      {/* Needs attention: the amber circle beside the label (9(a) — the colour
+          alone was the only cue, D153). */}
+      <div className="stat-label">
+        {tone === "serious" && <span className="mk-y" aria-hidden="true" />}
+        {label}
+      </div>
     </div>
   );
 }

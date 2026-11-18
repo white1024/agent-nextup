@@ -40,3 +40,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Bundled typefaces
+
+The app ships three variable fonts, converted to WOFF2 without other changes, in
+`src/assets/fonts/`. All three are licensed under the
+[SIL Open Font License 1.1](https://openfontlicense.org); the full licence text for
+each sits next to the font file.
+
+| Font | File | Copyright | Licence text |
+|---|---|---|---|
+| Inter Tight | `InterTight-wght.woff2` | Copyright 2022 The Inter Project Authors (https://github.com/rsms/inter-tight) | `OFL-InterTight.txt` |
+| JetBrains Mono | `JetBrainsMono-wght.woff2` | Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono) | `OFL-JetBrainsMono.txt` |
+| Noto Sans TC | `NotoSansTC-wght.woff2` | Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source' | `OFL-NotoSansTC.txt` |
+
+Source: the `ofl/` folders of [google/fonts](https://github.com/google/fonts).

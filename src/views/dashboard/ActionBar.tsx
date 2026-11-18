@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next";
 
 import { IconArrowRight } from "../../components/icons";
-import { useGateLabel } from "./WorkflowPanel";
+import { useGateLabel } from "../../hooks/gateLabel";
 import type { Gate, WorkflowStatus } from "../../types";
 
 interface Props {
@@ -35,6 +35,12 @@ interface Props {
  *
  * Rendering from the gates themselves means every template — including custom
  * ones — is covered without this file knowing anything about them.
+ *
+ * Since D153 it is the "next step" column inside the phase band rather than a
+ * strip of its own: one line per failing gate (its mark, its name, the
+ * engine's observation — truncated, full text on hover and in the gate card —
+ * and a plain button to where it gets fixed), or "every gate has passed" and
+ * the way to advance.
  */
 export default function ActionBar({
   status,
@@ -54,11 +60,15 @@ export default function ActionBar({
 
   if (failing.length === 0) {
     return (
-      <section className="action-bar action-bar--ready">
-        <span className="ab-lead">{t("actionBar.ready")}</span>
-        <button className="btn btn-small btn-primary" onClick={onGoToWorkflow}>
-          {t("actionBar.readyAction")} <IconArrowRight size={12} />
-        </button>
+      <section className="next next--ready" aria-label={t("actionBar.heading")}>
+        <div className="next-k">{t("actionBar.next")}</div>
+        <div className="next-ready">
+          <span className="mk-e" aria-hidden="true" />
+          <span>{t("actionBar.ready")}</span>
+          <button className="btn btn-small btn-primary" onClick={onGoToWorkflow}>
+            {t("actionBar.readyAction")} <IconArrowRight size={12} />
+          </button>
+        </div>
       </section>
     );
   }
@@ -85,29 +95,30 @@ export default function ActionBar({
   }
 
   return (
-    <section className="action-bar" aria-label={t("actionBar.heading")}>
-      <span className="ab-lead">{t("actionBar.heading")}</span>
-      <ul className="ab-items">
+    <section className="next" aria-label={t("actionBar.heading")}>
+      <div className="next-k">
+        {t("actionBar.next")} · {t("actionBar.stillNeeds", { n: failing.length })}
+      </div>
+      <ul className="next-items">
         {failing.map((g, i) => {
           const dest = destinationOf(g.gate);
-          const body = (
-            <>
-              <span className="ab-what">{gateLabel(g.gate)}</span>
-              {/* The engine's own observation ("2 open", "pending (human only)")
-                  — this is the number the product review asked for, straight from the evaluator
-                  rather than recomputed here where it could disagree with the gate. */}
-              <span className="ab-observed">{g.observed}</span>
-            </>
-          );
+          // R7: the user's own gate (a confirmation) waits on them — amber;
+          // the rest the engine will see by itself — hollow.
+          const yours = g.gate.kind === "manual_confirm";
           return (
-            <li className="ab-item" key={`${g.gate.kind}-${i}`}>
-              {dest === null ? (
-                <span className="ab-static">{body}</span>
-              ) : (
-                <button className="ab-go" onClick={dest.run} title={dest.label}>
-                  {body}
-                  <IconArrowRight size={12} aria-hidden="true" />
-                  <span className="sr-only">{dest.label}</span>
+            <li className="next-item" key={`${g.gate.kind}-${i}`}>
+              <span className={yours ? "mk-y" : "mk-o"} aria-hidden="true" />
+              <span className="next-what">{gateLabel(g.gate)}</span>
+              {/* The engine's own observation ("2 open", "pending (human only)")
+                  — straight from the evaluator rather than recomputed here
+                  where it could disagree with the gate. */}
+              <span className="next-obs" title={g.observed}>
+                {g.observed}
+              </span>
+              {dest !== null && (
+                <button className="btn btn-small" onClick={dest.run}>
+                  {dest.label}
+                  <IconArrowRight size={12} />
                 </button>
               )}
             </li>
