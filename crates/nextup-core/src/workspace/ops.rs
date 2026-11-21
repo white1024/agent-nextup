@@ -11,7 +11,7 @@
 //! Continuity contract (D24): every state mutation regenerates the handoff
 //! snapshot, so `latest_handoff.md` is never staler than the last operation —
 //! a session that only recorded decisions still hands off fresh.
-//! (generate_handoff refreshes the CLAUDE.md state block and manifest itself.)
+//! (generate_handoff refreshes the AGENTS.md state block and manifest itself.)
 
 use serde::{Deserialize, Serialize};
 
@@ -82,20 +82,28 @@ pub struct TaskUpdate {
 
 /// Transition a task. Every transition changes handoff content (section 3
 /// next-steps ordering, section 4 blockers), so every transition regenerates.
+/// `reason` is required for `blocked` and `cancelled` and ignored otherwise.
 pub fn update_task_status(
     paths: &WorkspacePaths,
     app_version: &str,
     id: &str,
     status: TaskStatus,
-    blocked_reason: Option<String>,
+    reason: Option<String>,
 ) -> Result<TaskUpdate> {
     mutate(paths, app_version, || {
         let previous = TaskStore::new(paths.tasks_dir()).get(id)?.status;
-        let task = TaskStore::new(paths.tasks_dir()).update_status(id, status, blocked_reason)?;
+        let task = TaskStore::new(paths.tasks_dir()).update_status(id, status, reason)?;
 
+        // A cancellation's reason is the only record of what replaced the
+        // task, so it rides on the ledger line rather than living in the
+        // task file alone (D169).
+        let why = match task.cancel_reason.as_deref() {
+            Some(reason) if task.status == TaskStatus::Cancelled => format!(" — {reason}"),
+            _ => String::new(),
+        };
         let event = LedgerEvent::new(
             LedgerKind::TaskStatusChanged,
-            format!("\"{}\": {} → {}", task.title, previous.label(), task.status.label()),
+            format!("\"{}\": {} → {}{why}", task.title, previous.label(), task.status.label()),
             Some(task.id.clone()),
         )
         // Structured endpoints (D75): the flywheel's blocked-task signal
@@ -164,12 +172,17 @@ pub fn edit_task(
     id: &str,
     edit: TaskEdit,
 ) -> Result<TaskUpdate> {
-    edit_task_with(paths, app_version, id, |_| edit)
+    edit_task_with(paths, app_version, id, None, |_| edit)
 }
 
 /// The fields an agent wants changed, and only those (the hub `edit_task`
 /// tool, D149). The GUI sends a whole form; an agent names what it means to
 /// change, and a missing field must mean "leave it", never "blank it".
+///
+/// `depends_on` is the one dependency write path (D169): a cancelled
+/// prerequisite never satisfies its dependents, so they have to be pointed at
+/// whatever replaced it — and before this, no tool could change a dependency
+/// after creation at all.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPatch {
@@ -177,6 +190,8 @@ pub struct TaskPatch {
     pub description: Option<String>,
     pub priority: Option<u8>,
     pub tags: Option<Vec<String>>,
+    pub depends_on: Option<Vec<String>>,
+    pub steps: Option<Vec<String>>,
 }
 
 /// [`edit_task`] for a partial change. The merge happens under the same lock
@@ -192,16 +207,21 @@ pub fn patch_task(
         && patch.description.is_none()
         && patch.priority.is_none()
         && patch.tags.is_none()
+        && patch.depends_on.is_none()
+        && patch.steps.is_none()
     {
         return Err(NextUpError::InvalidInput(
-            "nothing to change — pass at least one of title, description, priority, tags".into(),
+            "nothing to change — pass at least one of title, description, priority, tags, dependsOn, steps"
+                .into(),
         ));
     }
-    edit_task_with(paths, app_version, id, |before| TaskEdit {
+    let depends_on = patch.depends_on;
+    edit_task_with(paths, app_version, id, depends_on, |before| TaskEdit {
         title: patch.title.unwrap_or_else(|| before.title.clone()),
         description: patch.description.unwrap_or_else(|| before.description.clone()),
         priority: patch.priority.unwrap_or(before.priority),
         tags: patch.tags.unwrap_or_else(|| before.tags.clone()),
+        steps: patch.steps,
     })
 }
 
@@ -209,12 +229,16 @@ fn edit_task_with(
     paths: &WorkspacePaths,
     app_version: &str,
     id: &str,
+    depends_on: Option<Vec<String>>,
     make: impl FnOnce(&Task) -> TaskEdit,
 ) -> Result<TaskUpdate> {
     mutate(paths, app_version, || {
         let store = TaskStore::new(paths.tasks_dir());
         let before = store.get(id)?;
-        let task = store.edit(id, make(&before))?;
+        // One validated write: a refused dependency list (unknown id, cycle)
+        // or a refused attribute (blank title, bad priority) leaves the whole
+        // file as it was.
+        let task = store.edit_with_deps(id, make(&before), depends_on)?;
 
         let mut changes = Vec::new();
         if before.title != task.title {
@@ -240,6 +264,22 @@ fn edit_task_with(
                 if task.tags.is_empty() { "none".to_string() } else { task.tags.join(", ") };
             changes.push(format!("tags: {rendered}"));
         }
+        if before.steps != task.steps {
+            let titles: Vec<String> = task.steps.iter().map(|s| s.title.clone()).collect();
+            changes.push(if titles.is_empty() {
+                "steps: none".to_string()
+            } else {
+                format!("steps ({}): {}", titles.len(), titles.join(" / "))
+            });
+        }
+        if before.depends_on != task.depends_on {
+            let rendered = if task.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                task.depends_on.join(", ")
+            };
+            changes.push(format!("depends on: {rendered}"));
+        }
         let detail = if changes.is_empty() { "no changes".to_string() } else { changes.join("; ") };
         let event = LedgerEvent::new(
             LedgerKind::TaskEdited,
@@ -249,6 +289,146 @@ fn edit_task_with(
 
         // The title shows up in handoff §3 next-steps, so an edit changes the
         // snapshot like any other mutation (D24).
+        Ok((task, event))
+    })
+    .map(|(task, handoff)| TaskUpdate { task, handoff: Some(handoff), spec_fold: None })
+}
+
+// ── Questions for the user (D170) ───────────────────────────────────────────
+
+/// Ask the person something (hub `ask_user`). Ledgered as a note naming the
+/// question, so the snapshot's recent window shows it was asked.
+pub fn ask_user(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    input: crate::workspace::questions::NewQuestion,
+    asked_by: Option<String>,
+) -> Result<crate::workspace::questions::Question> {
+    mutate(paths, app_version, || {
+        let store = crate::workspace::questions::QuestionStore::new(paths);
+        let q = store.create(input, asked_by.clone(), &TaskStore::new(paths.tasks_dir()))?;
+        let whom = q.ask.as_deref().map(|a| format!(" (for {a})")).unwrap_or_default();
+        let event = LedgerEvent::new(
+            LedgerKind::Note,
+            format!("asked {}{whom}: {}", q.id, first_line(&q.question)),
+            q.blocks.first().cloned(),
+        )
+        .with_actor(asked_by);
+        Ok((q, event))
+    })
+    .map(|(q, _)| q)
+}
+
+/// The person answers (the app). The answer is ledgered as a decision — it is
+/// one, and the person made it — with the question in its first line, so the
+/// decisions view and a phase's decision gate both see it.
+pub fn answer_question(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    answer: &str,
+) -> Result<crate::workspace::questions::Question> {
+    mutate(paths, app_version, || {
+        let store = crate::workspace::questions::QuestionStore::new(paths);
+        let q = store.get(id)?;
+        if q.status != crate::workspace::questions::QuestionStatus::Open {
+            return Err(NextUpError::InvalidInput(format!("{id} is not open")));
+        }
+        let decision_id = ledger_for(paths).next_decision_id()?;
+        let answered = store.answer(id, answer.to_string(), decision_id.clone())?;
+        let event = LedgerEvent::new(
+            LedgerKind::Decision,
+            format!(
+                "{id} {} → {}",
+                first_line(&answered.question),
+                answered.answer.as_deref().unwrap_or_default()
+            ),
+            answered.blocks.first().cloned(),
+        )
+        .with_id(decision_id);
+        Ok((answered, event))
+    })
+    .map(|(q, _)| q)
+}
+
+/// The question no longer needs an answer (the app).
+pub fn withdraw_question(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+) -> Result<crate::workspace::questions::Question> {
+    mutate(paths, app_version, || {
+        let q = crate::workspace::questions::QuestionStore::new(paths).withdraw(id)?;
+        let event = LedgerEvent::new(
+            LedgerKind::Note,
+            format!("withdrew {}: {}", q.id, first_line(&q.question)),
+            None,
+        );
+        Ok((q, event))
+    })
+    .map(|(q, _)| q)
+}
+
+/// Questions as an agent reads them (hub `list_questions`): answered ones
+/// returned here are stamped seen, so the takeover surfaces stop listing them
+/// as answers nobody picked up — the delivery precedent (D160). The stamp is
+/// not ledgered (it is a read), but the surfaces are regenerated.
+pub fn read_questions_as_agent(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    include_closed: bool,
+) -> Result<Vec<crate::workspace::questions::Question>> {
+    use crate::workspace::questions::{QuestionStatus, QuestionStore};
+    with_mutation_lock(paths, || {
+        let store = QuestionStore::new(paths);
+        let shown: Vec<_> = store
+            .list()?
+            .into_iter()
+            .filter(|q| {
+                include_closed
+                    || q.status == QuestionStatus::Open
+                    || (q.status == QuestionStatus::Answered && q.seen_at.is_none())
+            })
+            .collect();
+        let answered: Vec<String> = shown
+            .iter()
+            .filter(|q| q.status == QuestionStatus::Answered)
+            .map(|q| q.id.clone())
+            .collect();
+        if store.mark_seen(&answered)? {
+            crate::workspace::sync::sync_after_mutation(paths, app_version)?;
+        }
+        // Return what the caller asked about, now carrying the stamp.
+        let ids: Vec<String> = shown.iter().map(|q| q.id.clone()).collect();
+        ids.iter().map(|id| store.get(id)).collect()
+    })
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
+/// Tick or untick one step of a task's checklist (D170). Ledgered as an edit
+/// — it describes the work, it claims nothing about it — and the handoff
+/// regenerates because next steps print each task's step count.
+pub fn set_task_step(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    step: usize,
+    done: bool,
+) -> Result<TaskUpdate> {
+    mutate(paths, app_version, || {
+        let task = TaskStore::new(paths.tasks_dir()).set_step(id, step, done)?;
+        let total = task.steps.len();
+        let ticked = task.steps.iter().filter(|s| s.done).count();
+        let title = &task.steps[step - 1].title;
+        let verb = if done { "done" } else { "reopened" };
+        let event = LedgerEvent::new(
+            LedgerKind::TaskEdited,
+            format!("\"{}\": step {step} «{title}» {verb} ({ticked}/{total})", task.title),
+            Some(task.id.clone()),
+        );
         Ok((task, event))
     })
     .map(|(task, handoff)| TaskUpdate { task, handoff: Some(handoff), spec_fold: None })
@@ -544,10 +724,11 @@ fn fold_task_specs_skipping(
     if task.spec_folded_at.is_some() {
         return Ok(None);
     }
-    // Non-done tasks never fold — and never archive either: stepping aside
-    // here lets `set_archived` refuse with its own message instead of this
-    // path preempting it with "verify first" (a dead end — verification
-    // itself refuses non-done tasks; batch ② review).
+    // Non-done tasks never fold. Open ones never archive either: stepping
+    // aside here lets `set_archived` refuse with its own message instead of
+    // this path preempting it with "verify first" (a dead end — verification
+    // itself refuses non-done tasks; batch ② review). A cancelled task does
+    // archive; its deltas stay in its folder and are never folded (D169).
     if task.status != TaskStatus::Done {
         return Ok(None);
     }
@@ -585,6 +766,7 @@ fn fold_task_specs_skipping(
     let others: Vec<(String, bool)> = TaskStore::new(paths.tasks_dir())
         .list()?
         .into_iter()
+        .filter(|t| t.status != TaskStatus::Cancelled)
         .map(|t| (t.id, t.spec_folded_at.is_some()))
         .collect();
     let blocking: Vec<String> = specs::cross_task_overlaps(paths, &task.id, &others)?
@@ -648,7 +830,8 @@ pub fn validate_task_specs(paths: &WorkspacePaths, id: &str) -> Result<specs::Ta
 pub fn pending_spec_folds(paths: &WorkspacePaths) -> Result<Vec<specs::TaskSpecsReport>> {
     let mut out = Vec::new();
     for task in TaskStore::new(paths.tasks_dir()).list()? {
-        if task.archived || task.spec_folded_at.is_some() {
+        // A cancelled task's bundle will never fold (D169): not pending.
+        if task.archived || task.spec_folded_at.is_some() || task.status == TaskStatus::Cancelled {
             continue;
         }
         match specs::dry_run_task_specs(paths, &task.id) {
@@ -987,7 +1170,7 @@ pub fn add_ledger_note(
     channel: NoteChannel,
     message: &str,
 ) -> Result<LedgerEvent> {
-    add_ledger_entry(paths, app_version, channel, message, None)
+    add_ledger_entry(paths, app_version, channel, message, None, false)
 }
 
 /// Record a decision, optionally naming an earlier decision it overturns.
@@ -1009,7 +1192,44 @@ pub fn add_decision(
     message: &str,
     supersedes: Option<&str>,
 ) -> Result<LedgerEvent> {
-    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes)
+    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes, false)
+}
+
+/// [`add_decision`] that may mark the decision provisional (D170): taken on a
+/// default, waiting in the "to decide" queue for the person to confirm or
+/// revise, and not counted toward a phase's decision gate.
+pub fn add_decision_with(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    message: &str,
+    supersedes: Option<&str>,
+    provisional: bool,
+) -> Result<LedgerEvent> {
+    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes, provisional)
+}
+
+/// The person's review of a provisional decision (D170): confirm it as it
+/// stands (`revised` = None) or replace it. Either way a new, settled
+/// decision supersedes the provisional one, so the queue drops it and the
+/// handoff marks it overturned — the record keeps both.
+pub fn review_decision(
+    paths: &WorkspacePaths,
+    app_version: &str,
+    id: &str,
+    revised: Option<&str>,
+) -> Result<LedgerEvent> {
+    let ledger = ledger_for(paths);
+    let pending = crate::workspace::questions::pending_provisional(&ledger)?;
+    let Some(original) = pending.iter().find(|e| e.id.as_deref() == Some(id)) else {
+        return Err(NextUpError::InvalidInput(format!(
+            "{id} is not a provisional decision waiting for review"
+        )));
+    };
+    let message = match revised.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(text) => text.to_string(),
+        None => format!("{}\n\n(Confirmed by the user — was provisional {id}.)", original.message),
+    };
+    add_ledger_entry(paths, app_version, NoteChannel::Decision, &message, Some(id), false)
 }
 
 fn add_ledger_entry(
@@ -1018,6 +1238,7 @@ fn add_ledger_entry(
     channel: NoteChannel,
     message: &str,
     supersedes: Option<&str>,
+    provisional: bool,
 ) -> Result<LedgerEvent> {
     let message = message.trim();
     if message.is_empty() {
@@ -1040,7 +1261,10 @@ fn add_ledger_entry(
                     )));
                 }
             }
-            event = event.with_id(ledger.next_decision_id()?).superseding(supersedes.clone());
+            event = event
+                .with_id(ledger.next_decision_id()?)
+                .superseding(supersedes.clone())
+                .provisionally(provisional);
         }
         // The line the caller gets back is the one that was appended.
         Ok((event.clone(), event))
@@ -1312,14 +1536,22 @@ fn try_mutate_milestones(
 // ── Read aggregates ─────────────────────────────────────────────────────────
 
 /// Compact harness position for status surfaces (`phase` is 1-based).
+///
+/// An ongoing project (D171) has no position: the four position fields are
+/// left out rather than reporting "phase 1 of 4, cannot advance" to an agent
+/// that reads this first — the false report D171 exists to remove.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowSummary {
-    pub current_phase: String,
+    pub mode: crate::workspace::workflow::WorkflowMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
     pub completed: bool,
     pub can_advance: bool,
-    pub phase: usize,
-    pub total_phases: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_phases: Option<usize>,
 }
 
 /// One-call workspace overview (context + task counts + harness position).
@@ -1339,12 +1571,16 @@ pub struct WorkspaceSummary {
 pub fn workspace_summary(paths: &WorkspacePaths) -> Result<WorkspaceSummary> {
     let context = crate::workspace::init::open_workspace(paths.root())?;
     let task_counts = crate::workspace::tasks::counts_for_dir(&paths.tasks_dir())?;
-    let workflow = crate::workspace::workflow::try_evaluate(paths)?.map(|s| WorkflowSummary {
-        current_phase: s.workflow.state.current_phase.clone(),
-        completed: s.workflow.state.completed,
-        can_advance: s.can_advance,
-        phase: s.current_index + 1,
-        total_phases: s.total_phases,
+    let workflow = crate::workspace::workflow::try_evaluate(paths)?.map(|s| {
+        let staged = !s.is_ongoing();
+        WorkflowSummary {
+            mode: s.workflow.mode,
+            current_phase: staged.then(|| s.workflow.state.current_phase.clone()),
+            completed: staged && s.workflow.state.completed,
+            can_advance: s.can_advance,
+            phase: staged.then_some(s.current_index + 1),
+            total_phases: staged.then_some(s.total_phases),
+        }
     });
     let modules = crate::workspace::modules::get_modules(paths)?.enabled;
     Ok(WorkspaceSummary { context, task_counts, workflow, modules })
@@ -1492,6 +1728,7 @@ mod tests {
                 description: "with context".into(),
                 priority: 0,
                 tags: vec!["ui".into()],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2369,7 +2606,7 @@ mod tests {
         .unwrap();
         write_delta(&paths, &open.id, "export", DELTA_OK);
         let err = set_task_archived(&paths, "0.1.0", &open.id, true).unwrap_err();
-        assert!(err.to_string().contains("only a done task can be archived"), "{err}");
+        assert!(err.to_string().contains("only a done or cancelled task can be archived"), "{err}");
     }
 
     #[test]
@@ -3081,5 +3318,96 @@ mod tests {
         let lines =
             Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 50).unwrap();
         assert!(lines.iter().any(|e| e.message.contains(&sha)), "{lines:?}");
+    }
+
+    // ── Cancelled and dependency edits (D169) ────────────────────────────────
+
+    #[test]
+    fn archiving_a_cancelled_task_drops_its_deltas_unfolded() {
+        let (_g, paths) = workspace();
+        let t = create_task(
+            &paths,
+            "0.1.0",
+            NewTask { title: "abandoned spec work".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        write_delta(&paths, &t.id, "export", DELTA_OK);
+        update_task_status(&paths, "0.1.0", &t.id, TaskStatus::Cancelled, Some("out of scope".into()))
+            .unwrap();
+        let archived = set_task_archived(&paths, "0.1.0", &t.id, true).unwrap();
+        assert!(archived.task.archived);
+        assert!(archived.spec_fold.is_none());
+        assert!(!paths.spec_file("export").exists(), "a cancelled delta never reaches specs/");
+
+        let events = Ledger::new(paths.ledger_file())
+            .recent_of_kind(LedgerKind::TaskStatusChanged, 5)
+            .unwrap();
+        assert!(events[0].message.contains("→ cancelled — out of scope"), "{}", events[0].message);
+    }
+
+    #[test]
+    fn edit_task_repoints_dependencies_and_a_refusal_changes_nothing() {
+        let (_g, paths) = workspace();
+        let mk = |title: &str| {
+            create_task(&paths, "0.1.0", NewTask { title: title.into(), priority: 1, ..Default::default() })
+                .unwrap()
+        };
+        let old = mk("old");
+        let new = mk("new");
+        let dependent = create_task(
+            &paths,
+            "0.1.0",
+            NewTask { title: "dependent".into(), depends_on: vec![old.id.clone()], ..Default::default() },
+        )
+        .unwrap();
+
+        let patched = patch_task(
+            &paths,
+            "0.1.0",
+            &dependent.id,
+            TaskPatch { depends_on: Some(vec![new.id.clone()]), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(patched.task.depends_on, vec![new.id.clone()]);
+        let events =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 5).unwrap();
+        assert!(events[0].message.contains(&format!("depends on: {}", new.id)), "{}", events[0].message);
+
+        // A cycle is refused whole: the title in the same patch does not land.
+        let err = patch_task(
+            &paths,
+            "0.1.0",
+            &new.id,
+            TaskPatch {
+                title: Some("renamed".into()),
+                depends_on: Some(vec![dependent.id.clone()]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        let unchanged = TaskStore::new(paths.tasks_dir()).get(&new.id).unwrap();
+        assert_eq!(unchanged.title, "new");
+        assert!(unchanged.depends_on.is_empty());
+    }
+
+    #[test]
+    fn ticking_a_step_ledgers_it_and_keeps_verification() {
+        let (_g, paths) = workspace();
+        let t = create_task(
+            &paths,
+            "0.1.0",
+            NewTask { title: "spec section".into(), steps: vec!["draft".into(), "review".into()], ..Default::default() },
+        )
+        .unwrap();
+        update_task_status(&paths, "0.1.0", &t.id, TaskStatus::Done, None).unwrap();
+        set_task_verification(&paths, "0.1.0", &t.id, true, Some("read it".into())).unwrap();
+
+        let update = set_task_step(&paths, "0.1.0", &t.id, 1, true).unwrap();
+        assert!(update.task.steps[0].done);
+        assert!(update.task.is_verified(), "a checklist tick is not a status change");
+        let events =
+            Ledger::new(paths.ledger_file()).recent_of_kind(LedgerKind::TaskEdited, 5).unwrap();
+        assert!(events[0].message.contains("step 1 «draft» done (1/2)"), "{}", events[0].message);
     }
 }

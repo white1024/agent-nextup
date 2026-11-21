@@ -69,6 +69,21 @@ impl ProjectRules {
     /// Baseline guidelines every new workspace starts with. Domain-agnostic:
     /// they describe *how to execute*, not *what the project is*.
     pub fn default_rules() -> Self {
+        Self::default_rules_for(false)
+    }
+
+    /// [`Self::default_rules`] for a workspace that brings its own method
+    /// (D170): the rule sending outputs to `artifacts/` is left out, because
+    /// that folder is not laid down and the project says where outputs go.
+    pub fn default_rules_for(own_method: bool) -> Self {
+        let mut rules = Self::baseline();
+        if own_method {
+            rules.execution_guidelines.retain(|g| !g.contains("artifacts/"));
+        }
+        rules
+    }
+
+    fn baseline() -> Self {
         Self {
             schema_version: RULES_SCHEMA_VERSION,
             execution_guidelines: vec![

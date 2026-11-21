@@ -3,6 +3,15 @@
   "name": "Business Planning",
   "description": "Discover → Strategy → Execute → Measure → Retrospect.",
   "domainHint": "business",
+  "ongoingInstructions": [
+    "Keep the current situation, audience, competitors and constraints current in context.json; record the key insights as decisions (what problem to solve, and for whom).",
+    "For each deliverable, settle who it is for (customers, partners, investors…), the setting they will see it in and what they must take away; record it as a decision, and show them one early piece before producing the rest.",
+    "Break each initiative into verifiable action tasks with slice-work (call the Skill tool with it): scope of ownership, definition of done, dependencies. Record the trade-offs as decisions (what to do, what not to do, and why).",
+    "Execute tasks by priority; outputs (decks, documents, spreadsheets) go into artifacts/. Mark blockers immediately and record who or what they depend on.",
+    "If validate_task_specs is in your tool list, a task that changes how something operates writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+    "When results come in, compare them against the goals and record the next move (double down, adjust, cut losses) as a decision.",
+    "When an initiative closes, call the Skill tool with retrospect and write the reusable methods back into rules.json."
+  ],
   "phases": [
     {
       "id": "discover",
@@ -10,6 +19,7 @@
       "description": "Clarify the problem, the market and the constraints.",
       "aiInstructions": [
         "Lay out the current situation, target audience, competitors and constraints.",
+        "Settle who the deliverable is for (customers, partners, investors…), the setting they will see it in and what they must take away; record it as a decision, and plan to show them one early piece before producing the rest.",
         "Record the key insights as decisions (what problem to solve, and for whom)."
       ],
       "exitGates": [{ "kind": "min_decisions", "count": 1 }]

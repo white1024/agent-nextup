@@ -1053,6 +1053,25 @@ code {
   box-shadow: inset 0 0 0 1.5px var(--text-3);
 }
 
+/* Cancelled (D169): the not-started square, struck through and quieter —
+   closed, but not by finishing. */
+.mk-x {
+  display: inline-block;
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: var(--r-mark);
+  box-shadow: inset 0 0 0 1.5px var(--text-3);
+  background: linear-gradient(
+    135deg,
+    transparent 44%,
+    var(--text-3) 44%,
+    var(--text-3) 58%,
+    transparent 58%
+  );
+  opacity: 0.75;
+}
+
 .dot-run {
   display: inline-block;
   flex: none;
@@ -5716,6 +5735,57 @@ option {
   border-style: dashed;
 }
 
+/* D173 ①: "find automatically" sits right after the missing count it fixes. */
+.ts-relink {
+  margin-left: var(--s-1);
+}
+
+.tmi-miss-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+
+/* The re-link result line (detail page and the import result): words on the
+   left, its own buttons on the right, like the update box (D144). */
+.tx-relink {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2h);
+}
+
+.tx-relink-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.tx-relink-text p {
+  margin: 0;
+}
+
+.tx-relink-text p + p {
+  margin-top: var(--s-1);
+}
+
+/* Import rows that are not one checkbox: nothing to click on the row itself. */
+.tx-row,
+.tx-row--same {
+  cursor: default;
+}
+
+.tx-row:hover,
+.tx-row--same:hover {
+  background: none;
+}
+
+.tx-row .seg {
+  flex: none;
+}
+
+.tx-row--same b {
+  color: var(--text-2);
+}
+
 /* Rail | canvas. One column once the main area is under 760 (rail on top). */
 .tmd-stage {
   display: grid;
@@ -8681,6 +8751,17 @@ option {
   grid-template-columns: minmax(0, 1fr);
 }
 
+/* D171: an ongoing project has no rail — the mode line sits in the middle of
+   the band's height instead of at the top of an empty column. */
+.phase-band--ongoing .ph-l {
+  align-self: center;
+}
+
+/* The rollback under "workflow complete" (D171 ⑤) sits below its sentence. */
+.wf-done .btn {
+  margin-top: var(--s-2);
+}
+
 @media (max-width: 1100px) {
   .phase-band {
     grid-template-columns: minmax(0, 1fr);
@@ -8718,6 +8799,21 @@ option {
   font-weight: 400;
   letter-spacing: normal;
   color: var(--text-3);
+}
+
+/* Days in the current phase (D169); amber once every gate passed and a week
+   went by without an advance — the same threshold the doctor warns at. */
+.phase-age {
+  font-family: var(--font-cjk);
+  font-size: var(--t-small);
+  font-weight: 400;
+  letter-spacing: normal;
+  color: var(--text-3);
+}
+
+.phase-age--idle {
+  color: var(--orange-ink);
+  font-weight: 600;
 }
 
 /* Equal tiles that truncate their names (the design). The pre-D153 stepper
@@ -10098,6 +10194,12 @@ option {
   color: var(--text-2);
 }
 
+.tr.is-cancelled .tr-open {
+  color: var(--text-3);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-3) 60%, transparent);
+}
+
 .pr {
   flex: none;
   padding: 2px 5px;
@@ -10190,6 +10292,19 @@ option {
 
 .tr-why-text {
   margin-left: 0.6em;
+}
+
+/* Cancelled: neutral, not amber — nothing is waiting on anyone. */
+.tr-why--x {
+  background: var(--surface-3);
+}
+
+.tr-why--x b {
+  color: var(--text-2);
+}
+
+.tr-why .mk-x {
+  transform: translateY(1px);
 }
 
 .tr-desc > summary {
@@ -10469,6 +10584,55 @@ option {
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* A task's own checklist (D170): ticked steps go quiet, the rest stay ink. */
+.tc-steps {
+  margin: -4px 0 12px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.tc-steps label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.tc-steps input {
+  flex: none;
+  transform: translateY(2px);
+}
+
+.tc-steps li.is-done span {
+  color: var(--text-3);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-3) 60%, transparent);
+}
+
+/* The row's step count: a quiet tag beside the title, teal once all are done. */
+.tkx-steps {
+  flex: none;
+  margin-left: var(--s-2);
+  padding: 0 6px;
+  border-radius: var(--r-1);
+  border: 1px solid var(--border-2);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.tkx-steps.is-all {
+  color: var(--green-ink);
+  border-color: color-mix(in srgb, var(--green) 40%, transparent);
 }
 
 .tc-row {
@@ -11006,6 +11170,11 @@ option {
   color: var(--text-2);
 }
 
+.kb-card.is-cancelled .kb-t {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+
 .kb-meta {
   display: flex;
   flex-wrap: wrap;
@@ -11032,7 +11201,8 @@ option {
 }
 
 .kb-st .mk-e,
-.kb-st .mk-o {
+.kb-st .mk-o,
+.kb-st .mk-x {
   width: 8px;
   height: 8px;
 }
@@ -14552,6 +14722,13 @@ option {
   background: var(--surface-1);
 }
 
+/* D171 ⑧: the template's ongoing instructions, one full-width field under the
+   phases (it belongs to the template, not to any one phase). */
+.tp-ongoing {
+  padding: var(--s-4) var(--s-5) 18px;
+  background: var(--surface-1);
+}
+
 .tp-f {
   display: flex;
   flex-direction: column;
@@ -18016,4 +18193,133 @@ option {
 .spc-enter .spc-row {
   animation: tkRowIn 480ms var(--ease-out) backwards;
   animation-delay: 200ms;
+}
+
+/* ── To decide (D170) ───────────────────────────────────────────────────────
+   Questions agents left for the person and decisions taken on a default. Each
+   item is a small card: who asked and what it holds, the question, the
+   recommended answer, then the person's controls. Amber only where something
+   waits on the person to forward it — the rest is ink. */
+.dq-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--s-3);
+}
+
+.dq {
+  padding: 12px 14px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-1h);
+  background: var(--surface-2);
+}
+
+.dq-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: 6px;
+}
+
+.dq-id {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.dq-chip {
+  padding: 0 7px;
+  border-radius: var(--r-1);
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 20px;
+}
+
+.dq-chip--fwd {
+  border-color: transparent;
+  background: var(--orange-soft);
+  color: var(--orange-ink);
+}
+
+.dq-by {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.dq-q {
+  margin: 0 0 6px;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.dq-rec,
+.dq-def {
+  margin: 0 0 6px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.dq-rec b {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.dq-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin: 4px 0 8px;
+}
+
+.dq-opts .btn.is-on {
+  border-color: var(--text-1);
+}
+
+.dq-answer {
+  width: 100%;
+  margin: 4px 0 6px;
+  resize: vertical;
+}
+
+.dq-lead {
+  margin: -4px 0 12px;
+}
+
+.dq-done {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dq-done li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-2);
+  overflow-wrap: anywhere;
+}
+
+.dq-done-q {
+  color: var(--text-2);
+}
+
+.dq-seen {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.dq-seen.is-unread {
+  color: var(--orange-ink);
 }

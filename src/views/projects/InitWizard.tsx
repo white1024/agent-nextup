@@ -14,6 +14,8 @@ import type { InitTargetProbe, SystemStatus, TemplateSummary } from "../../types
 import TemplatePicker from "./TemplatePicker";
 import ProjectCard from "./ProjectCard";
 import WizardFrame, { FirstPhase } from "./WizardFrame";
+import StagedCheck from "../../components/StagedCheck";
+import { modeToSend, runsStaged } from "../../lib/workflowMode";
 import { chargeCard } from "./motion";
 
 /** Windows-reserved device names can never be folder names. */
@@ -31,7 +33,7 @@ export function deriveFolderName(name: string): string {
 }
 
 /** A task-count block for a project that has none yet. */
-export const NO_TASKS = { total: 0, todo: 0, inProgress: 0, blocked: 0, done: 0, doneUnverified: 0 };
+export const NO_TASKS = { total: 0, todo: 0, inProgress: 0, blocked: 0, done: 0, cancelled: 0, doneUnverified: 0 };
 
 /**
  * Initialize a new project (spec 20 section 6): the form on the left, what the
@@ -75,6 +77,10 @@ export default function InitWizard({
   const [initGit, setInitGit] = useState(true);
   const [selectedModules, setSelectedModules] = useState<string[]>([]);
   const [grantAll, setGrantAll] = useState(grantAllToolsPreferred);
+  const [ownMethod, setOwnMethod] = useState(false);
+  // D171 ②: phases are opt-in.
+  const [staged, setStaged] = useState(false);
+  const isStaged = runsStaged(staged, template);
   const { busy, run } = useGuardedMutation(onError);
   const preview = useRef<HTMLUListElement>(null);
 
@@ -144,6 +150,8 @@ export default function InitWizard({
           modules: selectedModules.length > 0 ? selectedModules : undefined,
           createRoot: true,
           grantAllTools: grantAll,
+          ownMethod,
+          mode: modeToSend(staged, template),
         },
         gitAvailable && initGit,
       );
@@ -186,15 +194,16 @@ export default function InitWizard({
                 templateName: template?.name ?? null,
                 exists: true,
                 taskCounts: NO_TASKS,
-                phaseIndex: template ? 0 : null,
-                phaseCount: template?.phases.length ?? null,
-                phaseTitle: template?.phases[0]?.title ?? null,
+                ongoing: !isStaged,
+                phaseIndex: template && isStaged ? 0 : null,
+                phaseCount: isStaged ? (template?.phases.length ?? null) : null,
+                phaseTitle: isStaged ? (template?.phases[0]?.title ?? null) : null,
                 workflowCompleted: false,
                 at: new Date().toISOString(),
               }}
             />
           </ul>
-          <FirstPhase templateId={template?.id ?? null} />
+          <FirstPhase templateId={template?.id ?? null} staged={isStaged} />
         </>
       }
     >
@@ -335,6 +344,8 @@ export default function InitWizard({
         ))}
       </div>
 
+      <StagedCheck staged={staged} onChange={setStaged} template={template} />
+
       {/* A warning, not a lesson (invariant 17(c)): it says which powers are
           handed over, so it stays on screen rather than behind an info tip. */}
       <div className="fh-grant">
@@ -342,6 +353,15 @@ export default function InitWizard({
           <span>{t("wizard.grantAllTools")}</span>
         </Check>
         <p className="fh-grant-h">{t("wizard.grantAllToolsHint")}</p>
+      </div>
+
+      {/* D170: a folder that brings its own process gets only the takeover
+          layer — no memory/, work_record/, artifacts/ or project.yaml. */}
+      <div className="fh-grant">
+        <Check checked={ownMethod} onChange={setOwnMethod}>
+          <span>{t("wizard.ownMethod")}</span>
+        </Check>
+        <p className="fh-grant-h">{t("wizard.ownMethodHint")}</p>
       </div>
     </WizardFrame>
   );

@@ -9,6 +9,7 @@ import {
   cellsOf,
   changedCells,
   feedRows,
+  progressOf,
   keyedCalls,
   latestAt,
   sessionFor,
@@ -18,7 +19,7 @@ import {
   waitingTotal,
 } from "./overviewModel";
 
-const counts = { total: 6, todo: 1, inProgress: 1, blocked: 1, done: 3, doneUnverified: 1 };
+const counts = { total: 6, todo: 1, inProgress: 1, blocked: 1, done: 3, cancelled: 0, doneUnverified: 1 };
 
 function act(root: string, over: Partial<ProjectActivity> = {}): ProjectActivity {
   return { root, calls: [], callsSince: 0, capped: false, waiting: [], ...over };
@@ -50,6 +51,13 @@ describe("the project card", () => {
 describe("cells", () => {
   it("lays settled work first and what waits on you last", () => {
     expect(cellsOf(counts)).toEqual(["ver", "ver", "unv", "ip", "todo", "blk"]);
+  });
+
+  it("draws no cell for a cancelled task and leaves it out of the progress denominator (D169)", () => {
+    const withCancelled = { ...counts, total: 8, cancelled: 2 };
+    expect(cellsOf(withCancelled)).toEqual(cellsOf(counts));
+    expect(progressOf(withCancelled)).toEqual({ done: 3, live: 6, pct: 0.5 });
+    expect(progressOf({ ...counts, total: 2, done: 0, cancelled: 2 }).pct).toBe(0);
   });
 
   it("flips only the cells whose kind changed", () => {

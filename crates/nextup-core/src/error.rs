@@ -2,7 +2,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 /// One unmet prerequisite behind a `DependenciesUnmet` refusal: the blocking
-/// task's id plus its wire status label (`todo` / `in_progress` / `blocked`),
+/// task's id plus its wire status label (`todo` / `in_progress` / `blocked` / `cancelled`),
 /// or `missing` when the dependency file vanished.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -12,7 +12,14 @@ pub struct UnmetDependency {
 }
 
 fn render_unmet(deps: &[UnmetDependency]) -> String {
-    deps.iter().map(|d| format!("{} ({})", d.id, d.status)).collect::<Vec<_>>().join(", ")
+    let listed = deps.iter().map(|d| format!("{} ({})", d.id, d.status)).collect::<Vec<_>>().join(", ");
+    // A cancelled prerequisite will never be done (D169): waiting is not an
+    // option, so say what is.
+    if deps.iter().any(|d| d.status == "cancelled") {
+        format!("{listed} — a cancelled prerequisite never completes: point this task's dependsOn at whatever replaced it")
+    } else {
+        listed
+    }
 }
 
 /// Unified error type for the whole system.
@@ -154,8 +161,8 @@ pub const AGENT_ERROR_KINDS: [(&str, &str); 6] = [
     ("unauthorized", "the tool is not authorised in this workspace. Ask the user to enable it, and **do not** reach the same end by editing files (that succeeds and leaves no ledger trail)"),
     ("invalid_input", "fix the arguments and retry"),
     ("not_found", "that id or path does not exist. List first; do not retry the guess"),
-    ("workflow", "the phase cannot advance — the message names every gate still unmet with its observed value (or says the workflow is already complete). Satisfy them for real; forcing is human-only"),
-    ("dependencies_unmet", "prerequisites are not clear yet (carries `blockingTasks[]`, each `{id, status}`) — look at those or wait for them"),
+    ("workflow", "the phase cannot advance — the message names every gate still unmet with its observed value (or says the workflow is already complete, or that the project runs ongoing and has no phases to advance). Satisfy them for real; forcing is human-only"),
+    ("dependencies_unmet", "prerequisites are not clear yet (carries `blockingTasks[]`, each `{id, status}`) — look at those or wait for them; a `cancelled` one never clears, so point `dependsOn` elsewhere with `edit_task`"),
     ("already_claimed", "someone else holds the task (carries `currentAssignee`) — go and coordinate with them; claiming may not steal"),
 ];
 

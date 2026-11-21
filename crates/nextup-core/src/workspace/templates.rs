@@ -21,6 +21,21 @@ pub struct WorkflowTemplate {
     #[serde(default)]
     pub domain_hint: String,
     pub phases: Vec<Phase>,
+    /// The same method without phases (D171): what an agent follows when the
+    /// project runs *ongoing* — the per-phase disciplines rewritten as
+    /// triggers ("when the ask is vague", "before marking done", "when
+    /// shipping"). Empty means this template only runs staged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ongoing_instructions: Vec<String>,
+}
+
+impl WorkflowTemplate {
+    /// Whether this template can run ongoing (D171 ⑧): only when it carries
+    /// its own ongoing instructions — a custom template is never silently
+    /// given somebody else's.
+    pub fn supports_ongoing(&self) -> bool {
+        !self.ongoing_instructions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +58,9 @@ pub struct TemplateSummary {
     /// fetch every template body one by one.
     pub phases: Vec<PhaseOutline>,
     pub source: TemplateSource,
+    /// The template carries ongoing instructions (D171): the wizards offer
+    /// ongoing only when this is true.
+    pub supports_ongoing: bool,
 }
 
 /// Just enough of a phase to draw it: name and the shape of its exit gates.
@@ -207,6 +225,7 @@ pub fn template_summaries(
     Ok(all_templates(custom_dir, lang)?
         .into_iter()
         .map(|(t, source)| TemplateSummary {
+            supports_ongoing: t.supports_ongoing(),
             id: t.id,
             name: t.name,
             description: t.description,
@@ -366,6 +385,11 @@ pub fn validate_template(template: &WorkflowTemplate) -> Result<()> {
             validate_gate(id, gate)?;
         }
     }
+    if template.ongoing_instructions.iter().any(|line| line.trim().is_empty()) {
+        return Err(NextUpError::InvalidInput(
+            "ongoing instructions cannot contain an empty line".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -498,6 +522,96 @@ mod tests {
                     zp.id
                 );
             }
+            assert_eq!(
+                z.ongoing_instructions.len(),
+                e.ongoing_instructions.len(),
+                "ongoingInstructions of '{}' must match in count across languages",
+                z.id
+            );
+        }
+    }
+
+    /// New projects default to ongoing (D171 ②), so a built-in that could not
+    /// run that way would contradict the default (D171 ⑦).
+    #[test]
+    fn every_built_in_can_run_ongoing() {
+        for lang in [TemplateLang::ZhTw, TemplateLang::En] {
+            for t in built_in_templates(lang).unwrap() {
+                assert!(t.supports_ongoing(), "{} ({lang:?}) needs ongoingInstructions", t.id);
+            }
+        }
+    }
+
+    /// Every skill an instruction tells an agent to call must be one the
+    /// workspace is given: the generic set everywhere, a domain pack only in
+    /// the template it is keyed to (D148). The zh coding template named
+    /// `diagnose` — never shipped — from D148 until D171, because nothing
+    /// read the zh text against the skill list.
+    #[test]
+    fn instructions_name_only_skills_the_workspace_carries() {
+        use crate::workspace::bootstrap::{TEMPLATE_SKILLS, WORKSPACE_SKILLS};
+        let named = |text: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            for marker in ["Skill tool with ", "call it with ", "執行 "] {
+                for (i, _) in text.match_indices(marker) {
+                    let rest = &text[i + marker.len()..];
+                    let name: String =
+                        rest.chars().take_while(|c| c.is_ascii_lowercase() || *c == '-').collect();
+                    if !name.is_empty() && name != "it" {
+                        out.push(name);
+                    }
+                }
+            }
+            // Slash commands ("run /work-the-frontier").
+            for (i, _) in text.match_indices('/') {
+                let name: String = text[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                    .collect();
+                let after_space = i == 0 || text[..i].ends_with(' ');
+                if after_space && name.contains('-') {
+                    out.push(name);
+                }
+            }
+            // "with slice-work (call the Skill tool with it)", "用 slice-work 把…（呼叫
+            // Skill 工具執行）": the named skill is the last hyphenated word before
+            // the marker.
+            for marker in ["(call the Skill tool with it)", "（呼叫 Skill 工具執行）"] {
+                for (i, _) in text.match_indices(marker) {
+                    let last = text[..i]
+                        .split(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                        .filter(|w| w.contains('-') && !w.starts_with('-') && !w.ends_with('-'))
+                        .last();
+                    if let Some(name) = last {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            out
+        };
+        for lang in [TemplateLang::ZhTw, TemplateLang::En] {
+            for t in built_in_templates(lang).unwrap() {
+                let mut carried: Vec<&str> = WORKSPACE_SKILLS.iter().map(|(n, _)| *n).collect();
+                for (pack_template, pack) in TEMPLATE_SKILLS {
+                    if t.id == pack_template {
+                        carried.extend(pack.iter().map(|(n, _)| *n));
+                    }
+                }
+                let lines = t
+                    .phases
+                    .iter()
+                    .flat_map(|p| p.ai_instructions.iter())
+                    .chain(t.ongoing_instructions.iter());
+                for line in lines {
+                    for skill in named(line) {
+                        assert!(
+                            carried.contains(&skill.as_str()),
+                            "{} ({lang:?}) names skill '{skill}', which it does not carry: {line}",
+                            t.id
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -522,6 +636,13 @@ mod tests {
                 assert!(
                     phase.ai_instructions.iter().any(|i| i.contains("validate_task_specs")),
                     "{id}/{phase_id} ({lang:?}) must prompt for the spec delta"
+                );
+                // An ongoing project never enters that phase (D171), so its
+                // working instructions have to carry the prompt themselves.
+                let template = templates.iter().find(|t| t.id == id).unwrap();
+                assert!(
+                    template.ongoing_instructions.iter().any(|i| i.contains("validate_task_specs")),
+                    "{id} ({lang:?}) ongoing instructions must prompt for the spec delta"
                 );
             }
         }
@@ -597,6 +718,20 @@ mod tests {
     }
 
     #[test]
+    fn ongoing_instructions_reject_empty_lines_and_report_support() {
+        let mut t = sample_custom("with-ongoing");
+        assert!(!t.supports_ongoing());
+        t.ongoing_instructions = vec!["Work the tasks".into()];
+        assert!(t.supports_ongoing());
+        assert!(validate_template(&t).is_ok());
+        t.ongoing_instructions.push("   ".into());
+        assert!(validate_template(&t).is_err());
+
+        let summaries = template_summaries(None, TemplateLang::En).unwrap();
+        assert!(summaries.iter().all(|s| s.supports_ongoing), "built-ins all run ongoing");
+    }
+
+    #[test]
     fn validation_rejects_bad_templates() {
         let l = TemplateLang::ZhTw;
         let mut t = resolve_template(None, None, l).unwrap();
@@ -625,6 +760,7 @@ mod tests {
                 ai_instructions: vec!["Do one thing".into()],
                 exit_gates: vec![Gate::MinTasks { count: 1 }],
             }],
+            ongoing_instructions: vec![],
         }
     }
 

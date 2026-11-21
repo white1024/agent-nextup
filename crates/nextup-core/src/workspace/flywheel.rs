@@ -324,6 +324,8 @@ mod tests {
                 description: String::new(),
                 goals: vec![],
                 boundaries: vec![],
+                // The flywheel reads override advances, so it needs phases.
+                mode: Some(crate::workspace::workflow::WorkflowMode::Staged),
                 ..Default::default()
             },
             &StaticKeyProvider([5u8; 32]),

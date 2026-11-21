@@ -4,12 +4,16 @@ import { useTranslation } from "react-i18next";
 import { api, errorKind, errorMessage } from "../../api";
 import { useGuardedMutation } from "../../hooks";
 import EmptyState from "../../components/EmptyState";
+import Modal from "../../components/Modal";
+import StagedCheck from "../../components/StagedCheck";
+import { modeToSend } from "../../lib/workflowMode";
 import Scramble from "../../components/Scramble";
 import { centreOf, fx, motionOff, tokenRgb } from "../../lib/fx";
 import { EASE_OUT } from "../../lib/listMotion";
 import { IconArrowRight, IconWarn } from "../../components/icons";
 import type { TemplateSummary, WorkflowStatus } from "../../types";
 import { useGateLabel } from "../../hooks/gateLabel";
+import { daysInPhase, READY_IDLE_DAYS } from "./phaseAge";
 
 interface Props {
   refreshKey: number;
@@ -63,6 +67,12 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
   const { busy, run: runMutation } = useGuardedMutation(setError);
   const [showOverride, setShowOverride] = useState(false);
   const [overrideReason, setOverrideReason] = useState("");
+  // D171 ⑤: stepping back a phase asks once — it clears the phase's manual
+  // confirmations and restarts its decision count, which an advance does not
+  // give back.
+  const [rollbackOpen, setRollbackOpen] = useState(false);
+  // The legacy adopt panel's opt-in for phases (D171 ②, review E2).
+  const [adoptStaged, setAdoptStaged] = useState(false);
 
   // Hero/diff animations: stagger gates in after a phase advance, glow a gate
   // that just flipped to passed. Driven by state diffs, not by render — the
@@ -518,12 +528,18 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
               disabled={busy}
               onClick={() => {
                 captureFlip("adopt");
-                void run(() => api.adoptWorkflow(adoptId));
+                const tpl = templates.find((x) => x.id === adoptId) ?? null;
+                void run(() => api.adoptWorkflow(adoptId, modeToSend(adoptStaged, tpl)));
               }}
             >
               {t("workflow.adopt")}
             </button>
           </div>
+          <StagedCheck
+            staged={adoptStaged}
+            onChange={setAdoptStaged}
+            template={templates.find((x) => x.id === adoptId) ?? null}
+          />
           {error && <div className="alert alert-error">{error}</div>}
         </section>
         {grid(null)}
@@ -558,6 +574,51 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
     );
   }
 
+  // Ongoing (D171): no phases, no gates, nothing to advance. The band names
+  // the mode; the card under it is the instructions an agent works from.
+  if (status.workflow.mode === "ongoing") {
+    const lines = status.workflow.ongoingInstructions ?? [];
+    return (
+      <>
+        <section className="panel phase-band phase-band--ongoing" ref={bandRef}>
+          <div className="ph-l">
+            <div className="phase-k">
+              <Scramble durationMs={760} value={`${t("workflow.ongoing")} · ${status.workflow.templateName}`} />
+              <span className="phase-desc">· {t("workflow.ongoingDesc")}</span>
+            </div>
+          </div>
+          {next}
+        </section>
+        {grid(
+          <section className="panel gates-card" id="wf-gates">
+            <div className="panel-head">
+              <h2 className="panel-title">
+                {t("workflow.ongoingHeading")}
+                <span className="sub">{t("workflow.ongoingSub")}</span>
+              </h2>
+            </div>
+            {error && <div className="alert alert-error">{error}</div>}
+            <p className="section-hint">{t("workflow.ongoingHint")}</p>
+            {lines.length === 0 ? (
+              <EmptyState title={t("workflow.ongoingEmpty")} />
+            ) : (
+              <div className="wf-desc">
+                <ul className="instruction-list">
+                  {lines.map((line, i) => (
+                    <li key={i}>
+                      <span className="idx">{i + 1}.</span>
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>,
+        )}
+      </>
+    );
+  }
+
   const { workflow, currentIndex, totalPhases, gates, canAdvance } = status;
   const completed = workflow.state.completed;
   const phase = workflow.phases[currentIndex];
@@ -566,6 +627,12 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
   // The track fills to the middle of the current tile (to the end once the
   // flow is complete).
   const fill = completed ? 1 : (currentIndex + 0.5) / Math.max(1, workflow.phases.length);
+  // How long this phase has been open (D169). An external workspace sat in its
+  // first phase for 26 days with the gate passed and no surface said so; a day
+  // count is shown once there is one, and turns amber when every gate passes
+  // and a week has gone by — the doctor's `phase_ready_idle` threshold.
+  const days = completed ? null : daysInPhase(workflow.state.history, workflow.state.currentPhase);
+  const readyIdle = days !== null && canAdvance && days >= READY_IDLE_DAYS;
 
   const band = (
     <section className="panel phase-band" ref={bandRef}>
@@ -581,6 +648,11 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
           />
           {!completed && phase && phase.description !== "" && (
             <span className="phase-desc">· {phase.description}</span>
+          )}
+          {days !== null && days >= 1 && (
+            <span className={`phase-age${readyIdle ? " phase-age--idle" : ""}`}>
+              · {readyIdle ? t("workflow.readyIdleDays", { n: days }) : t("workflow.inPhaseDays", { n: days })}
+            </span>
           )}
         </div>
         <div className="rail-scroll">
@@ -645,6 +717,9 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
           <div>
             <strong>{t("workflow.completed")}</strong>
             <p>{t("workflow.completedHint")}</p>
+            <button className="btn btn-ghost btn-small" disabled={busy} onClick={() => setRollbackOpen(true)}>
+              {t("workflow.rollback")}
+            </button>
           </div>
         </div>
       ) : (
@@ -727,6 +802,13 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
               {!canAdvance && (
                 <span className="section-hint">{t("workflow.blockedHint", { n: failCount })}</span>
               )}
+              {/* D171 ⑤: the undo for an advance pressed too early — a person's
+                  call, with no hub tool behind it. */}
+              {currentIndex > 0 && (
+                <button className="btn btn-ghost btn-small" disabled={busy} onClick={() => setRollbackOpen(true)}>
+                  {t("workflow.rollback")}
+                </button>
+              )}
             </div>
 
             {/* Force advance (invariant 7 ③'s compliant variant): a disclosure
@@ -782,10 +864,40 @@ export default function WorkflowPanel({ refreshKey, onMutated, onStatus, next, l
     </section>
   );
 
+  // The phase a rollback lands in: the previous one, or — finished — the last.
+  const backTo = completed ? workflow.phases[workflow.phases.length - 1] : workflow.phases[currentIndex - 1];
+
   return (
     <>
       {band}
       {grid(gatesCard)}
+      {rollbackOpen && backTo && (
+        <Modal narrow label={t("workflow.rollbackHeading")} onClose={() => setRollbackOpen(false)}>
+          <div className="form">
+            <h2 className="form-heading">{t("workflow.rollbackHeading")}</h2>
+            <p>
+              {completed
+                ? t("workflow.rollbackReopenBody", { phase: backTo.title })
+                : t("workflow.rollbackBody", { phase: backTo.title })}
+            </p>
+            <div className="form-actions">
+              <button className="btn" onClick={() => setRollbackOpen(false)}>
+                {t("common.cancel")}
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={busy}
+                onClick={() => {
+                  setRollbackOpen(false);
+                  void run(() => api.rollbackPhase());
+                }}
+              >
+                {t("workflow.rollbackConfirm")}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }

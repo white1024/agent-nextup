@@ -179,6 +179,11 @@ function checkIncludes(tree, files) {
  *
  * Site pages are skipped: their links are Astro routes (`/agent-nextup/gates/`),
  * not filesystem paths, and `astro build` already fails on a broken one.
+ *
+ * Fenced code blocks are skipped too: a link there is shown as text, not
+ * followed. The README's sample state block is real `gen_demo` output and ends
+ * with the engine's link to `.nextup/snapshots/latest_handoff.md`, a path that
+ * exists in a managed workspace, never in this repo.
  */
 function checkLinks(tree, files) {
   const present = new Set(files);
@@ -193,7 +198,19 @@ function checkLinks(tree, files) {
   for (const rel of files.filter((f) => f.endsWith(".md"))) {
     if (rel.startsWith("site/")) continue;
     const lines = readFileSync(join(tree, rel), "utf8").split(/\r?\n/);
+    let fence = null; // the opening run of ``` or ~~~ while inside a block
     lines.forEach((line, i) => {
+      const run = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (run && !fence) {
+        fence = run[1];
+        return;
+      }
+      if (fence) {
+        // CommonMark: the closing run uses the same character, is at least as
+        // long, and carries nothing but trailing spaces.
+        if (run && run[1][0] === fence[0] && run[1].length >= fence.length && !run[2].trim()) fence = null;
+        return;
+      }
       for (const m of line.matchAll(/\]\(([^)#:\s]+)(?:#[^)]*)?\)/g)) {
         const target = m[1].replace(/\/$/, "");
         if (/^(https?:|mailto:|\/)/.test(target)) continue;

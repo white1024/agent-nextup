@@ -32,8 +32,11 @@ import { fadeRowsOut } from "../../lib/listMotion";
 import PathLabel from "../../components/PathLabel";
 import { BACK_OUT_MS, arriveAt, fadeDialog, foldLetter, peekStars, replay, sendTiming } from "./motion";
 import { teamSkin } from "../../lib/prefs";
+import { RelinkLine, pickSearchFolder } from "./TeamTransfer";
+import { mergeRelink, scopeReport } from "./transfer";
 import type {
   DeliverySummary,
+  RelinkReport,
   RouteOutcome,
   Team,
   TeamMember,
@@ -121,6 +124,8 @@ export default function TeamDetail({
     | null
   >(null);
   const [missing, setMissing] = useState<Set<string>>(new Set());
+  /** What the last "find automatically" did, for this team's members (D173 ①). */
+  const [relinkReport, setRelinkReport] = useState<RelinkReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   // One instance across `run`, `runFlow` and `routeNow`: they shared a single
   // `busy` that gates 15 disabled bindings, and splitting them would quietly
@@ -438,6 +443,29 @@ export default function TeamDetail({
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
     await run(() => api.teamRebindWorkspace(member.workspaceId, dir));
+  }
+
+  /**
+   * Find missing members by their stable id (D173 ①) — the graph's own paths
+   * and this machine's project list, plus `dir` and the folders directly
+   * under it when the person picked one. The pass covers every team; the line
+   * speaks about this one. A follow-up folder search folds into the line
+   * already showing, so what was found stays said.
+   */
+  function relinkNow(dir: string | null) {
+    return runMutation(async () => {
+      setError(null);
+      const done = await api.teamRelink(dir);
+      onTeams(done.teams);
+      const here = done.teams.filter((x) => x.id === team.id);
+      const report = scopeReport(done.report, here);
+      setRelinkReport((before) => (dir !== null && before !== null ? mergeRelink(before, report) : report));
+    });
+  }
+
+  async function relinkInFolder() {
+    const dir = await pickSearchFolder();
+    if (dir !== null) await relinkNow(dir);
   }
 
   const railRow = (id: string) =>
@@ -807,11 +835,24 @@ export default function TeamDetail({
           </span>
         )}
         {missing.size > 0 && (
-          <span className="chip team-missing-chip ts-missing">
-            {t("teams.summaryMissing", { n: missing.size })}
-          </span>
+          <>
+            <span className="chip team-missing-chip ts-missing">
+              {t("teams.summaryMissing", { n: missing.size })}
+            </span>
+            <button className="btn btn-small ts-relink" disabled={busy} onClick={() => void relinkNow(null)}>
+              {t("teams.relink")}
+            </button>
+          </>
         )}
       </div>
+      {relinkReport !== null && (
+        <RelinkLine
+          report={relinkReport}
+          busy={busy}
+          onSearch={() => void relinkInFolder()}
+          onClose={() => setRelinkReport(null)}
+        />
+      )}
 
       <div className="tmd-stage">
         <aside className="panel tmd-rail">
@@ -968,13 +1009,18 @@ export default function TeamDetail({
               {missing.has(selectedMember.workspaceId) && (
                 <div className="tmi-miss">
                   <p>{t("teams.missingHint")}</p>
-                  <button
-                    className="btn btn-small"
-                    disabled={busy}
-                    onClick={() => void rebind(selectedMember)}
-                  >
-                    <IconFolder size={13} /> {t("teams.rebind")}
-                  </button>
+                  <div className="tmi-miss-actions">
+                    <button className="btn btn-small" disabled={busy} onClick={() => void relinkNow(null)}>
+                      {t("teams.relink")}
+                    </button>
+                    <button
+                      className="btn btn-small"
+                      disabled={busy}
+                      onClick={() => void rebind(selectedMember)}
+                    >
+                      <IconFolder size={13} /> {t("teams.rebind")}
+                    </button>
+                  </div>
                 </div>
               )}
 

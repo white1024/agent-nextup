@@ -19,12 +19,12 @@ Moving things:
 
 Looking inside a member:
 
-- `team_member_status` — counts, phase, mailbox sizes. Cheap; use it first.
+- `team_member_status` — counts, phase (or that it runs ongoing, with no phase), mailbox sizes. Cheap; use it first.
 - `team_member_tasks`, `team_member_ledger`, `team_member_specs` — the real thing: task text, decisions, progress notes, current-state specs.
 
 Signing off:
 
-- `team_archive_task` — archive a member's finished task. This is the **only** action that folds that task's spec deltas into its project's specification, so it is the moment its claims become that project's stated current state. Read what the task actually did first.
+- `team_archive_task` — archive a member's finished (`done`) task — a cancelled one is the user's to file away, and the tool refuses it. This is the **only** action that folds that task's spec deltas into its project's specification, so it is the moment its claims become that project's stated current state. Read what the task actually did first.
 
 ### What is still not yours
 

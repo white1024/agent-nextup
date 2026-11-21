@@ -19,6 +19,7 @@ import type {
   LayoutSkin,
   LedgerChannel,
   LedgerEvent,
+  Question,
   LedgerKind,
   LedgerPage,
   LedgerTail,
@@ -38,9 +39,13 @@ import type {
   TaskStatus,
   TaskUpdate,
   Team,
+  TeamsImported,
+  TeamsRelinked,
+  ImportPreview,
   TemplateSummary,
   TerminalBuffer,
   TerminalSessionMeta,
+  WorkflowMode,
   WorkflowStatus,
   WorkflowTemplate,
   WorkspaceModules,
@@ -90,9 +95,15 @@ export function errorMessage(e: unknown): string {
   const message = rawErrorMessage(e);
   const kind = errorKind(e);
   if (kind === null) return message;
-  const key = `errors.${kind}`;
+  const fields = structuredFields(e);
+  // A cancelled prerequisite never completes (D169): "finish it first" would
+  // send the user after something that cannot happen, so it gets its own line.
+  const key =
+    kind === "dependencies_unmet" && fields.cancelled
+      ? "errors.dependencies_unmet_cancelled"
+      : `errors.${kind}`;
   if (!i18n.exists(key)) return message;
-  return i18n.t(key, { message, ...structuredFields(e) });
+  return i18n.t(key, { message, ...fields });
 }
 
 /** Extra fields carried by structured refusals, for the `errors.*` sentences. */
@@ -105,13 +116,16 @@ function structuredFields(e: unknown): Record<string, string> {
     fields.conflicts = record.conflicts.map(String).join("; ");
   }
   if (Array.isArray(record.blockingTasks)) {
-    fields.blocking = record.blockingTasks
-      .map((task) =>
-        typeof task === "object" && task !== null && "id" in task
-          ? String((task as { id: unknown }).id)
-          : String(task),
-      )
-      .join(", ");
+    const idOf = (task: unknown) =>
+      typeof task === "object" && task !== null && "id" in task
+        ? String((task as { id: unknown }).id)
+        : String(task);
+    fields.blocking = record.blockingTasks.map(idOf).join(", ");
+    const cancelled = record.blockingTasks.filter(
+      (task) =>
+        typeof task === "object" && task !== null && (task as { status?: unknown }).status === "cancelled",
+    );
+    if (cancelled.length > 0) fields.cancelled = cancelled.map(idOf).join(", ");
   }
   if (typeof record.currentAssignee === "string") fields.assignee = record.currentAssignee;
   if (Array.isArray(record.dependentTasks)) fields.dependents = record.dependentTasks.join(", ");
@@ -146,12 +160,25 @@ export const api = {
 
   listTasks: () => invoke<Task[]>("list_tasks"),
   createTask: (input: NewTask) => invoke<Task>("create_task", { input }),
-  updateTaskStatus: (id: string, status: TaskStatus, blockedReason?: string) =>
+  /** `reason` is required for blocked and cancelled, ignored otherwise. */
+  updateTaskStatus: (id: string, status: TaskStatus, reason?: string) =>
     invoke<TaskUpdate>("update_task_status", {
       id,
       status,
-      blockedReason: blockedReason ?? null,
+      reason: reason ?? null,
     }),
+  // To decide (D170).
+  listQuestions: () => invoke<Question[]>("list_questions"),
+  answerQuestion: (id: string, answer: string) =>
+    invoke<Question>("answer_question", { id, answer }),
+  withdrawQuestion: (id: string) => invoke<Question>("withdraw_question", { id }),
+  listProvisionalDecisions: () => invoke<LedgerEvent[]>("list_provisional_decisions"),
+  /** Confirm a provisional decision (`revised` omitted) or replace its text. */
+  reviewDecision: (id: string, revised?: string) =>
+    invoke<LedgerEvent>("review_decision", { id, revised: revised ?? null }),
+  /** Tick or untick one step of a task's checklist (D170; `step` counts from 1). */
+  setTaskStep: (id: string, step: number, done: boolean) =>
+    invoke<TaskUpdate>("set_task_step", { id, step, done }),
   setTaskVerification: (id: string, verified: boolean, note?: string) =>
     invoke<TaskUpdate>("set_task_verification", { id, verified, note: note ?? null }),
   editTask: (id: string, edit: TaskEdit) => invoke<TaskUpdate>("edit_task", { id, edit }),
@@ -232,8 +259,13 @@ export const api = {
     invoke<WorkflowStatus>("advance_phase", { force, reason: reason ?? null }),
   confirmGate: (phaseId: string, prompt: string) =>
     invoke<WorkflowStatus>("confirm_gate", { phaseId, prompt }),
-  adoptWorkflow: (templateId: string) =>
-    invoke<WorkflowStatus>("adopt_workflow", { templateId, lang: i18n.language }),
+  adoptWorkflow: (templateId: string, mode?: WorkflowMode) =>
+    invoke<WorkflowStatus>("adopt_workflow", { templateId, lang: i18n.language, mode: mode ?? null }),
+  /** Staged ⇄ ongoing (D171 ③). A person's call — no hub tool reaches it. */
+  setWorkflowMode: (mode: WorkflowMode) =>
+    invoke<WorkflowStatus>("set_workflow_mode", { mode, lang: i18n.language }),
+  /** Step a staged project back one phase (D171 ⑤). */
+  rollbackPhase: () => invoke<WorkflowStatus>("rollback_phase"),
   scaffoldBootstrap: () => invoke<string[]>("scaffold_bootstrap"),
   workspaceAssetsStatus: () => invoke<AssetStatus[]>("workspace_assets_status"),
   workspaceAssetsUpgrade: (overwrite: string[], keepAsUser: string[]) =>
@@ -304,6 +336,19 @@ export const api = {
     invoke<Team[]>("team_set_prime", { teamId, root }),
   teamRebindWorkspace: (workspaceId: string, newRoot: string) =>
     invoke<Team[]>("team_rebind_workspace", { workspaceId, newRoot }),
+  /**
+   * Find missing members and primes by stable id, across every team (D173 ①):
+   * the graph's own paths, this machine's project list, then the folders
+   * directly under `searchDir` when given.
+   */
+  teamRelink: (searchDir: string | null = null) =>
+    invoke<TeamsRelinked>("team_relink", { searchDir }),
+  /** Write the chosen teams to a team file (D173 ②); answers how many. */
+  teamExport: (teamIds: string[], file: string) => invoke<number>("team_export", { teamIds, file }),
+  teamImportPreview: (file: string) => invoke<ImportPreview>("team_import_preview", { file }),
+  /** Take the picked teams from the file (no merge), then re-link. */
+  teamImportApply: (file: string, take: string[], searchDir: string | null = null) =>
+    invoke<TeamsImported>("team_import_apply", { file, take, searchDir }),
   /** `skin` picks which canvas style's saved positions to replace (D157). */
   teamSetLayout: (
     teamId: string,

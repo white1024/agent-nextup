@@ -52,6 +52,15 @@ pub struct InitProjectParams {
     /// day-one grant.
     #[serde(default)]
     pub grant_all_tools: bool,
+    /// The folder brings its own method (D170): lay down only the takeover
+    /// layer. Recorded in context.json so later syncs and upgrades keep to it.
+    #[serde(default)]
+    pub own_method: bool,
+    /// Staged or ongoing (D171). `None` is the product default — ongoing
+    /// whenever the template can run that way — so headless callers and a
+    /// coordinator creating a member land where the wizard's default does.
+    #[serde(default)]
+    pub mode: Option<crate::workspace::workflow::WorkflowMode>,
 }
 
 /// Create the full Agent NextUp structure inside `params.root`:
@@ -81,6 +90,9 @@ pub fn initialize_project(
         crate::workspace::templates::default_custom_dir().as_deref(),
         crate::workspace::templates::TemplateLang::from_tag(params.template_lang.as_deref()),
     )?;
+    // Instantiating is pure, so it happens here too: asking for ongoing on a
+    // template that cannot run that way fails before the disk is touched.
+    let workflow = crate::workspace::workflow::instantiate(&template, params.mode)?;
     // Same fail-early contract for module ids.
     for module in &params.modules {
         crate::workspace::modules::validate_module(module)?;
@@ -108,10 +120,13 @@ pub fn initialize_project(
 
     std::fs::create_dir_all(paths.snapshots_dir())?;
     std::fs::create_dir_all(paths.tasks_dir())?;
-    std::fs::create_dir_all(paths.artifacts_dir())?;
     // Keep the (initially empty) directories versionable in git.
     atomic_write(&paths.tasks_dir().join(".gitkeep"), b"")?;
-    atomic_write(&paths.artifacts_dir().join(".gitkeep"), b"")?;
+    // A project with its own method already says where outputs go (D170).
+    if !params.own_method {
+        std::fs::create_dir_all(paths.artifacts_dir())?;
+        atomic_write(&paths.artifacts_dir().join(".gitkeep"), b"")?;
+    }
     // Keep machine-local and rebuildable derivatives out of version control:
     // secrets.enc is sealed by this machine's master key (committing it only
     // spreads noise), index.sqlite is a rebuildable FTS5 derivative, and
@@ -137,18 +152,18 @@ pub fn initialize_project(
     } else {
         "general"
     };
-    let context = ProjectContext::new(
+    let mut context = ProjectContext::new(
         name,
         domain,
         params.description.trim(),
         clean_lines(&params.goals),
         clean_lines(&params.boundaries),
     );
+    context.own_method = params.own_method;
     save_context(&paths.context_file(), &context)?;
-    save_rules(&paths.rules_file(), &ProjectRules::default_rules())?;
+    save_rules(&paths.rules_file(), &ProjectRules::default_rules_for(params.own_method))?;
     save_secrets(&paths.secrets_file(), keys, &SecretMap::new())?;
 
-    let workflow = crate::workspace::workflow::instantiate(&template)?;
     crate::workspace::workflow::save_workflow(&paths.workflow_file(), &workflow)?;
 
     // Capability modules: only written when something is enabled — a missing
@@ -181,6 +196,9 @@ pub fn initialize_project(
     if !granted.is_empty() {
         crate::agent::set_tools_allowed(&paths, &granted, true)?;
     }
+    // Every tool in today's registry has now been offered (D172): the asset
+    // upgrade of a later version grants only what that version adds.
+    crate::agent::record_known_tools(&paths)?;
 
     // AI-session bootstrap layer: CLAUDE.md / AGENTS.md entry points, the
     // operating guide, memory index, aggregation manifest and work-record
@@ -251,6 +269,8 @@ mod tests {
             modules: vec![],
             create_root: false,
             grant_all_tools: false,
+            own_method: false,
+            mode: None,
         }
     }
 
@@ -512,8 +532,56 @@ mod tests {
             crate::workspace::workflow::load_workflow(&paths.workflow_file()).unwrap();
         assert_eq!(workflow.template_id, "research-v1");
         assert_eq!(workflow.state.current_phase, "scope");
-        // The initial handoff already carries the harness position.
+        // Left unsaid, a new project runs ongoing (D171), with the template's
+        // own working instructions copied in for later.
+        assert!(workflow.is_ongoing());
+        assert!(!workflow.ongoing_instructions.is_empty());
         let handoff = std::fs::read_to_string(paths.handoff_file()).unwrap();
-        assert!(handoff.contains("**Workflow phase:**"));
+        assert!(handoff.contains("**Workflow:** ongoing"), "{handoff}");
+        assert!(handoff.contains("**Working instructions**"), "{handoff}");
+    }
+
+    #[test]
+    fn staged_is_chosen_explicitly_and_reported_by_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(dir.path());
+        p.mode = Some(crate::workspace::workflow::WorkflowMode::Staged);
+        initialize_project(&p, &StaticKeyProvider([1u8; 32]), "0.1.0").unwrap();
+        let paths = WorkspacePaths::new(dir.path());
+        let raw = std::fs::read_to_string(paths.workflow_file()).unwrap();
+        // Staged writes no mode at all, so an older app reads it as it always
+        // read a staged project.
+        assert!(!raw.contains("\"mode\""), "{raw}");
+        let handoff = std::fs::read_to_string(paths.handoff_file()).unwrap();
+        assert!(handoff.contains("**Workflow phase:**"), "{handoff}");
+    }
+
+    #[test]
+    fn ongoing_needs_the_templates_own_ongoing_instructions() {
+        let staged_only = crate::workspace::templates::WorkflowTemplate {
+            id: "staged-only".into(),
+            name: "Staged only".into(),
+            description: String::new(),
+            domain_hint: String::new(),
+            phases: vec![crate::workspace::workflow::Phase {
+                id: "one".into(),
+                title: "One".into(),
+                description: String::new(),
+                ai_instructions: vec![],
+                exit_gates: vec![],
+            }],
+            ongoing_instructions: vec![],
+        };
+        assert_eq!(
+            crate::workspace::workflow::WorkflowMode::default_for(&staged_only),
+            crate::workspace::workflow::WorkflowMode::Staged,
+            "a template without ongoing instructions defaults to staged"
+        );
+        let err = crate::workspace::workflow::instantiate(
+            &staged_only,
+            Some(crate::workspace::workflow::WorkflowMode::Ongoing),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
     }
 }

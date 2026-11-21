@@ -10,7 +10,7 @@ import Scramble from "../../components/Scramble";
 import { centreOf, fx, motionOff } from "../../lib/fx";
 import { EASE_OUT } from "../../lib/listMotion";
 import type { Gate, TemplateSummary, WorkflowPhase, WorkflowTemplate } from "../../types";
-import { failedPhaseId } from "./model";
+import { failedPhaseId, instructionLines, ongoingOrNone } from "./model";
 import { splitAroundCount } from "../../lib/format";
 import { offsetIn, runRail } from "./motion";
 import { DashText, GateMark } from "./TemplateBand";
@@ -77,7 +77,7 @@ function nextPhaseId(phases: WorkflowPhase[]): string {
   }
 }
 
-/** Trim fields and drop empty AI-instruction lines; core validates the rest. */
+/** Trim fields and drop empty instruction lines; core validates the rest. */
 function normalized(t: WorkflowTemplate): WorkflowTemplate {
   return {
     ...t,
@@ -90,8 +90,9 @@ function normalized(t: WorkflowTemplate): WorkflowTemplate {
       id: p.id.trim(),
       title: p.title.trim(),
       description: p.description.trim(),
-      aiInstructions: p.aiInstructions.map((l) => l.trim()).filter(Boolean),
+      aiInstructions: instructionLines(p.aiInstructions),
     })),
+    ongoingInstructions: ongoingOrNone(instructionLines(t.ongoingInstructions ?? [])),
   };
 }
 
@@ -165,6 +166,7 @@ export default function TemplateEditor({
   const ltRef = useRef<HTMLElement>(null);
   const linkRef = useRef<HTMLElement>(null);
   const aiRef = useRef<HTMLTextAreaElement>(null);
+  const ongoingRef = useRef<HTMLTextAreaElement>(null);
   const mounted = useRef(true);
   const swapToken = useRef(0);
   const slideNext = useRef(false);
@@ -285,6 +287,13 @@ export default function TemplateEditor({
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight + 2}px`;
   }, [aiText, viewKey]);
+  const ongoingText = (draft.ongoingInstructions ?? []).join("\n");
+  useLayoutEffect(() => {
+    const ta = ongoingRef.current;
+    if (ta === null) return;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight + 2}px`;
+  }, [ongoingText]);
 
   // ── C149: "New from this" lands on a fresh editor ──────────────────────────
   useLayoutEffect(() => {
@@ -977,6 +986,34 @@ export default function TemplateEditor({
         </section>
         <i className="tp-link" aria-hidden="true" ref={linkRef} />
       </div>
+
+      {/* D171 ⑧: the template's other way to run. Empty = staged only; an
+          emptied field drops the list so the draft matches a template that
+          never had one. */}
+      <section className="panel tp-ongoing">
+        <label className="tp-f">
+          <span className="tp-l">{t("tpl.ongoing")}</span>
+          <span className="tp-in">
+            <textarea
+              ref={ongoingRef}
+              rows={4}
+              value={ongoingText}
+              disabled={readOnly}
+              placeholder={readOnly ? undefined : t("tpl.ongoingPlaceholder")}
+              onChange={(e) =>
+                patch({ ongoingInstructions: e.target.value === "" ? undefined : e.target.value.split("\n") })
+              }
+            />
+          </span>
+          <span className="tp-sub">
+            {!readOnly
+              ? t("tpl.ongoingHint")
+              : ongoingText === ""
+                ? t("tpl.ongoingNone")
+                : t("tpl.ongoingViewHint")}
+          </span>
+        </label>
+      </section>
 
       {confirmDiscard && (
         <ConfirmDanger

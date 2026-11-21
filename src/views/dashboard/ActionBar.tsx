@@ -54,7 +54,25 @@ export default function ActionBar({
 
   // Nothing read yet, no harness, or the whole flow is finished — in none of
   // those is there a "next step" this bar could honestly name.
-  if (status === null || status.workflow.state.completed) return null;
+  if (status === null) return null;
+
+  // Ongoing (D171) has no gates at all — an empty list is not "every gate
+  // passed", and offering to advance would send the person to a refusal.
+  if (status.workflow.mode === "ongoing") {
+    return (
+      <section className="next" aria-label={t("actionBar.heading")}>
+        <div className="next-k">{t("actionBar.next")}</div>
+        <div className="next-ready">
+          <span>{t("actionBar.ongoing")}</span>
+          <button className="btn btn-small" onClick={onGoToTasks}>
+            {t("actionBar.goTasks")} <IconArrowRight size={12} />
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  if (status.workflow.state.completed) return null;
 
   const failing = status.gates.filter((g) => !g.passed);
 

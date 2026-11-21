@@ -71,6 +71,8 @@ pub const SETTINGS_FILE: &str = "settings.json";
 pub const SHIPPED_ASSETS_FILE: &str = "shipped_assets.json";
 pub const ASSET_BACKUPS_DIR: &str = "asset_backups";
 pub const EXCHANGE_DIR: &str = "exchange";
+/// Questions for the user, one file each (D170).
+pub const QUESTIONS_DIR: &str = "questions";
 pub const OUTBOX_DIR: &str = "outbox";
 pub const INBOX_DIR: &str = "inbox";
 pub const SNAPSHOTS_DIR: &str = "snapshots";
@@ -198,6 +200,11 @@ impl WorkspacePaths {
     /// net: self-gitignored, not exported in backups, not watched.
     pub fn asset_backups_dir(&self) -> PathBuf {
         self.nextup_dir().join(ASSET_BACKUPS_DIR)
+    }
+
+    /// Questions for the user, one JSON file each (workspace::questions, D170).
+    pub fn questions_dir(&self) -> PathBuf {
+        self.nextup_dir().join(QUESTIONS_DIR)
     }
 
     /// Cross-workspace delivery envelopes (workspace::exchange, D48).

@@ -3,6 +3,15 @@
   "name": "通用流程",
   "description": "適用任何領域的基本循環：規劃 → 執行 → 檢視 → 復盤。",
   "domainHint": "general",
+  "ongoingInstructions": [
+    "先讀 .nextup/snapshots/latest_handoff.md 與 context.json，校準目標與邊界。",
+    "有新工作進來時，先講定交付物給誰看：每一種讀者在什麼場合看、看完要能懂什麼或做什麼。以「決策」記下來，並先拿一小段給讀者看過，再產出其餘部分。",
+    "用 slice-work 把新工作拆成任務（呼叫 Skill 工具執行）：每個任務都能獨立交付與驗收，寫明驗收條件、優先級與相依。",
+    "依優先級認領任務並標記 in_progress，一次專注一件事。完成即標 done；受阻立即標 blocked 並寫明原因。",
+    "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
+    "標 done 之前，對照任務的驗收條件與 context.json 的 goals 檢查；有缺漏就補任務，不要硬算完成。所有交付物一律放進 artifacts/。",
+    "一段工作告一段落時（一個里程碑、一次交付，或累積了幾週的任務），呼叫 Skill 工具執行 retrospect，把改進寫回 rules.json 的 executionGuidelines。"
+  ],
   "phases": [
     {
       "id": "plan",
@@ -10,6 +19,7 @@
       "description": "把目標拆解成可在單一 session 完成的原子任務。",
       "aiInstructions": [
         "先讀 .nextup/snapshots/latest_handoff.md 與 context.json，校準目標與邊界。",
+        "先講定交付物給誰看：每一種讀者在什麼場合看、看完要能懂什麼或做什麼。以「決策」記下來，並規劃先拿一小段給讀者看過，再產出其餘部分。",
         "用 slice-work 把工作拆成任務（呼叫 Skill 工具執行）：每個任務都能獨立交付與驗收，寫明驗收條件、優先級與相依。"
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]

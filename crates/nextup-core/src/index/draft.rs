@@ -28,6 +28,16 @@ pub struct AdoptionDraft {
     pub description: String,
     pub languages: Vec<String>,
     pub suggested_tasks: Vec<NewTask>,
+    /// The folder already carries its own agent entry or documents (D170):
+    /// `AGENTS.md`, `CLAUDE.md` or a `docs/` folder. The adoption wizard
+    /// pre-ticks "has its own method" from this; the person still decides.
+    #[serde(default)]
+    pub own_method_detected: bool,
+}
+
+/// What [`AdoptionDraft::own_method_detected`] looks for.
+pub fn detect_own_method(root: &Path) -> bool {
+    root.join("AGENTS.md").is_file() || root.join("CLAUDE.md").is_file() || root.join("docs").is_dir()
 }
 
 /// Collect TODO/FIXME markers from one file's content (called during the
@@ -89,7 +99,8 @@ pub fn draft_adoption(root: &Path, files: &[ScannedFile], todos: &[TodoHit]) -> 
         })
         .collect();
 
-    AdoptionDraft { name, domain, description, languages, suggested_tasks }
+    let own_method_detected = detect_own_method(root);
+    AdoptionDraft { name, domain, description, languages, suggested_tasks, own_method_detected }
 }
 
 #[cfg(test)]

@@ -1,10 +1,15 @@
 //! Initialize a blank managed workspace (no demo content) for E2E agent tests.
 //!
-//! Usage: cargo run -p nextup-core --example init_blank -- <target-dir> [name] [template-id] [modules]
+//! Usage: cargo run -p nextup-core --example init_blank -- <target-dir> [name] [template-id] [modules] [mode]
 //! `modules` is comma-separated (e.g. `collab`); unknown ids abort before disk.
+//! `mode` is `staged` (the default here) or `ongoing`. The product default is
+//! ongoing (D171), but the e2e scripts walk the phase harness — advance,
+//! gates, the manual_confirm refusal — so this fixture keeps them staged
+//! unless asked.
 
 use nextup_core::security::keystore::StaticKeyProvider;
 use nextup_core::workspace::init::{initialize_project, InitProjectParams};
+use nextup_core::workspace::workflow::WorkflowMode;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -18,6 +23,14 @@ fn main() {
         .next()
         .map(|m| m.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
+    let mode = match args.next().as_deref() {
+        None | Some("staged") => WorkflowMode::Staged,
+        Some("ongoing") => WorkflowMode::Ongoing,
+        Some(other) => {
+            eprintln!("unknown mode '{other}' (staged | ongoing)");
+            std::process::exit(2);
+        }
+    };
 
     let keys = StaticKeyProvider([1u8; 32]);
     let params = InitProjectParams {
@@ -36,6 +49,8 @@ fn main() {
         // The D63 day-one grant, as an unticked wizard gives it (D150): the
         // e2e runs open the guarded tools themselves, as a person would.
         grant_all_tools: false,
+        own_method: false,
+        mode: Some(mode),
     };
 
     match initialize_project(&params, &keys, "0.1.0") {

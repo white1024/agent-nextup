@@ -29,6 +29,7 @@ use nextup_core::workspace::activity::{self, ProjectActivity};
 use nextup_core::workspace::registry::{self, WorkspaceOverview};
 use nextup_core::workspace::settings::{self, WorkspaceSettings};
 use nextup_core::workspace::tasks::{NewTask, Task, TaskEdit, TaskStatus, TaskStore};
+use nextup_core::workspace::team_transfer;
 use nextup_core::workspace::teams::{self, Team, TeamMember};
 use nextup_core::workspace::templates::{self, TemplateSummary, WorkflowTemplate};
 use nextup_core::workspace::workflow::{self, WorkflowStatus};
@@ -209,13 +210,10 @@ pub async fn update_task_status(
     state: tauri::State<'_, AppState>,
     id: String,
     status: TaskStatus,
-    blocked_reason: Option<String>,
+    reason: Option<String>,
 ) -> CmdResult<TaskUpdate> {
     let ws = state.require_workspace()?;
-    blocking(move || {
-        ops::update_task_status(&ws.paths(), APP_VERSION, &id, status, blocked_reason)
-    })
-    .await
+    blocking(move || ops::update_task_status(&ws.paths(), APP_VERSION, &id, status, reason)).await
 }
 
 /// Rewrite a task's attributes (title / description / priority / tags). The
@@ -229,6 +227,77 @@ pub async fn edit_task(
 ) -> CmdResult<TaskUpdate> {
     let ws = state.require_workspace()?;
     blocking(move || ops::edit_task(&ws.paths(), APP_VERSION, &id, edit)).await
+}
+
+// ── To decide: questions and provisional decisions (D170) ─────────────────
+
+/// Every question, oldest first. The app reads without stamping anything —
+/// "seen" means an agent picked the answer up, not that a person looked.
+#[tauri::command]
+pub async fn list_questions(
+    state: tauri::State<'_, AppState>,
+) -> CmdResult<Vec<nextup_core::workspace::questions::Question>> {
+    let ws = state.require_workspace()?;
+    blocking(move || nextup_core::workspace::questions::QuestionStore::new(&ws.paths()).list()).await
+}
+
+/// The person answers; ledgered as a decision.
+#[tauri::command]
+pub async fn answer_question(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    answer: String,
+) -> CmdResult<nextup_core::workspace::questions::Question> {
+    let ws = state.require_workspace()?;
+    blocking(move || ops::answer_question(&ws.paths(), APP_VERSION, &id, &answer)).await
+}
+
+/// The question no longer needs an answer.
+#[tauri::command]
+pub async fn withdraw_question(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> CmdResult<nextup_core::workspace::questions::Question> {
+    let ws = state.require_workspace()?;
+    blocking(move || ops::withdraw_question(&ws.paths(), APP_VERSION, &id)).await
+}
+
+/// Provisional decisions nobody has reviewed yet, oldest first.
+#[tauri::command]
+pub async fn list_provisional_decisions(
+    state: tauri::State<'_, AppState>,
+) -> CmdResult<Vec<nextup_core::workspace::ledger::LedgerEvent>> {
+    let ws = state.require_workspace()?;
+    blocking(move || {
+        nextup_core::workspace::questions::pending_provisional(&nextup_core::workspace::ledger::Ledger::new(
+            ws.paths().ledger_file(),
+        ))
+    })
+    .await
+}
+
+/// Confirm a provisional decision as it stands (`revised` absent) or replace
+/// it; either way a settled decision supersedes it.
+#[tauri::command]
+pub async fn review_decision(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    revised: Option<String>,
+) -> CmdResult<nextup_core::workspace::ledger::LedgerEvent> {
+    let ws = state.require_workspace()?;
+    blocking(move || ops::review_decision(&ws.paths(), APP_VERSION, &id, revised.as_deref())).await
+}
+
+/// Tick or untick one step of a task's checklist (D170; 1-based).
+#[tauri::command]
+pub async fn set_task_step(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    step: usize,
+    done: bool,
+) -> CmdResult<TaskUpdate> {
+    let ws = state.require_workspace()?;
+    blocking(move || ops::set_task_step(&ws.paths(), APP_VERSION, &id, step, done)).await
 }
 
 /// Delete a task file. Refused (structured `has_dependents`) while another
@@ -547,12 +616,45 @@ pub async fn confirm_gate(
     blocking(move || workflow::confirm_gate(&ws.paths(), &phase_id, &prompt)).await
 }
 
+/// Switch the project between staged and ongoing (D171 ③). A person's call:
+/// no hub tool reaches this, the same line phase advancement sits behind.
+/// `lang` picks which built-in template supplies the ongoing instructions
+/// when a workflow.json from before D171 has no copy of its own.
+#[tauri::command]
+pub async fn set_workflow_mode(
+    state: tauri::State<'_, AppState>,
+    mode: workflow::WorkflowMode,
+    lang: Option<String>,
+) -> CmdResult<WorkflowStatus> {
+    let ws = state.require_workspace()?;
+    blocking(move || {
+        workflow::set_mode(
+            &ws.paths(),
+            APP_VERSION,
+            mode,
+            templates::default_custom_dir().as_deref(),
+            templates::TemplateLang::from_tag(lang.as_deref()),
+        )
+    })
+    .await
+}
+
+/// Step a staged project back one phase (D171 ⑤) — the undo for an advance
+/// pressed too early. A person's call, like the switch above.
+#[tauri::command]
+pub async fn rollback_phase(state: tauri::State<'_, AppState>) -> CmdResult<WorkflowStatus> {
+    let ws = state.require_workspace()?;
+    blocking(move || workflow::rollback_phase(&ws.paths(), APP_VERSION)).await
+}
+
 /// Attach a harness to a legacy workspace that predates workflow.json.
+/// `mode: None` takes the product default (D171).
 #[tauri::command]
 pub async fn adopt_workflow(
     state: tauri::State<'_, AppState>,
     template_id: String,
     lang: Option<String>,
+    mode: Option<workflow::WorkflowMode>,
 ) -> CmdResult<WorkflowStatus> {
     let ws = state.require_workspace()?;
     blocking(move || {
@@ -561,7 +663,7 @@ pub async fn adopt_workflow(
             templates::default_custom_dir().as_deref(),
             templates::TemplateLang::from_tag(lang.as_deref()),
         )?;
-        workflow::adopt(&ws.paths(), &template, APP_VERSION)
+        workflow::adopt(&ws.paths(), &template, mode, APP_VERSION)
     })
     .await
 }
@@ -597,6 +699,12 @@ pub async fn workspace_assets_status(
 /// `overwrite` / `keep_as_user` carry the user's per-item decisions for
 /// manual-review assets (empty for the plain "upgrade" button — safe items
 /// only). The engine re-renders content itself; the UI never sends any.
+///
+/// The plain button also grants the day-one tools a newer version added
+/// (D172), so the material that tells an agent about a tool and the grant
+/// that lets it call one arrive with the same press. Here and not in
+/// `upgrade_assets`: the hub's `upgrade_workspace_assets` shares that
+/// function, and an agent must not be the one widening its own grants.
 #[tauri::command]
 pub async fn workspace_assets_upgrade(
     state: tauri::State<'_, AppState>,
@@ -605,11 +713,14 @@ pub async fn workspace_assets_upgrade(
 ) -> CmdResult<AssetsUpgradeOutcome> {
     let ws = state.require_workspace()?;
     blocking(move || {
-        assets::upgrade_assets(
-            &ws.paths(),
-            APP_VERSION,
-            &AssetDecisions { overwrite, keep_as_user },
-        )
+        let plain = overwrite.is_empty() && keep_as_user.is_empty();
+        let paths = ws.paths();
+        let mut outcome =
+            assets::upgrade_assets(&paths, APP_VERSION, &AssetDecisions { overwrite, keep_as_user })?;
+        if plain {
+            outcome.granted_tools = agent::grant_new_default_tools(&paths)?;
+        }
+        Ok(outcome)
     })
     .await
 }
@@ -722,6 +833,10 @@ pub struct AgentAccessView {
     /// Grants a restored backup carried and parked for a person (D143);
     /// absent once accepted or dropped, and on every workspace never restored.
     pub restored_access: Option<agent::RestoredAccess>,
+    /// Day-one tools a newer version added that this workspace has never been
+    /// offered (D172) — what the asset upgrade button will grant, said before
+    /// it is pressed.
+    pub pending_default_grants: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -760,6 +875,10 @@ fn agent_view(paths: &WorkspacePaths, access: agent::AgentAccess) -> CmdResult<A
         write_tool_groups,
         guarded_reasons,
         restored_access: agent::restored_access(paths)?,
+        pending_default_grants: agent::pending_default_grants(paths)?
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
     })
 }
 
@@ -1251,6 +1370,75 @@ pub async fn team_rebind_workspace(
             teams::check_rebind_identity(&workspace_id, context.workspace_id.as_deref())?;
             teams::rebind_workspace(path, &workspace_id, new_root.trim(), &context.name)
         })
+    })
+    .await
+}
+
+/// The graph after a re-link, with what the re-link did — the GUI adopts the
+/// first like any team mutation and says the second out loud.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamsRelinked {
+    pub teams: Vec<Team>,
+    pub report: team_transfer::RelinkReport,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamsImported {
+    pub teams: Vec<Team>,
+    pub outcome: team_transfer::ImportOutcome,
+}
+
+/// Where the re-link looks besides the graph itself (D173 ①): this machine's
+/// project list, then the folders right under `search_dir` when the person
+/// picked one.
+fn relink_candidates(search_dir: Option<&str>) -> CmdResult<Vec<PathBuf>> {
+    let dir = search_dir.map(str::trim).filter(|d| !d.is_empty()).map(Path::new);
+    team_transfer::candidate_roots(registry::default_registry_path().as_deref(), dir)
+}
+
+/// Find missing members and primes by their stable id (D173 ①), across every
+/// team. A button press, never a page open (D41/D53: opening reads).
+#[tauri::command]
+pub async fn team_relink(search_dir: Option<String>) -> CmdResult<TeamsRelinked> {
+    blocking(move || {
+        let roots = relink_candidates(search_dir.as_deref())?;
+        let report = team_transfer::relink(&teams::teams_file()?, &roots)?;
+        Ok(TeamsRelinked { teams: teams::list_all()?, report })
+    })
+    .await
+}
+
+/// Write the chosen teams to a team file the person carries to another
+/// machine (D173 ②). Answers how many were written.
+#[tauri::command]
+pub async fn team_export(team_ids: Vec<String>, file: String) -> CmdResult<usize> {
+    blocking(move || {
+        team_transfer::export_teams(&teams::teams_file()?, &team_ids, Path::new(file.trim()), APP_VERSION)
+    })
+    .await
+}
+
+/// What importing a team file would do, team by team. Reads only.
+#[tauri::command]
+pub async fn team_import_preview(file: String) -> CmdResult<team_transfer::ImportPreview> {
+    blocking(move || team_transfer::preview_import(&teams::teams_file()?, Path::new(file.trim()))).await
+}
+
+/// Take the teams the person picked from a team file, then re-link (D173 ②).
+/// No merge: each picked team is the file's version, path caches aside.
+#[tauri::command]
+pub async fn team_import_apply(
+    file: String,
+    take: Vec<String>,
+    search_dir: Option<String>,
+) -> CmdResult<TeamsImported> {
+    blocking(move || {
+        let roots = relink_candidates(search_dir.as_deref())?;
+        let outcome =
+            team_transfer::apply_import(&teams::teams_file()?, Path::new(file.trim()), &take, &roots)?;
+        Ok(TeamsImported { teams: teams::list_all()?, outcome })
     })
     .await
 }

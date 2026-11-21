@@ -3,6 +3,16 @@
   "name": "Software Development",
   "description": "Spec → Implement → Verify → Release → Retrospect, with built-in quality gates.",
   "domainHint": "coding",
+  "ongoingInstructions": [
+    "Read the handoff and context.json. Work arrives as tasks: when a request is still vague, call the Skill tool with align-scope and settle what done means before building.",
+    "For anything new, settle who will use or review it and what they must be able to do with it; record it as a decision, and get an early slice in front of them before building the rest.",
+    "Turn settled work into vertical-slice tasks with their dependencies: call the Skill tool with slice-work. Record key technical choices (framework, data structures, boundaries) as decisions.",
+    "Take work from the frontier: the highest-priority task in Next steps that you can take, or list_tasks { ready: true }. Build it test-first (call the Skill tool with test-first; for a bug whose cause is not obvious, call it with debug-loop), following the execution guidelines in rules.json.",
+    "If validate_task_specs is in your tool list, a task that changes behaviour writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+    "Before marking a task done, review it on two axes — the project's conventions and what the task asked for: call the Skill tool with two-axis-review, fix what it finds, and give the user the before-and-after evidence they need to mark it verified. Mark done and commit after each task.",
+    "When several independent tasks are ready at once, suggest the user run /work-the-frontier to build them in parallel.",
+    "When you ship, write the release notes with ship-notes (call the Skill tool with it). When a stretch of work closes — a release, a milestone, or a few weeks of tasks — call the Skill tool with retrospect and write the improvements back into rules.json."
+  ],
   "phases": [
     {
       "id": "spec",
@@ -10,6 +20,7 @@
       "description": "Define requirements, acceptance criteria and key technical decisions.",
       "aiInstructions": [
         "Read the handoff and context.json. If the requirements are still vague, call the Skill tool with align-scope and settle what done means first.",
+        "Settle who will use or review what you ship, and what they must be able to do with it; record it as a decision, and plan an early slice they can try before building the rest.",
         "Turn the settled scope into vertical-slice tasks with their dependencies: call the Skill tool with slice-work.",
         "Record key technical choices (framework, data structures, boundaries) as decisions."
       ],

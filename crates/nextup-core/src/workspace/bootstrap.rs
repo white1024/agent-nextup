@@ -32,7 +32,7 @@ pub const STATE_END: &str = "<!-- NEXTUP:STATE:END -->";
 pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<String>> {
     let workflow = try_evaluate(paths)?;
     let phase_title = match &workflow {
-        Some(ws) => ws.current_phase_title(),
+        Some(ws) => crate::workspace::manifest::phase_field(ws),
         None => "—".to_string(),
     };
 
@@ -52,12 +52,17 @@ pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<Stri
     write_if_missing(&paths.agents_md_file(), render_agents_md(ctx))?;
     write_if_missing(&paths.protocol_file(), render_protocol(ctx))?;
     write_if_missing(&paths.nextup_guide_file(), render_guide(ctx))?;
-    write_if_missing(&paths.memory_index_file(), render_memory_index(ctx))?;
-    write_if_missing(&paths.manifest_file(), super::manifest::render_manifest(ctx, &phase_title))?;
-    write_if_missing(
-        &paths.work_record_dir().join("_TEMPLATE.md"),
-        render_work_record_template(ctx),
-    )?;
+    // A project with its own method keeps its own memory, records and
+    // outward summary (D170): only the takeover layer is laid down, and a
+    // later sync must not grow the rest back.
+    if !ctx.own_method {
+        write_if_missing(&paths.memory_index_file(), render_memory_index(ctx))?;
+        write_if_missing(&paths.manifest_file(), super::manifest::render_manifest(ctx, &phase_title))?;
+        write_if_missing(
+            &paths.work_record_dir().join("_TEMPLATE.md"),
+            render_work_record_template(ctx),
+        )?;
+    }
     // Never merged if the user already has their own .mcp.json (v1 keeps
     // hands off existing mcpServers entries entirely). The bare command name
     // relies on PATH; the app rewrites it to an absolute path at init time
@@ -74,6 +79,11 @@ pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<Stri
     // result is reported in `created` so the user sees it happened. The
     // human's own content is untouched (D7/D16).
     ensure_agents_import(&paths.claude_md_file(), &mut created)?;
+    // The same smallest-edit rule for an AGENTS.md the engine did not write
+    // (D170): an adopted folder that already had one used to get nothing at
+    // all — no state block, no pointer to the protocol — so the takeover layer
+    // was unreachable and the doctor reported the missing block as an error.
+    ensure_agents_section(&paths.agents_md_file(), &mut created)?;
     // Skills ship to both roots as real files (D82): `.agents/skills/` is the
     // host-neutral canonical copy, `.claude/skills/` is where Claude Code
     // actually discovers them. Never a symlink — see layout::AGENT_CONFIG_DIR.
@@ -100,6 +110,29 @@ pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<Stri
     // moved on" from "the user customized" (workspace::assets, D38).
     super::assets::record_pristine(paths, ctx)?;
     Ok(created)
+}
+
+/// The section appended to an `AGENTS.md` the engine did not author (D170):
+/// the protocol pointer, the hub line and the state block markers, nothing
+/// else. The person's own text above it is never touched.
+const AGENTS_SECTION: &str = "\n\n## Agent NextUp\n\n> 📐 **Follow [nextup_docs/00-protocol.md](nextup_docs/00-protocol.md) on every takeover** — it is short and it is the procedure. The file contract and formats are in [nextup_docs/01-nextup-guide.md](nextup_docs/01-nextup-guide.md).\n> 🔌 When the **nextup hub tools** are available (MCP, through `.mcp.json` at the root), route tasks, decisions, questions for the user and phase advances through them.\n> Everything above this section is this project's own; the engine maintains only the block below.\n\n<!-- NEXTUP:STATE:BEGIN -->\n(initialising; this block is maintained by the Agent NextUp engine)\n<!-- NEXTUP:STATE:END -->\n";
+
+/// Append [`AGENTS_SECTION`] to an existing `AGENTS.md` that has no state
+/// block. No-op when the file is absent (scaffold just wrote its own) or
+/// already carries the markers.
+fn ensure_agents_section(path: &Path, created: &mut Vec<String>) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)?;
+    if content.contains(STATE_BEGIN) {
+        return Ok(());
+    }
+    let mut updated = content.trim_end().to_string();
+    updated.push_str(AGENTS_SECTION);
+    atomic_write(path, updated.as_bytes())?;
+    created.push("AGENTS.md (Agent NextUp section appended)".into());
+    Ok(())
 }
 
 /// The import line that makes the `AGENTS.md` body reachable from Claude Code.
@@ -340,7 +373,7 @@ pub fn set_mcp_discovery_command(paths: &WorkspacePaths, command: &str) -> Resul
     Ok(())
 }
 
-/// How many recent decisions the CLAUDE.md state block shows.
+/// How many recent decisions the AGENTS.md state block shows.
 pub(crate) const STATE_BLOCK_DECISIONS: usize = 3;
 /// How many recent `progress` entries the state block shows (D78) — the
 /// takeover reads "where the last session stopped" right after the one-liner.
@@ -446,7 +479,11 @@ fn refresh_agents_state(
         .map(|(id, _)| *id)
         .filter(|id| modules.is_enabled(id))
         .collect();
-    let block = render_state_block(ctx, tasks, workflow, decisions, progress, specs_caps, &guided);
+    // Questions and provisional decisions (D170): read here like the spec
+    // line above — a directory listing and one ledger pass.
+    let asks = crate::workspace::questions::ask_summary(paths)?;
+    let block =
+        render_state_block(ctx, tasks, workflow, decisions, progress, specs_caps, &guided, &asks);
     let updated = format!(
         "{}{}\n{}\n{}{}",
         &content[..begin],
@@ -469,6 +506,7 @@ fn render_state_block(
     progress: &[LedgerEvent],
     specs_caps: Option<usize>,
     guided_modules: &[&str],
+    asks: &crate::workspace::questions::AskSummary,
 ) -> String {
     let counts = compute_counts(tasks);
     let mut md = String::with_capacity(1024);
@@ -481,12 +519,29 @@ fn render_state_block(
         "\n**Status**: {} (domain: {}) — {} tasks: {} todo / {} in progress / {} blocked / {} done",
         ctx.name, ctx.domain, counts.total, counts.todo, counts.in_progress, counts.blocked, counts.done
     ));
+    if counts.cancelled > 0 {
+        md.push_str(&format!(" / {} cancelled", counts.cancelled));
+    }
     if let Some(ws) = workflow {
-        if ws.workflow.state.completed {
+        if ws.is_ongoing() {
+            // No position and no date (D171): an ongoing project is not
+            // anywhere along a line, and "since" would read as a stall.
+            md.push_str(&format!(
+                "; runs **ongoing** (template {} — no phases to advance)",
+                ws.workflow.template_name
+            ));
+        } else if ws.workflow.state.completed {
             md.push_str(&format!("; workflow **complete** (template {})", ws.workflow.template_name));
         } else {
+            // The entry date makes a phase that has not moved visible (D169):
+            // an external workspace sat in its first phase for 26 days with
+            // its exit gate passed, and nothing on any surface said so.
+            let since = ws
+                .current_phase_entered_on()
+                .map(|day| format!(", since {day}"))
+                .unwrap_or_default();
             md.push_str(&format!(
-                "; current phase **{}** ({}/{}, template {})",
+                "; current phase **{}** ({}/{}, template {}{since})",
                 ws.current_phase_title(),
                 ws.current_index + 1,
                 ws.total_phases,
@@ -542,9 +597,17 @@ fn render_state_block(
         }
     }
 
-    // This phase's instructions and gates
+    // This phase's instructions and gates — or, ongoing, the one set of
+    // working instructions (D171).
     if let Some(ws) = workflow {
-        if !ws.workflow.state.completed {
+        if ws.is_ongoing() {
+            if !ws.workflow.ongoing_instructions.is_empty() {
+                md.push_str("\n**Working instructions** (this project runs ongoing — no phases, no exit gates):\n");
+                for line in &ws.workflow.ongoing_instructions {
+                    md.push_str(&format!("- {line}\n"));
+                }
+            }
+        } else if !ws.workflow.state.completed {
             if let Some(phase) = ws.workflow.phases.get(ws.current_index) {
                 if !phase.ai_instructions.is_empty() {
                     md.push_str("\n**Instructions for this phase**:\n");
@@ -562,6 +625,11 @@ fn render_state_block(
                             gate.observed
                         ));
                     }
+                    // A ticked list reads as "fine" and nobody moves (D169):
+                    // say outright that the phase is waiting on an advance.
+                    if ws.can_advance {
+                        md.push_str("- **All exit gates pass — this phase is ready to advance.** Call `advance_phase`; if it is refused as not authorised, tell the user it is ready — they can advance it in the app. Do not start the next phase's work under this one.\n");
+                    }
                 }
             }
         }
@@ -572,7 +640,12 @@ fn render_state_block(
     let next = crate::workspace::tasks::next_steps(tasks);
     md.push_str("\n**Next steps** (up to 5; ▶ = in progress):\n");
     if next.is_empty() {
-        md.push_str("- (no open tasks; break new ones out of this phase's instructions)\n");
+        let source = if workflow.is_some_and(|ws| ws.is_ongoing()) {
+            "the working instructions"
+        } else {
+            "this phase's instructions"
+        };
+        md.push_str(&format!("- (no open tasks; break new ones out of {source})\n"));
     } else {
         for step in next.iter().take(5) {
             let task = step.task;
@@ -614,12 +687,15 @@ fn render_state_block(
         }
     }
 
+    md.push_str(&asks.render(state_line));
+
     // Recent decisions (each clamped by the D78 lens — the state block is an index,
     // not an archive)
     if !decisions.is_empty() {
         md.push_str("\n**Recent decisions**:\n");
         for event in decisions {
-            md.push_str(&format!("- `{}` {}\n", event.at, state_line(&event.message)));
+            let mark = if event.provisional { "(provisional) " } else { "" };
+            md.push_str(&format!("- `{}` {mark}{}\n", event.at, state_line(&event.message)));
         }
     }
 
@@ -648,10 +724,29 @@ fn render_claude_md(ctx: &ProjectContext) -> String {
 }
 
 fn render_agents_md(ctx: &ProjectContext) -> String {
+    // A project with its own method (D170) gets no rows for folders the
+    // engine did not lay down, and its third reading step is its own index.
+    let third = if ctx.own_method {
+        "(3) this project's own documents (write their index outside the state block)"
+    } else {
+        "(3) [memory/MEMORY.md](memory/MEMORY.md) (cross-session memory)"
+    };
+    let own_rows = if ctx.own_method {
+        ""
+    } else {
+        "| [memory/MEMORY.md](memory/MEMORY.md) | Cross-session memory index (one fact per file) | Every takeover |\n"
+    };
+    let output_rows = if ctx.own_method {
+        ""
+    } else {
+        "| `artifacts/` | Deliverable output directory | When delivering |\n\
+| `work_record/` | Monthly work record (`YYYY-MM.md`; template `_TEMPLATE.md`) | End of month, or when asked to record |\n\
+| [project.yaml](project.yaml) | Outward-facing aggregate manifest (`phase`/`progress`/`updated` synced by the engine) | When reporting outwards |\n"
+    };
     format!(
         r#"# {name} — Agent NextUp workspace
 
-> 🤖 **Read in this order**: (1) the Current state block below (engine-maintained, never stale) -> (2) [.nextup/snapshots/latest_handoff.md](.nextup/snapshots/latest_handoff.md) (the full handoff snapshot) -> (3) [memory/MEMORY.md](memory/MEMORY.md) (cross-session memory).
+> 🤖 **Read in this order**: (1) the Current state block below (engine-maintained, never stale) -> (2) [.nextup/snapshots/latest_handoff.md](.nextup/snapshots/latest_handoff.md) (the full handoff snapshot) -> {third}.
 > 📐 **Follow [nextup_docs/00-protocol.md](nextup_docs/00-protocol.md) on every takeover** — it is short and it is the procedure. The file contract, formats and headless rules are in [nextup_docs/01-nextup-guide.md](nextup_docs/01-nextup-guide.md): required reading the first time you take over, and reference material after that.
 > 🔌 When the **nextup hub tools** are available (MCP, connected automatically through `.mcp.json` at the root): route tasks, decisions, milestones and phase advances **through tool calls**. The tools keep the ledger and the handoff layer in sync; editing JSON by hand does not. Fall back to the guide's headless file operations only when the tools cannot be reached.
 > 🗣️ Reply in the language the user writes in.
@@ -667,12 +762,8 @@ fn render_agents_md(ctx: &ProjectContext) -> String {
 | [nextup_docs/00-protocol.md](nextup_docs/00-protocol.md) | **The session operating protocol** — the eight steps of a takeover | **Every** takeover |
 | [nextup_docs/01-nextup-guide.md](nextup_docs/01-nextup-guide.md) | The .nextup contract, task and ledger formats, gate semantics, hub tools (§9) | First takeover, or before touching any file |
 | `.nextup/context.json` | Project goals, boundaries and milestones (**source of truth**) | When you need to know what is and is not in scope |
-| [memory/MEMORY.md](memory/MEMORY.md) | Cross-session memory index (one fact per file) | Every takeover |
-| `tasks/` | Atomic tasks, one file each (`T-XXXX.json`) | When picking up a task |
-| `artifacts/` | Deliverable output directory | When delivering |
-| `work_record/` | Monthly work record (`YYYY-MM.md`; template `_TEMPLATE.md`) | End of month, or when asked to record |
-| [project.yaml](project.yaml) | Outward-facing aggregate manifest (`phase`/`progress`/`updated` synced by the engine) | When reporting outwards |
-| `.mcp.json` | Connection settings for the nextup hub tools (Agent NextUp points it at the resolved `nextup-mcp` path) | Takes effect automatically; rarely needs reading |
+{own_rows}| `tasks/` | Atomic tasks, one file each (`T-XXXX.json`) | When picking up a task |
+{output_rows}| `.mcp.json` | Connection settings for the nextup hub tools (Agent NextUp points it at the resolved `nextup-mcp` path) | Takes effect automatically; rarely needs reading |
 | `.agents/skills/` | The process skills, canonical copies (`.claude/skills/` holds byte-identical copies for Claude Code) | When your host cannot invoke skills — read the `SKILL.md` and follow it |
 | [CLAUDE.md](CLAUDE.md) | A shell that imports this file (Claude Code reads only that name) | Never edit it instead of this file |
 "#,
@@ -681,6 +772,20 @@ fn render_agents_md(ctx: &ProjectContext) -> String {
         end = STATE_END,
     )
 }
+
+/// The two protocol sentences that name folders a project with its own method
+/// does not have (D170), in their default and own-method forms.
+const OUTPUT_RULE: (&str, &str) = (
+    "every output goes in `artifacts/`",
+    "every output goes where this project's own documents say (AGENTS.md, outside the state block)",
+);
+const MEMORY_RULE: (&str, &str) = (
+    " — plus a memory file (one fact per file, with an index line)",
+    " — plus whatever this project's own documents say about recording it",
+);
+/// The guide's one note for a project with its own method (D170); the default
+/// render drops the placeholder line entirely.
+const OWN_METHOD_NOTE: &str = "> 🗂 **This workspace brings its own method.** It was set up without `memory/`, `work_record/`, `artifacts/` and `project.yaml`: where this guide names them, use what the project's own documents (AGENTS.md, outside the state block) name instead.\n";
 
 /// Hub discovery file at the workspace root. Seeded with a bare `nextup-mcp`
 /// command (keeps the file portable across machines/backups); the desktop app
@@ -782,7 +887,11 @@ pub(crate) fn render_guide(ctx: &ProjectContext) -> String {
         .map(|(kind, advice)| format!("  - `{kind}` — {advice}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // Both line endings: a Windows checkout embeds the template as CRLF.
+    let note = if ctx.own_method { OWN_METHOD_NOTE } else { "" };
     GUIDE_TEMPLATE
+        .replace("@OWN_METHOD_NOTE@\r\n", note)
+        .replace("@OWN_METHOD_NOTE@\n", note)
         .replace("@PROJECT_NAME@", &ctx.name)
         .replace("@READ_TOOLS@", &tool_list(&crate::agent::READ_TOOLS))
         .replace("@WRITE_TOOLS@", &tool_list(&crate::agent::WRITE_TOOLS))
@@ -798,7 +907,11 @@ pub(crate) fn render_guide(ctx: &ProjectContext) -> String {
 /// an agent re-reads on **every** takeover is small: the guide it points at is
 /// reference material, read when the contract is actually needed.
 pub(crate) fn render_protocol(ctx: &ProjectContext) -> String {
-    PROTOCOL_TEMPLATE.replace("@PROJECT_NAME@", &ctx.name)
+    let pick = |(default, own): (&'static str, &'static str)| if ctx.own_method { own } else { default };
+    PROTOCOL_TEMPLATE
+        .replace("@PROJECT_NAME@", &ctx.name)
+        .replace("@OUTPUT_RULE@", pick(OUTPUT_RULE))
+        .replace("@MEMORY_RULE@", pick(MEMORY_RULE))
 }
 
 const PROTOCOL_TEMPLATE: &str = include_str!("../../guide/00-protocol.md");
@@ -959,11 +1072,15 @@ mod tests {
         assert!(!claude.contains("Session operating protocol"), "protocol lives in the guide (§0)");
         // Initial refresh already populated the state block (init generates handoff).
         assert!(claude.contains("**Status**"));
-        assert!(claude.contains("Plan"), "current phase shows in state block");
+        // A new project runs ongoing by default (D171): no position, the
+        // template's working instructions instead of a phase's.
+        assert!(claude.contains("runs **ongoing**"), "{claude}");
+        assert!(claude.contains("**Working instructions**"), "{claude}");
+        assert!(!claude.contains("**Exit gates**"), "ongoing has no gates to list");
 
         let manifest = std::fs::read_to_string(paths.manifest_file()).unwrap();
         assert!(manifest.contains("id: handoff-test-demo"));
-        assert!(manifest.contains("phase: Plan"));
+        assert!(manifest.contains("phase: ongoing"));
         assert!(manifest.contains("progress: 0"));
     }
 
@@ -1280,6 +1397,16 @@ mod tests {
     #[test]
     fn state_block_marks_the_fields_nothing_re_checks() {
         let (_g, paths) = workspace();
+        // The exit gates are the engine-computed neighbour this test leans
+        // on, and only a staged project has them (D171).
+        crate::workspace::workflow::set_mode(
+            &paths,
+            "0.1.0",
+            crate::workspace::workflow::WorkflowMode::Staged,
+            None,
+            Default::default(),
+        )
+        .unwrap();
         add_ledger_note(&paths, "0.1.0", NoteChannel::Progress, "折疊完成,等人封存").unwrap();
         let t = create_task(
             &paths,
@@ -1448,14 +1575,17 @@ mod tests {
     #[test]
     fn scaffold_is_idempotent_and_non_destructive() {
         let (_g, paths) = workspace();
+        // An AGENTS.md without the state block gets the engine section
+        // appended once (D170) — the person's text stays first and intact —
+        // and a second pass changes nothing.
         std::fs::write(paths.agents_md_file(), "custom agents file\n").unwrap();
         let ctx = load_context(&paths.context_file()).unwrap();
         let created = scaffold(&paths, &ctx).unwrap();
-        assert!(created.is_empty(), "everything exists; nothing recreated");
-        assert_eq!(
-            std::fs::read_to_string(paths.agents_md_file()).unwrap(),
-            "custom agents file\n"
-        );
+        assert_eq!(created, vec!["AGENTS.md (Agent NextUp section appended)".to_string()]);
+        let once = std::fs::read_to_string(paths.agents_md_file()).unwrap();
+        assert!(once.starts_with("custom agents file\n\n## Agent NextUp"));
+        assert!(scaffold(&paths, &ctx).unwrap().is_empty(), "everything exists; nothing recreated");
+        assert_eq!(std::fs::read_to_string(paths.agents_md_file()).unwrap(), once);
     }
 
     #[test]
@@ -1469,4 +1599,68 @@ mod tests {
         assert_eq!(created, vec!["AGENTS.md".to_string(), "MEMORY.md".to_string()]);
     }
 
+
+    // ── Own method (D170) ────────────────────────────────────────────────────
+
+    #[test]
+    fn an_own_method_workspace_gets_only_the_takeover_layer_and_keeps_it_that_way() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# my method\n\nOur own process.\n").unwrap();
+        assert!(crate::index::draft::detect_own_method(dir.path()));
+        initialize_project(
+            &InitProjectParams {
+                root: dir.path().to_string_lossy().into_owned(),
+                name: "own".into(),
+                own_method: true,
+                ..Default::default()
+            },
+            &StaticKeyProvider([9u8; 32]),
+            "0.1.0",
+        )
+        .unwrap();
+        let paths = WorkspacePaths::new(dir.path());
+        assert!(paths.protocol_file().is_file() && paths.nextup_guide_file().is_file());
+        assert!(paths.tasks_dir().is_dir());
+        assert!(!paths.memory_index_file().exists());
+        assert!(!paths.manifest_file().exists());
+        assert!(!paths.work_record_dir().exists());
+        assert!(!paths.artifacts_dir().exists());
+
+        let protocol = std::fs::read_to_string(paths.protocol_file()).unwrap();
+        assert!(protocol.contains("where this project's own documents say"));
+        assert!(!protocol.contains("artifacts/") && !protocol.contains("@OUTPUT_RULE@"));
+        assert!(!protocol.contains("memory file") && !protocol.contains("@MEMORY_RULE@"));
+        let guide = std::fs::read_to_string(paths.nextup_guide_file()).unwrap();
+        assert!(guide.contains("This workspace brings its own method"));
+        assert!(!guide.contains("@OWN_METHOD_NOTE@"));
+        let rules = std::fs::read_to_string(paths.rules_file()).unwrap();
+        assert!(!rules.contains("artifacts/"));
+
+        // A later sync must not grow the skipped files back.
+        let ctx = crate::workspace::context::load_context(&paths.context_file()).unwrap();
+        assert!(ctx.own_method);
+        scaffold(&paths, &ctx).unwrap();
+        assert!(!paths.memory_index_file().exists() && !paths.manifest_file().exists());
+
+        // The person's own AGENTS.md keeps its text and gains only the engine
+        // section at the end, which the state block then fills.
+        let agents = std::fs::read_to_string(paths.agents_md_file()).unwrap();
+        assert!(agents.starts_with("# my method\n\nOur own process."));
+        assert!(agents.contains("## Agent NextUp") && agents.contains("00-protocol.md"));
+        assert!(agents.contains("**Status**"), "the state block was filled: {agents}");
+        let report = crate::workspace::doctor::run_doctor(paths.root()).unwrap();
+        assert!(!report.findings.iter().any(|f| f.check == "marker_block"), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_default_workspace_renders_no_own_method_text_or_placeholders() {
+        let (_g, paths) = workspace();
+        let protocol = std::fs::read_to_string(paths.protocol_file()).unwrap();
+        assert!(protocol.contains("every output goes in `artifacts/`"));
+        assert!(protocol.contains("plus a memory file"));
+        let guide = std::fs::read_to_string(paths.nextup_guide_file()).unwrap();
+        assert!(!guide.contains("@OWN_METHOD_NOTE@") && !guide.contains("brings its own method"));
+        let agents = std::fs::read_to_string(paths.agents_md_file()).unwrap();
+        assert!(agents.contains("| `artifacts/` |") && agents.contains("[memory/MEMORY.md]"));
+    }
 }

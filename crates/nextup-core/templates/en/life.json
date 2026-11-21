@@ -3,6 +3,12 @@
   "name": "Life Planning",
   "description": "Clarify → Plan → Act → Reflect, a lightweight loop.",
   "domainHint": "life",
+  "ongoingInstructions": [
+    "Keep the motivation and the ideal outcome in goals of context.json, and the one thing that matters most right now recorded as a decision.",
+    "Break it into small tasks finishable within a week — smaller is better. The slice-work skill walks the breakdown with the user (call the Skill tool with it).",
+    "Advance one task at a time; when stuck, mark it blocked and write down the sticking point — never grind through.",
+    "Every so often — when a focus is done, or when things stall — call the Skill tool with retrospect, write what worked and what did not as a decision, and decide the next focus."
+  ],
   "phases": [
     {
       "id": "clarify",

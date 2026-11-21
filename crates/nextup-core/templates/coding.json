@@ -3,6 +3,16 @@
   "name": "軟體開發",
   "description": "規格 → 實作 → 驗證 → 交付 → 復盤，內建品質關卡。",
   "domainHint": "coding",
+  "ongoingInstructions": [
+    "讀 handoff 與 context.json。工作以任務的形式進來：需求還模糊時，先呼叫 Skill 工具執行 align-scope，把「完成」的意思定下來再動手。",
+    "做新東西之前，先講定它給誰用、誰審，他們要能用它做什麼；以「決策」記下來，並先做一個他們能試用的早期切片，再做其餘部分。",
+    "把定好的工作切成帶相依的垂直切片任務：呼叫 Skill 工具執行 slice-work。用「決策」記錄關鍵技術選型（框架、資料結構、邊界）。",
+    "從 frontier 拿工作：Next steps 裡你能拿的最高優先任務，或 list_tasks { ready: true }。每個任務都先寫測試（呼叫 Skill 工具執行 test-first；原因不明顯的 bug，改執行 debug-loop），遵守 rules.json 的執行守則。",
+    "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
+    "標 done 之前，從兩個軸審查——專案慣例、任務要求的內容：呼叫 Skill 工具執行 two-axis-review，修掉它找到的問題，並把使用者標「已驗證」需要的前後對照證據交給他。每完成一個任務就標 done 並 commit。",
+    "同時有好幾個彼此獨立的任務可以開工時，建議使用者跑 /work-the-frontier 平行完成。",
+    "要交付時，呼叫 Skill 工具執行 ship-notes 寫發布說明。一段工作告一段落時（一次發版、一個里程碑，或累積了幾週的任務），呼叫 Skill 工具執行 retrospect，把改進寫回 rules.json。"
+  ],
   "phases": [
     {
       "id": "spec",
@@ -10,6 +20,7 @@
       "description": "定義需求、驗收條件與關鍵技術決策。",
       "aiInstructions": [
         "讀 handoff 與 context.json。需求還模糊時，先呼叫 Skill 工具執行 align-scope，把「完成」的意思定下來。",
+        "先講定做出來的東西給誰用、誰審，他們要能用它做什麼；以「決策」記下來，並規劃一個他們能先試用的早期切片，再做其餘部分。",
         "把定好的範圍切成帶相依的垂直切片任務：呼叫 Skill 工具執行 slice-work。",
         "用「決策」記錄關鍵技術選型（框架、資料結構、邊界）。"
       ],
@@ -24,7 +35,7 @@
       "description": "依規格逐一完成任務。",
       "aiInstructions": [
         "從 frontier 拿工作：Next steps 裡你能拿的最高優先任務，或 list_tasks { ready: true }。遵守 rules.json 的執行守則。",
-        "每個任務都先寫測試：呼叫 Skill 工具執行 test-first。原因不明顯的 bug，改執行 diagnose。",
+        "每個任務都先寫測試：呼叫 Skill 工具執行 test-first。原因不明顯的 bug，改執行 debug-loop。",
         "若工具清單裡有 validate_task_specs，會改變行為的任務要在標 done 之前把規格 delta 寫進 tasks/<task-id>/specs/（見 nextup_docs/modules/specs.md）。",
         "每完成一個原子任務就標 done 並 commit。",
         "同時有好幾個彼此獨立的任務可以開工時，建議使用者跑 /work-the-frontier 平行完成。"

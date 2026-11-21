@@ -255,6 +255,11 @@ pub struct AssetsUpgradeOutcome {
     /// file was backed up this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_dir: Option<String>,
+    /// Tools a newer version added that the same press granted (D172). Only
+    /// the GUI's upgrade fills it; this function itself never touches grants,
+    /// so the hub's `upgrade_workspace_assets` always returns it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_tools: Vec<String>,
 }
 
 /// Bring the curriculum up to the running engine's content: overwrite
@@ -294,6 +299,7 @@ pub fn upgrade_assets(
             skipped_customized: Vec::new(),
             needs_review: Vec::new(),
             backup_dir: None,
+            granted_tools: Vec::new(),
         };
         let mut dirty = false;
 
@@ -551,7 +557,7 @@ mod tests {
             crate::workspace::templates::TemplateLang::En,
         )
         .unwrap();
-        crate::workspace::workflow::adopt(&legacy, &coding_template, "0.0.0-test").unwrap();
+        crate::workspace::workflow::adopt(&legacy, &coding_template, None, "0.0.0-test").unwrap();
         for (name, _) in pack {
             assert!(legacy.skill_file(name).is_file(), "{name} shipped on adopt");
             assert!(fingerprinted(&legacy, name), "{name} fingerprinted on adopt");
@@ -572,6 +578,23 @@ mod tests {
         .unwrap();
         let rel = WorkspacePaths::module_guide_rel(crate::workspace::modules::MODULE_TEAM);
         assert!(load_shipped(&paths).unwrap().assets.contains_key(&rel), "{rel} fingerprinted");
+    }
+
+    #[test]
+    fn the_upgrade_itself_never_touches_grants() {
+        // The hub's upgrade_workspace_assets calls this function directly, so
+        // granting here would let an agent widen its own grants (D172). The
+        // GUI grants in its own command, after this returns.
+        let (_dir, paths) = workspace();
+        let access = crate::agent::AgentAccess {
+            allowed_tools: vec!["create_task".into()],
+            ..Default::default()
+        };
+        crate::agent::save_access(&paths.agent_access_file(), &access).unwrap();
+        std::fs::write(paths.root().join(GUIDE_REL), "stale").unwrap();
+        let outcome = upgrade_assets(&paths, "0.0.0-test", &AssetDecisions::default()).unwrap();
+        assert!(outcome.granted_tools.is_empty());
+        assert_eq!(crate::agent::get_access(&paths).unwrap(), access);
     }
 
     #[test]

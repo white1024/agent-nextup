@@ -45,6 +45,7 @@ const MARK: Record<TaskStatus, string> = {
   in_progress: "dot-run",
   blocked: "mk-y",
   done: "mk-e",
+  cancelled: "mk-x",
 };
 
 function CardStatus({ status }: { status: TaskStatus }) {

@@ -46,6 +46,10 @@ pub struct WorkspaceOverview {
     pub exists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_counts: Option<TaskCounts>,
+    /// Open questions and provisional decisions waiting on the person (D170)
+    /// — the project card's amber line counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub you_counts: Option<crate::workspace::questions::YouCounts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_phase: Option<String>,
     /// Display title of the current phase (D42 pure-Chinese titles); None
@@ -55,6 +59,9 @@ pub struct WorkspaceOverview {
     pub current_phase_title: Option<String>,
     #[serde(default)]
     pub workflow_completed: bool,
+    /// Runs ongoing (D171): the card shows no phase position.
+    #[serde(default)]
+    pub ongoing: bool,
     /// 0-based position of the current phase and how many there are, for
     /// "phase 2 / 5". None when there is no workflow or the state points at
     /// an unknown phase.
@@ -144,6 +151,9 @@ pub fn overview(path: &Path) -> Result<Vec<WorkspaceOverview>> {
                 None => (entry.name.clone(), entry.domain.clone()),
             };
             let workflow = load_workflow(&paths.workflow_file()).ok();
+            // Ongoing (D171) has no position: only the mode and the template
+            // reach the card.
+            let staged = workflow.as_ref().filter(|w| !w.is_ongoing());
             WorkspaceOverview {
                 root: entry.root,
                 name,
@@ -151,20 +161,22 @@ pub fn overview(path: &Path) -> Result<Vec<WorkspaceOverview>> {
                 last_opened: entry.last_opened,
                 exists,
                 task_counts: if exists { counts_for_dir(&paths.tasks_dir()).ok() } else { None },
-                current_phase: workflow.as_ref().map(|w| w.state.current_phase.clone()),
-                current_phase_title: workflow.as_ref().and_then(|w| {
+                you_counts: exists.then(|| crate::workspace::questions::you_counts(&paths)),
+                current_phase: staged.map(|w| w.state.current_phase.clone()),
+                current_phase_title: staged.and_then(|w| {
                     w.phases
                         .iter()
                         .find(|p| p.id == w.state.current_phase)
                         .map(|p| p.title.clone())
                 }),
-                current_phase_index: workflow.as_ref().and_then(|w| {
+                current_phase_index: staged.and_then(|w| {
                     w.phases.iter().position(|p| p.id == w.state.current_phase)
                 }),
-                phase_count: workflow.as_ref().map(|w| w.phases.len()),
+                phase_count: staged.map(|w| w.phases.len()),
                 template_id: workflow.as_ref().map(|w| w.template_id.clone()),
                 template_name: workflow.as_ref().map(|w| w.template_name.clone()),
-                workflow_completed: workflow.map(|w| w.state.completed).unwrap_or(false),
+                workflow_completed: staged.map(|w| w.state.completed).unwrap_or(false),
+                ongoing: workflow.map(|w| w.is_ongoing()).unwrap_or(false),
             }
         })
         .collect())
@@ -257,12 +269,29 @@ mod tests {
         assert!(real.exists);
         assert_eq!(real.name, "real", "name is re-read from context, not the stale pointer");
         assert!(real.task_counts.is_some());
-        assert!(real.current_phase.is_some());
+        // A new project runs ongoing (D171): the card gets the mode and the
+        // template, and no position at all.
+        assert!(real.ongoing);
+        assert!(real.current_phase.is_none() && real.current_phase_title.is_none());
+        assert!(real.current_phase_index.is_none() && real.phase_count.is_none());
+        assert_eq!(real.template_id.as_deref(), Some("generic-v1"));
+        assert!(real.template_name.is_some());
+
+        // Staged, the position is resolved for the card.
+        crate::workspace::workflow::set_mode(
+            &crate::workspace::layout::WorkspacePaths::new(ws.path()),
+            "0.1.0",
+            crate::workspace::workflow::WorkflowMode::Staged,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let rows = overview(&reg).unwrap();
+        let real = &rows[1];
+        assert!(!real.ongoing);
         assert!(real.current_phase_title.is_some(), "phase title resolved for card display");
         assert_eq!(real.current_phase_index, Some(0), "a fresh workspace sits on its first phase");
         assert!(real.phase_count.is_some_and(|n| n > 1));
-        assert_eq!(real.template_id.as_deref(), Some("generic-v1"));
-        assert!(real.template_name.is_some());
 
         // The ghost has no readable workflow — template stays None and the
         // serialized row simply omits the fields.

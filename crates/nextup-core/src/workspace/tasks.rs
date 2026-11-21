@@ -1,8 +1,8 @@
 //! Task store: one atomic task = one JSON file under `tasks/`.
 //!
 //! Files are the source of truth — the store is stateless and every operation
-//! re-reads the directory. Status (`todo/in_progress/blocked/done`) is the
-//! *claim* dimension; verification (`verified_at`/`verified_note`) is the
+//! re-reads the directory. Status (`todo/in_progress/blocked/done/cancelled`)
+//! is the *claim* dimension; verification (`verified_at`/`verified_note`) is the
 //! separate *checked* dimension (D17). This module also owns the takeover
 //! selectors ([`next_steps`], [`blocked`]) every handoff surface renders from,
 //! so "what should the next session do first" is decided in exactly one place.
@@ -17,6 +17,22 @@ use crate::workspace::context::now_rfc3339;
 
 pub const TASK_SCHEMA_VERSION: u32 = 1;
 
+/// Most steps one task may carry (D170). A checklist past this is a phase
+/// plan, not one task's steps, and every takeover surface renders the count.
+pub const MAX_TASK_STEPS: usize = 50;
+
+/// One step of a task's own checklist (D170). Steps describe how the task's
+/// work breaks down — an external PM ran "five sections × the same eight
+/// steps", which had nowhere to live but a hand-kept table — and they never
+/// move the task's status, its verification or any gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStep {
+    pub title: String,
+    #[serde(default)]
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -24,11 +40,23 @@ pub enum TaskStatus {
     InProgress,
     Blocked,
     Done,
+    /// Closed without being done (D169): superseded, dropped, or overtaken by
+    /// events. Before it existed the only way to close such a task was `done`,
+    /// which counted it as progress and let it unlock its dependents — an
+    /// external PM's workspace read 54% while nothing was finished. A
+    /// cancelled task needs a reason, never satisfies a dependency, cannot be
+    /// verified and never folds its delta specs.
+    Cancelled,
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 4] =
-        [TaskStatus::Todo, TaskStatus::InProgress, TaskStatus::Blocked, TaskStatus::Done];
+    pub const ALL: [TaskStatus; 5] = [
+        TaskStatus::Todo,
+        TaskStatus::InProgress,
+        TaskStatus::Blocked,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
@@ -36,7 +64,14 @@ impl TaskStatus {
             TaskStatus::InProgress => "in_progress",
             TaskStatus::Blocked => "blocked",
             TaskStatus::Done => "done",
+            TaskStatus::Cancelled => "cancelled",
         }
+    }
+
+    /// Closed = no work left on it: done or cancelled. Archiving accepts only
+    /// closed tasks and the `all_tasks_done` gate counts only the rest as open.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, TaskStatus::Done | TaskStatus::Cancelled)
     }
 }
 
@@ -48,7 +83,7 @@ impl std::str::FromStr for TaskStatus {
     fn from_str(s: &str) -> Result<Self> {
         TaskStatus::ALL.into_iter().find(|st| st.label() == s).ok_or_else(|| {
             NextUpError::InvalidInput(format!(
-                "unknown task status '{s}' (expected one of: todo, in_progress, blocked, done)"
+                "unknown task status '{s}' (expected one of: todo, in_progress, blocked, done, cancelled)"
             ))
         })
     }
@@ -84,6 +119,10 @@ pub struct Task {
     /// Absent on pre-existing files and cleared with the reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_at: Option<String>,
+    /// Why the task was cancelled (D169) — required on the way in, cleared on
+    /// the way out, like `blocked_reason`. Absent on pre-existing files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
     /// Collaboration fields (D31). Always part of the schema — a workspace
     /// without the collab module simply never surfaces them (fields stay
     /// universal, modules only gate exposure), so old files need no migration.
@@ -91,12 +130,15 @@ pub struct Task {
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// The task's own checklist (D170). Absent on pre-existing files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TaskStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_note: Option<String>,
-    /// Archived = closed and hidden from default listings (D40). Only a done
-    /// task can be archived; the file stays in `tasks/` under its id, so
+    /// Archived = closed and hidden from default listings (D40). Only a closed
+    /// task (done, or cancelled since D169) can be archived; the file stays in `tasks/` under its id, so
     /// dependency resolution and `get` are unaffected. Missing field means
     /// "not archived" — pre-existing task files need no migration.
     #[serde(default)]
@@ -145,6 +187,9 @@ pub struct NewTask {
     pub assignee: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Step titles, all starting unchecked (D170).
+    #[serde(default)]
+    pub steps: Vec<String>,
 }
 
 /// The editable *attribute* set of a task — everything that describes the work
@@ -163,6 +208,11 @@ pub struct TaskEdit {
     pub priority: u8,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The complete new step list by title (D170); `None` leaves it as it is.
+    /// A title that was already there keeps its checkmark, so rewording one
+    /// step does not reset the others.
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +223,10 @@ pub struct TaskCounts {
     pub in_progress: usize,
     pub blocked: usize,
     pub done: usize,
+    /// Closed without being done (D169). Counted in `total` — the files exist
+    /// — but every progress figure leaves them out of the denominator.
+    #[serde(default)]
+    pub cancelled: usize,
     /// Done tasks whose completion claim has not been verified yet — the gap
     /// a takeover session must treat as assumptions, not facts.
     #[serde(default)]
@@ -265,8 +319,10 @@ impl TaskStore {
             tags: normalize_tags(input.tags),
             blocked_reason: None,
             blocked_at: None,
+            cancel_reason: None,
             assignee: normalize_assignee(input.assignee),
             depends_on,
+            steps: normalize_steps(input.steps, &[])?,
             verified_at: None,
             verified_note: None,
             archived: false,
@@ -288,9 +344,27 @@ impl TaskStore {
     /// [`Self::update_status`]) — if the substance of the work really changed,
     /// that is a new task, not an edit.
     pub fn edit(&self, id: &str, edit: TaskEdit) -> Result<Task> {
+        self.edit_with_deps(id, edit, None)
+    }
+
+    /// [`Self::edit`] that may also replace the dependency list (D169, the
+    /// hub's `edit_task { dependsOn }`). Everything is validated before the
+    /// one write, so a refusal of either half leaves the file untouched.
+    pub fn edit_with_deps(
+        &self,
+        id: &str,
+        edit: TaskEdit,
+        depends_on: Option<Vec<String>>,
+    ) -> Result<Task> {
         let mut task = self.get(id)?;
         task.title = validate_title(edit.title)?;
         validate_priority(edit.priority)?;
+        if let Some(deps) = depends_on {
+            task.depends_on = self.validate_depends_on(Some(id), deps)?;
+        }
+        if let Some(titles) = edit.steps {
+            task.steps = normalize_steps(titles, &task.steps)?;
+        }
         task.description = edit.description;
         task.priority = edit.priority;
         task.tags = normalize_tags(edit.tags);
@@ -326,10 +400,10 @@ impl TaskStore {
             .collect())
     }
 
-    /// Transition a task's status. Entering `Blocked` requires a reason;
-    /// leaving it clears the reason. Any actual status change invalidates a
-    /// prior verification — it attested a specific completed state, and that
-    /// claim just changed.
+    /// Transition a task's status. Entering `Blocked` or `Cancelled` requires
+    /// a reason; leaving it clears the reason. Any actual status change
+    /// invalidates a prior verification — it attested a specific completed
+    /// state, and that claim just changed.
     ///
     /// Dependency unlock rule (D31): starting or completing a task requires
     /// every `depends_on` task to be done. Enforced here — beneath both
@@ -340,7 +414,7 @@ impl TaskStore {
         &self,
         id: &str,
         status: TaskStatus,
-        blocked_reason: Option<String>,
+        reason: Option<String>,
     ) -> Result<Task> {
         let mut task = self.get(id)?;
         if matches!(status, TaskStatus::InProgress | TaskStatus::Done) {
@@ -353,8 +427,19 @@ impl TaskStore {
                 });
             }
         }
+        let reason = reason.map(|r| r.trim().to_string()).unwrap_or_default();
+        if status == TaskStatus::Cancelled {
+            if reason.is_empty() {
+                return Err(NextUpError::InvalidInput(
+                    "a reason is required when cancelling a task (what replaced it, or why it was dropped)"
+                        .into(),
+                ));
+            }
+            task.cancel_reason = Some(reason.clone());
+        } else {
+            task.cancel_reason = None;
+        }
         if status == TaskStatus::Blocked {
-            let reason = blocked_reason.map(|r| r.trim().to_string()).unwrap_or_default();
             if reason.is_empty() {
                 return Err(NextUpError::InvalidInput(
                     "a reason is required when blocking a task".into(),
@@ -371,18 +456,23 @@ impl TaskStore {
             task.blocked_reason = None;
             task.blocked_at = None;
         }
+        // Any real status change un-archives (D40, widened by D169): archived
+        // is a sub-state of one closed state, not of "closed" in general —
+        // a cancelled task moved to done must pass the verify-before-archive
+        // rule like any other, and a filed-away done task that gets cancelled
+        // should come back into view with its new status.
         if status != task.status {
             task.verified_at = None;
             task.verified_note = None;
             task.verified_specs_hash = None;
-        }
-        // Reopening an archived task un-archives it (D40): archived is a
-        // sub-state of done, so a task cannot be "in progress but archived".
-        // The spec-fold marker clears with it (D79): reopened work may edit
-        // its delta specs, and a stale marker would silently skip the
-        // re-fold on the next archive.
-        if status != TaskStatus::Done {
             task.archived = false;
+        }
+        // The spec-fold marker clears when the task reopens (D79): reopened
+        // work may edit its delta specs, and a stale marker would silently
+        // skip the re-fold on the next archive. Moving between done and
+        // cancelled keeps it — the folded text is in specs/ either way, and
+        // clearing it would invite a second fold of the same delta.
+        if !status.is_closed() {
             task.spec_folded_at = None;
             task.spec_folded_hash = None;
         }
@@ -434,16 +524,36 @@ impl TaskStore {
 
     /// Archive or un-archive a task (D40). Archiving is a presentation-tier
     /// close: the file stays in place (id lookups and dependency edges keep
-    /// working), default listings hide it. Only a done task may be archived —
-    /// open work must stay visible; un-archiving is always accepted.
+    /// working), default listings hide it. Only a closed task (done or
+    /// cancelled) may be archived — open work must stay visible; un-archiving
+    /// is always accepted.
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<Task> {
         let mut task = self.get(id)?;
-        if archived && task.status != TaskStatus::Done {
+        if archived && !task.status.is_closed() {
             return Err(NextUpError::InvalidInput(
-                "only a done task can be archived".into(),
+                "only a done or cancelled task can be archived".into(),
             ));
         }
         task.archived = archived;
+        task.updated_at = now_rfc3339();
+        atomic_write_json(&self.task_file(id)?, &task)?;
+        Ok(task)
+    }
+
+    /// Tick or untick one step (1-based, as every surface numbers them —
+    /// D170). Like an attribute edit it leaves status and verification alone:
+    /// a checklist describes the work, it does not claim the work is done.
+    pub fn set_step(&self, id: &str, step: usize, done: bool) -> Result<Task> {
+        let mut task = self.get(id)?;
+        let count = task.steps.len();
+        let Some(slot) = step.checked_sub(1).and_then(|i| task.steps.get_mut(i)) else {
+            return Err(NextUpError::InvalidInput(if count == 0 {
+                format!("{id} has no steps — add them with edit_task first")
+            } else {
+                format!("step must be 1 to {count} for {id} — got {step}")
+            }));
+        };
+        slot.done = done;
         task.updated_at = now_rfc3339();
         atomic_write_json(&self.task_file(id)?, &task)?;
         Ok(task)
@@ -542,7 +652,7 @@ impl TaskStore {
 
     /// Dependencies that are not done yet, as structured `{id, status}` pairs
     /// (status `missing` when the dep file vanished — it certainly is not a
-    /// completed prerequisite). Carried on `DependenciesUnmet` so callers can
+    /// completed prerequisite; `cancelled` never will be one, D169). Carried on `DependenciesUnmet` so callers can
     /// branch on data instead of parsing the message.
     fn unmet_dependencies(&self, task: &Task) -> Result<Vec<UnmetDependency>> {
         let mut unmet = Vec::new();
@@ -607,6 +717,36 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Trim and drop blank step titles, cap the count, and carry each surviving
+/// title's checkmark over from `previous` (D170) — matched by title, first
+/// unclaimed match wins, so two steps with the same title keep their own.
+fn normalize_steps(titles: Vec<String>, previous: &[TaskStep]) -> Result<Vec<TaskStep>> {
+    let titles: Vec<String> =
+        titles.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if titles.len() > MAX_TASK_STEPS {
+        return Err(NextUpError::InvalidInput(format!(
+            "a task may carry at most {MAX_TASK_STEPS} steps — got {}; split the work into tasks",
+            titles.len()
+        )));
+    }
+    let mut claimed = vec![false; previous.len()];
+    Ok(titles
+        .into_iter()
+        .map(|title| {
+            let done = previous
+                .iter()
+                .enumerate()
+                .find(|(i, p)| !claimed[*i] && p.title == title)
+                .map(|(i, p)| {
+                    claimed[i] = true;
+                    p.done
+                })
+                .unwrap_or(false);
+            TaskStep { title, done }
+        })
+        .collect())
+}
+
 /// The title rule shared by create and edit: trimmed, and never blank — an
 /// untitled task is invisible on every takeover surface.
 fn validate_title(title: String) -> Result<String> {
@@ -640,9 +780,23 @@ pub fn compute_counts(tasks: &[Task]) -> TaskCounts {
                     counts.done_unverified += 1;
                 }
             }
+            TaskStatus::Cancelled => counts.cancelled += 1,
         }
     }
     counts
+}
+
+impl TaskCounts {
+    /// Done as a share of the work that is still meant to happen: cancelled
+    /// tasks leave the denominator (D169). 0 when nothing is left to count.
+    pub fn progress_percent(&self) -> usize {
+        let live = self.total.saturating_sub(self.cancelled);
+        if live == 0 {
+            0
+        } else {
+            (self.done * 100) / live
+        }
+    }
 }
 
 pub fn counts_for_dir(tasks_dir: &Path) -> Result<TaskCounts> {
@@ -660,20 +814,29 @@ pub struct NextStep<'a> {
     /// [`TaskStore::update_status`] enforces, so a task listed as startable
     /// is one the engine will actually let start.
     pub waiting_on: Vec<String>,
+    /// The subset of `waiting_on` that was cancelled (D169) — those will never
+    /// land, so the note says to re-point the dependency instead of waiting.
+    pub cancelled_deps: Vec<String>,
 }
 
 impl<'a> NextStep<'a> {
     /// `all` must be every task file, archived ones included: a dependency
-    /// may point at a task that has since been archived, and archived means
-    /// done.
+    /// may point at a task that has since been archived — done or cancelled,
+    /// and only done clears it.
     pub fn of(task: &'a Task, all: &[Task]) -> Self {
-        let waiting_on = task
+        let status_of = |dep: &String| all.iter().find(|t| &t.id == dep).map(|t| t.status);
+        let waiting_on: Vec<String> = task
             .depends_on
             .iter()
-            .filter(|dep| !all.iter().any(|t| &t.id == *dep && t.status == TaskStatus::Done))
+            .filter(|dep| status_of(dep) != Some(TaskStatus::Done))
             .cloned()
             .collect();
-        Self { task, waiting_on }
+        let cancelled_deps = waiting_on
+            .iter()
+            .filter(|dep| status_of(dep) == Some(TaskStatus::Cancelled))
+            .cloned()
+            .collect();
+        Self { task, waiting_on, cancelled_deps }
     }
 
     /// Takeover grouping: in progress, then the frontier, then assigned but
@@ -708,6 +871,18 @@ impl<'a> NextStep<'a> {
         let mut parts = Vec::new();
         if !self.waiting_on.is_empty() {
             parts.push(format!("waits on {}", self.waiting_on.join(", ")));
+        }
+        // A task with a checklist says how far along it is (D170): the one
+        // number a takeover needs from it without opening the file.
+        if !self.task.steps.is_empty() {
+            let done = self.task.steps.iter().filter(|s| s.done).count();
+            parts.push(format!("steps {done}/{}", self.task.steps.len()));
+        }
+        if !self.cancelled_deps.is_empty() {
+            parts.push(format!(
+                "{} cancelled — re-point dependsOn",
+                self.cancelled_deps.join(", ")
+            ));
         }
         if self.task.status == TaskStatus::Todo {
             if let Some(who) = &self.task.assignee {
@@ -1108,6 +1283,7 @@ mod tests {
             description: String::new(),
             priority,
             tags: tags.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -1124,6 +1300,7 @@ mod tests {
                     description: "now with context".into(),
                     priority: 0,
                     tags: vec!["ui".into(), " ui ".into(), "  ".into(), "core".into()],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1269,5 +1446,159 @@ mod tests {
         assert_eq!(t.assignee.as_deref(), Some("integ"));
         let t = store.set_assignee(&t.id, None).unwrap();
         assert_eq!(t.assignee, None);
+    }
+
+    // ── Cancelled (D169) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cancelling_needs_a_reason_and_reopening_clears_it() {
+        let (_g, store) = store();
+        let t = store.create(new_task("superseded", 1)).unwrap();
+
+        let err = store.update_status(&t.id, TaskStatus::Cancelled, Some("  ".into())).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+
+        let cancelled = store
+            .update_status(&t.id, TaskStatus::Cancelled, Some("replaced by T-0009".into()))
+            .unwrap();
+        assert_eq!(cancelled.cancel_reason.as_deref(), Some("replaced by T-0009"));
+        assert!(cancelled.blocked_reason.is_none());
+
+        // Verification only attests a completion claim; a cancellation is not one.
+        assert_eq!(
+            store.set_verification(&t.id, true, Some("ran".into()), None).unwrap_err().kind(),
+            "invalid_input"
+        );
+        // A closed task archives; reopening pulls it out and drops the reason.
+        assert!(store.set_archived(&t.id, true).unwrap().archived);
+        let reopened = store.update_status(&t.id, TaskStatus::Todo, None).unwrap();
+        assert!(!reopened.archived);
+        assert!(reopened.cancel_reason.is_none());
+
+        // The wire name round-trips and pre-D169 files still parse.
+        assert_eq!("cancelled".parse::<TaskStatus>().unwrap(), TaskStatus::Cancelled);
+        let old: Task = serde_json::from_str(r#"{"schemaVersion":1,"id":"T-9997","title":"old","status":"done","priority":1,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}"#).unwrap();
+        assert!(old.cancel_reason.is_none());
+    }
+
+    #[test]
+    fn a_cancelled_prerequisite_never_unlocks_its_dependents() {
+        let (_g, store) = store();
+        let old = store.create(new_task("old plan", 1)).unwrap();
+        let next = store
+            .create(NewTask {
+                title: "builds on the old plan".into(),
+                depends_on: vec![old.id.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        store.update_status(&old.id, TaskStatus::Cancelled, Some("dropped".into())).unwrap();
+
+        let err = store.update_status(&next.id, TaskStatus::InProgress, None).unwrap_err();
+        assert_eq!(err.kind(), "dependencies_unmet");
+        let message = err.to_string();
+        assert!(message.contains("(cancelled)"), "{message}");
+        assert!(message.contains("dependsOn"), "the refusal must say what to do: {message}");
+
+        let all = store.list().unwrap();
+        let steps = next_steps(&all);
+        assert_eq!(steps.len(), 1, "a cancelled task is not a next step");
+        let note = steps[0].note().unwrap();
+        assert!(note.contains("cancelled — re-point dependsOn"), "{note}");
+        assert!(!steps[0].is_ready());
+
+        // Re-pointing frees it.
+        let replacement = store.create(new_task("new plan", 1)).unwrap();
+        store.set_depends_on(&next.id, vec![replacement.id.clone()]).unwrap();
+        store.update_status(&replacement.id, TaskStatus::Done, None).unwrap();
+        assert!(store.update_status(&next.id, TaskStatus::InProgress, None).is_ok());
+    }
+
+    #[test]
+    fn cancelled_tasks_leave_the_progress_denominator() {
+        let (_g, store) = store();
+        let a = store.create(new_task("a", 1)).unwrap();
+        let b = store.create(new_task("b", 1)).unwrap();
+        let c = store.create(new_task("c", 1)).unwrap();
+        store.update_status(&a.id, TaskStatus::Done, None).unwrap();
+        store.update_status(&b.id, TaskStatus::Cancelled, Some("superseded".into())).unwrap();
+        let counts = compute_counts(&store.list().unwrap());
+        assert_eq!((counts.total, counts.done, counts.cancelled, counts.todo), (3, 1, 1, 1));
+        assert_eq!(counts.progress_percent(), 50, "1 of the 2 live tasks");
+        store.update_status(&c.id, TaskStatus::Cancelled, Some("dropped".into())).unwrap();
+        assert_eq!(compute_counts(&store.list().unwrap()).progress_percent(), 100);
+        assert_eq!(TaskCounts::default().progress_percent(), 0);
+    }
+
+    #[test]
+    fn moving_between_done_and_cancelled_unarchives_but_keeps_the_fold_marker() {
+        let (_g, store) = store();
+        let t = store.create(new_task("filed", 1)).unwrap();
+        store.update_status(&t.id, TaskStatus::Done, None).unwrap();
+        store.set_spec_folded(&t.id, Some("2026-11-18T00:00:00Z".into()), Some("h".into())).unwrap();
+        store.set_archived(&t.id, true).unwrap();
+
+        // A filed-away done task that gets cancelled comes back into view;
+        // its folded text is already in specs/, so the marker stays.
+        let cancelled = store.update_status(&t.id, TaskStatus::Cancelled, Some("dropped".into())).unwrap();
+        assert!(!cancelled.archived);
+        assert!(cancelled.spec_folded_at.is_some());
+
+        // An archived cancelled task moved to done must pass the archive rules
+        // again, not ride in on the old flag.
+        store.set_archived(&t.id, true).unwrap();
+        let done = store.update_status(&t.id, TaskStatus::Done, None).unwrap();
+        assert!(!done.archived);
+        // Reopening is what clears the marker.
+        assert!(store.update_status(&t.id, TaskStatus::Todo, None).unwrap().spec_folded_at.is_none());
+    }
+
+    #[test]
+    fn an_edit_refused_on_either_half_writes_nothing() {
+        let (_g, store) = store();
+        let a = store.create(new_task("a", 1)).unwrap();
+        let b = store.create(new_task("b", 1)).unwrap();
+        let bad_priority = TaskEdit { title: "b".into(), priority: 9, ..Default::default() };
+        assert!(store.edit_with_deps(&b.id, bad_priority, Some(vec![a.id.clone()])).is_err());
+        assert!(store.get(&b.id).unwrap().depends_on.is_empty(), "valid deps must not land alone");
+    }
+
+    // ── Steps (D170) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn steps_tick_without_moving_status_and_survive_a_reword() {
+        let (_g, store) = store();
+        let t = store
+            .create(NewTask {
+                title: "section 2".into(),
+                steps: vec!["inventory".into(), " ".into(), "walkthrough".into(), "decide".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t.steps.len(), 3, "blank titles are dropped");
+
+        let ticked = store.set_step(&t.id, 2, true).unwrap();
+        assert!(ticked.steps[1].done);
+        assert_eq!(ticked.status, TaskStatus::Todo, "a checklist never moves the status");
+        assert_eq!(store.set_step(&t.id, 0, true).unwrap_err().kind(), "invalid_input");
+        assert_eq!(store.set_step(&t.id, 4, true).unwrap_err().kind(), "invalid_input");
+
+        // Rewording one step keeps the others' checkmarks.
+        let edit = TaskEdit {
+            title: "section 2".into(),
+            priority: 0,
+            steps: Some(vec!["inventory".into(), "walkthrough".into(), "decide with the PM".into()]),
+            ..Default::default()
+        };
+        let edited = store.edit(&t.id, edit).unwrap();
+        assert_eq!(edited.steps.iter().map(|s| s.done).collect::<Vec<_>>(), vec![false, true, false]);
+
+        // The next-step note carries the count.
+        let all = store.list().unwrap();
+        assert!(next_steps(&all)[0].note().unwrap().contains("steps 1/3"));
+
+        let too_many = (0..=MAX_TASK_STEPS).map(|i| format!("s{i}")).collect();
+        let edit = TaskEdit { title: "x".into(), steps: Some(too_many), ..Default::default() };
+        assert_eq!(store.edit(&t.id, edit).unwrap_err().kind(), "invalid_input");
     }
 }

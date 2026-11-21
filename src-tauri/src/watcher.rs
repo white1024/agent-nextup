@@ -17,7 +17,10 @@ pub const WORKSPACE_CHANGED_EVENT: &str = "workspace://changed";
 /// Emitted when the ledger grew (D62). Deliberately a *separate* event from
 /// `workspace://changed`, because the two carry opposite instructions: the
 /// latter means "re-read your state", this one means "read the new tail and
-/// decide whether to notify" — and nothing more.
+/// decide whether to notify". Since D170 two listeners also re-read on it —
+/// the app status (for the To decide badge) and the To decide page, because a
+/// provisional decision lives in the ledger and nowhere else — and both only
+/// read.
 ///
 /// That distinction is what makes watching the ledger safe at all. The ledger
 /// is excluded from the state signal because every mutation ends in a ledger
@@ -194,7 +197,11 @@ fn classify(root: &Path, path: &Path) -> Option<Signal> {
         // routing (app layer) — an MCP-side publish must light up the GUI's
         // pending-send list, and an inbound routing the recipient's inbox.
         || rel == ".nextup/exchange"
-        || rel.starts_with(".nextup/exchange/");
+        || rel.starts_with(".nextup/exchange/")
+        // Questions for the user (D170): asked through the hub, answered in
+        // the app — either side must refresh the other's queue and badge.
+        || rel == ".nextup/questions"
+        || rel.starts_with(".nextup/questions/");
 
     is_state.then_some(Signal::State)
 }

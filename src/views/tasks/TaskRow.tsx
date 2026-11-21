@@ -6,7 +6,10 @@ import TimeAgo from "../../components/TimeAgo";
 import { IconArchive, IconDoc, IconPencil, IconTrash, IconX } from "../../components/icons";
 import type { Task, TaskStatus } from "../../types";
 
-export const STATUSES: TaskStatus[] = ["todo", "in_progress", "blocked", "done"];
+export const STATUSES: TaskStatus[] = ["todo", "in_progress", "blocked", "done", "cancelled"];
+
+/** The two statuses that ask for a reason first, in the same inline prompt. */
+export type ReasonStatus = "blocked" | "cancelled";
 
 /** Everything a row can ask its page to do. One object, so the row's props
  *  stay readable and the page owns every write (invariant 8: one path per
@@ -19,6 +22,8 @@ export interface RowActions {
   markVerify: (id: string) => void;
   unverify: (id: string) => void;
   archive: (task: Task) => void;
+  /** Tick or untick step `step` (1-based) of the task's checklist (D170). */
+  step: (task: Task, step: number, done: boolean) => void;
   edit: (task: Task) => void;
   remove: (task: Task) => void;
   nudgeVerify: (id: string) => void;
@@ -42,6 +47,8 @@ interface Props {
   mutating: boolean;
   nudge: boolean;
   blocking: boolean;
+  /** Which status the reason prompt is asking for. */
+  blockAs: ReasonStatus;
   blockReason: string;
   setBlockReason: (v: string) => void;
   verifying: boolean;
@@ -54,12 +61,15 @@ interface Props {
  * The status mark beside the select (R7 as D153 took it): a hollow square for
  * not started, the agent's violet dot while in progress, the amber circle for
  * anything waiting on you — blocked, and done but not yet verified — and the
- * cyan square once verification says it is through. The word is the select
- * next to it, so the mark itself is decoration to a screen reader.
+ * cyan square once verification says it is through, and a struck-through
+ * square for work that will not happen (D169). The word is the select next to
+ * it, so the mark itself is decoration to a screen reader.
  */
 function Mark({ task, turn }: { task: Task; turn: boolean }) {
   const cls =
-    task.status === "blocked"
+    task.status === "cancelled"
+      ? "mk-x"
+      : task.status === "blocked"
       ? "mk-y"
       : task.status === "done"
         ? task.verifiedAt
@@ -97,6 +107,7 @@ export default function TaskRow({
   mutating,
   nudge,
   blocking,
+  blockAs,
   blockReason,
   setBlockReason,
   verifying,
@@ -108,6 +119,7 @@ export default function TaskRow({
   const [descOpen, setDescOpen] = useState(false);
   const verified = Boolean(task.verifiedAt);
   const done = task.status === "done";
+  const closed = done || task.status === "cancelled";
 
   // C26 / C274 / C275 / C276: the mark turns on any change of what it shows.
   const turn = usePulse(`${task.status}/${verified ? 1 : 0}`, 620);
@@ -163,9 +175,18 @@ export default function TaskRow({
     ));
 
   // Blocked: what it waits on, and since when — nothing re-checks a reason, so
-  // its age is the only cue that the blocker may already be gone.
+  // its age is the only cue that the blocker may already be gone. Cancelled:
+  // what replaced it (D169), the only record of where the work went.
   const reason =
-    task.status === "blocked" && task.blockedReason ? (
+    task.status === "cancelled" && task.cancelReason ? (
+      <div className="tr-why tr-why--x" data-reason>
+        <i className="mk-x" aria-hidden="true" />
+        <span>
+          <b>{t("status.cancelled")}</b>
+          <span className="tr-why-text">{task.cancelReason}</span>
+        </span>
+      </div>
+    ) : task.status === "blocked" && task.blockedReason ? (
       <div className="tr-why" data-reason>
         <i className="mk-y" aria-hidden="true" />
         <span>
@@ -270,8 +291,8 @@ export default function TaskRow({
           onKeyDown={(e) => {
             if (e.key === "Enter" && blockReason.trim() !== "" && !mutating) act.blockConfirm(task.id);
           }}
-          aria-label={t("tasks.blockReasonPlaceholder")}
-          placeholder={t("tasks.blockReasonPlaceholder")}
+          aria-label={t(blockAs === "cancelled" ? "tasks.cancelReasonPlaceholder" : "tasks.blockReasonPlaceholder")}
+          placeholder={t(blockAs === "cancelled" ? "tasks.cancelReasonPlaceholder" : "tasks.blockReasonPlaceholder")}
         />
         <button className="btn btn-small" onClick={act.blockCancel}>
           {t("common.cancel")}
@@ -281,7 +302,7 @@ export default function TaskRow({
           disabled={blockReason.trim() === "" || mutating}
           onClick={() => act.blockConfirm(task.id)}
         >
-          {t("tasks.confirmBlock")}
+          {t(blockAs === "cancelled" ? "tasks.confirmCancelTask" : "tasks.confirmBlock")}
         </button>
       </div>,
     );
@@ -325,7 +346,7 @@ export default function TaskRow({
         <IconPencil size={14} />
         {words && t("tasks.edit")}
       </button>
-      {done && (
+      {closed && (
         <button
           className={`btn btn-ghost ${words ? "btn-small tc-btn" : "btn-icon"}`}
           title={words ? undefined : archiveLabel}
@@ -348,6 +369,36 @@ export default function TaskRow({
       </button>
     </>
   );
+
+  // The checklist (D170): a count on the row, the boxes in the card. Ticking
+  // never touches the status select — the steps describe the work, they do
+  // not claim it is done.
+  const steps = task.steps ?? [];
+  const stepsDone = steps.filter((s) => s.done).length;
+  const stepCount =
+    steps.length > 0 ? (
+      <span className={`tkx-steps${stepsDone === steps.length ? " is-all" : ""}`}>
+        {t("tasks.stepsCount", { done: stepsDone, total: steps.length })}
+      </span>
+    ) : null;
+  const checklist =
+    steps.length > 0 ? (
+      <ol className="tc-steps" aria-label={t("tasks.stepsLabel")}>
+        {steps.map((s, i) => (
+          <li key={i} className={s.done ? "is-done" : ""}>
+            <label>
+              <input
+                type="checkbox"
+                checked={s.done}
+                disabled={mutating}
+                onChange={(e) => act.step(task, i + 1, e.target.checked)}
+              />
+              <span>{s.title}</span>
+            </label>
+          </li>
+        ))}
+      </ol>
+    ) : null;
 
   const style = { "--j": index } as CSSProperties;
 
@@ -377,6 +428,7 @@ export default function TaskRow({
           <h3 className="tc-t">{task.title}</h3>
           {reason}
           <p className="tc-d">{task.description !== "" ? task.description : t("tasks.noDesc")}</p>
+          {checklist}
           <div className="tc-row">
             <span className="tc-k">{t("tasks.colStatus")}</span>
             <span className="tc-v">
@@ -412,6 +464,7 @@ export default function TaskRow({
           <button className="tr-open" aria-expanded={false} onClick={() => act.open(task.id)}>
             {task.title}
           </button>
+          {stepCount}
         </div>
         {task.tags.length > 0 && <div className="tr-tags">{tags(false)}</div>}
         {reason}

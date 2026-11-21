@@ -3,6 +3,12 @@
   "name": "生活規劃",
   "description": "釐清 → 計畫 → 行動 → 回顧，輕量循環。",
   "domainHint": "life",
+  "ongoingInstructions": [
+    "動機與理想結果放在 context.json 的 goals；現在最重要的一件事以「決策」記下。",
+    "拆成一週內做得完的小任務，越小越好。slice-work 會帶著使用者一起拆（呼叫 Skill 工具執行）。",
+    "一次推進一個任務；卡住就標 blocked 並寫下卡點，不要硬撐。",
+    "每隔一段時間——一個重點做完，或事情停滯時——呼叫 Skill 工具執行 retrospect，把有用與沒用的寫成「決策」，再決定下一個重點。"
+  ],
   "phases": [
     {
       "id": "clarify",

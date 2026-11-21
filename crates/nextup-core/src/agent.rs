@@ -172,6 +172,15 @@ pub const TOOLS: &[ToolMeta] = &[
     // written after verification is refused at fold time, not here.
     granted("edit_task", None, "tasks"),
     granted("write_task_file", Some(MODULE_SPECS), "tasks"),
+    // A task's own checklist (D170). Granted like edit_task: a step describes
+    // the work and asserts nothing about status or verification.
+    granted("set_task_step", None, "tasks"),
+    // Questions for the user (D170). Asking is granted like record_decision:
+    // it hands the person a choice, it takes none away from them. Reading
+    // answers stamps them seen — a read with a bookkeeping side effect, the
+    // get_delivery precedent (D160).
+    granted("ask_user", None, "knowledge"),
+    read("list_questions", None),
 ];
 
 /// Display order of the write-tier semantic groups (D39). Presentation
@@ -322,6 +331,14 @@ pub struct AgentAccess {
     /// `McpServerEntry::allowed_tools`.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Every write tool that existed the last time this allowlist was settled
+    /// — at creation, or when the app's asset upgrade granted what a newer
+    /// version added (D172). A day-one tool absent from it is one this
+    /// workspace has never been offered; a day-one tool in it but not granted
+    /// was turned off by a person and stays off. `None` is a file from before
+    /// the field, read as [`KNOWN_BEFORE_RECORD`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_tools: Option<Vec<String>>,
 }
 
 impl Default for AgentAccess {
@@ -332,6 +349,7 @@ impl Default for AgentAccess {
             schema_version: AGENT_ACCESS_SCHEMA_VERSION,
             enabled: true,
             allowed_tools: Vec::new(),
+            known_tools: None,
         }
     }
 }
@@ -414,6 +432,7 @@ pub fn set_tool_allowed(paths: &WorkspacePaths, tool: &str, allowed: bool) -> Re
         if allowed {
             access.allowed_tools.push(tool.to_string());
         }
+        mark_known(&mut access, [tool]);
         save_access(&paths.agent_access_file(), &access)?;
         Ok(access)
     })
@@ -453,6 +472,7 @@ pub fn set_tools_allowed(
         if allowed {
             access.allowed_tools.extend(tools.iter().cloned());
         }
+        mark_known(&mut access, tools.iter().map(String::as_str));
         save_access(&paths.agent_access_file(), &access)?;
         Ok(access)
     })
@@ -467,14 +487,152 @@ pub fn set_tools_allowed(
 pub fn set_all_tools_allowed(paths: &WorkspacePaths, allowed: bool) -> Result<AgentAccess> {
     with_mutation_lock(paths, || {
         let mut access = load_access(&paths.agent_access_file())?;
-        access.allowed_tools = if allowed {
-            let modules = crate::workspace::modules::get_modules(paths)?;
-            exposed_write_tools(&modules).iter().map(|t| t.to_string()).collect()
-        } else {
-            Vec::new()
-        };
+        let modules = crate::workspace::modules::get_modules(paths)?;
+        let exposed = exposed_write_tools(&modules);
+        access.allowed_tools =
+            if allowed { exposed.iter().map(|t| t.to_string()).collect() } else { Vec::new() };
+        mark_known(&mut access, exposed.iter().copied());
         save_access(&paths.agent_access_file(), &access)?;
         Ok(access)
+    })
+}
+
+// ── Tools a newer version adds (D172) ───────────────────────────────────────
+
+/// The write tools 1.0.0 shipped — the last release before `knownTools` was
+/// recorded. A file without the field was settled against this set *or an
+/// older one*, so only tools added after it count as new; an older day-one
+/// tool missing from such a file may have been turned off, and the record
+/// cannot tell, so it is left alone. **Frozen: never edit.** A new tool goes
+/// in [`TOOLS`] only; the `knownTools` written from then on carry it.
+const KNOWN_BEFORE_RECORD: &[&str] = &[
+    "create_task",
+    "update_task_status",
+    "set_task_verification",
+    "claim_task",
+    "assign_task",
+    "record_decision",
+    "record_note",
+    "record_progress",
+    "record_rejected",
+    "advance_phase",
+    "add_milestone",
+    "set_milestone_done",
+    "set_milestone_verified",
+    "record_lesson",
+    "record_lesson_fired",
+    "archive_stale_lessons",
+    "generate_handoff",
+    "upgrade_workspace_assets",
+    "publish_delivery",
+    "team_set_edge",
+    "team_set_edge_auto_route",
+    "team_route",
+    "team_add_member",
+    "team_create_member",
+    "team_remove_member",
+    "team_member_tasks",
+    "team_member_ledger",
+    "team_member_specs",
+    "team_archive_task",
+    "edit_task",
+    "write_task_file",
+];
+
+fn all_write_tools() -> Vec<String> {
+    WRITE_TOOLS.iter().map(|t| t.to_string()).collect()
+}
+
+/// A tool a person switched, on or off, has been offered: the upgrade must
+/// not grant it back. Without this, a pre-record file whose owner turned a
+/// newer tool on and off again would still read it as never offered — the
+/// frozen baseline does not name it — and the next upgrade would reopen it.
+fn mark_known<'a>(access: &mut AgentAccess, tools: impl IntoIterator<Item = &'a str>) {
+    let known = access
+        .known_tools
+        .get_or_insert_with(|| KNOWN_BEFORE_RECORD.iter().map(|t| t.to_string()).collect());
+    for tool in tools {
+        if !known.iter().any(|k| k == tool) {
+            known.push(tool.to_string());
+        }
+    }
+}
+
+/// Day-one tools this workspace exposes but has never been offered: what a
+/// new workspace would grant, minus everything the allowlist was already
+/// settled against. Guarded tools are never in it — they wait for a person
+/// in every workspace, new or old.
+fn unoffered_default_tools(access: &AgentAccess, modules: &WorkspaceModules) -> Vec<&'static str> {
+    let known = |t: &str| match &access.known_tools {
+        Some(k) => k.iter().any(|x| x == t),
+        None => KNOWN_BEFORE_RECORD.contains(&t),
+    };
+    default_granted_tools(modules)
+        .into_iter()
+        .filter(|t| !known(t) && !access.tool_allowed(t))
+        .collect()
+}
+
+/// What [`grant_new_default_tools`] would grant right now, for the Tools page
+/// to say before the person presses upgrade. A workspace with no access file
+/// has never had a grant and gets none here either.
+pub fn pending_default_grants(paths: &WorkspacePaths) -> Result<Vec<&'static str>> {
+    if !paths.agent_access_file().is_file() {
+        return Ok(Vec::new());
+    }
+    let access = load_access(&paths.agent_access_file())?;
+    let modules = crate::workspace::modules::get_modules(paths)?;
+    Ok(unoffered_default_tools(&access, &modules))
+}
+
+/// Mark every write tool in the registry as offered — the allowlist was just
+/// settled from scratch (a new workspace), so nothing in it is new.
+pub fn record_known_tools(paths: &WorkspacePaths) -> Result<()> {
+    with_mutation_lock(paths, || {
+        let mut access = load_access(&paths.agent_access_file())?;
+        access.known_tools = Some(all_write_tools());
+        save_access(&paths.agent_access_file(), &access)
+    })
+}
+
+/// Grant the day-one tools a newer version added that this workspace has
+/// never been offered, then record the whole registry as offered so a tool
+/// the person turns off later stays off (D172).
+///
+/// **Only the GUI's asset upgrade calls this.** The hub's
+/// `upgrade_workspace_assets` runs the same curriculum upgrade without it —
+/// an agent upgrading the material must not be the one widening its own
+/// grants. The master switch is left as it is: a grant behind a closed
+/// switch opens nothing until the person opens it.
+pub fn grant_new_default_tools(paths: &WorkspacePaths) -> Result<Vec<String>> {
+    with_mutation_lock(paths, || {
+        if !paths.agent_access_file().is_file() {
+            return Ok(Vec::new());
+        }
+        let mut access = load_access(&paths.agent_access_file())?;
+        let modules = crate::workspace::modules::get_modules(paths)?;
+        let new: Vec<String> =
+            unoffered_default_tools(&access, &modules).iter().map(|t| t.to_string()).collect();
+        let all = all_write_tools();
+        if new.is_empty() && access.known_tools.as_ref() == Some(&all) {
+            return Ok(new);
+        }
+        access.allowed_tools.extend(new.iter().cloned());
+        access.known_tools = Some(all);
+        save_access(&paths.agent_access_file(), &access)?;
+        if !new.is_empty() {
+            crate::workspace::ledger::ledger_for(paths).append(
+                &crate::workspace::ledger::LedgerEvent::new(
+                    crate::workspace::ledger::LedgerKind::AssetsUpgraded,
+                    format!(
+                        "granted tools added since this workspace's grants were set: {} (turn any off in the tool catalog)",
+                        new.join(", ")
+                    ),
+                    None,
+                ),
+            )?;
+        }
+        Ok(new)
     })
 }
 
@@ -490,6 +648,11 @@ pub struct RestoredAccess {
     pub allowed_tools: Vec<String>,
     /// When the backup was made, so the prompt can say how old the grants are.
     pub exported_at: String,
+    /// The source's `knownTools` (D172), applied with the grants. Without it a
+    /// tool the person had turned off would read as never offered here, and
+    /// the next asset upgrade would turn it back on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_tools: Option<Vec<String>>,
 }
 
 pub fn restored_access(paths: &WorkspacePaths) -> Result<Option<RestoredAccess>> {
@@ -519,6 +682,15 @@ pub fn resolve_restored_access(paths: &WorkspacePaths, accept: bool) -> Result<A
                 for tool in restored.allowed_tools {
                     if exposed.contains(&tool.as_str()) && !access.tool_allowed(&tool) {
                         access.allowed_tools.push(tool);
+                    }
+                }
+                // Offered on the source machine counts as offered here; a tool
+                // switched on this machine before accepting stays known too.
+                if let Some(offered) = restored.known_tools {
+                    if access.known_tools.is_none() {
+                        access.known_tools = Some(offered);
+                    } else {
+                        mark_known(&mut access, offered.iter().map(String::as_str));
                     }
                 }
                 save_access(&paths.agent_access_file(), &access)?;
@@ -638,7 +810,7 @@ mod tests {
             "workspace_status list_tasks get_task workflow_status search_workspace build_index \
              workspace_doctor post_mortem_candidates list_deliveries get_delivery list_teammates \
              team_overview team_member_status team_list_deliveries list_specs get_spec \
-             validate_task_specs"
+             validate_task_specs list_questions"
         );
         assert_eq!(
             WRITE_TOOLS.join(" "),
@@ -649,13 +821,14 @@ mod tests {
              upgrade_workspace_assets publish_delivery team_set_edge team_set_edge_auto_route \
              team_route team_add_member team_create_member team_remove_member \
              team_member_tasks team_member_ledger team_member_specs team_archive_task \
-             edit_task write_task_file"
+             edit_task write_task_file set_task_step ask_user"
         );
         assert_eq!(
             DEFAULT_GRANTED_TOOLS.join(" "),
             "create_task update_task_status claim_task assign_task record_decision record_note \
              record_progress record_rejected add_milestone set_milestone_done record_lesson \
-             record_lesson_fired archive_stale_lessons generate_handoff edit_task write_task_file"
+             record_lesson_fired archive_stale_lessons generate_handoff edit_task write_task_file \
+             set_task_step ask_user"
         );
         // Reason-ordered, not table-ordered — see GUARD_REASONS.
         assert_eq!(
@@ -953,5 +1126,185 @@ mod tests {
         .unwrap();
         let access = set_tool_allowed(&paths, "assign_task", false).unwrap();
         assert!(!access.tool_allowed("assign_task"));
+    }
+
+    // ── D172: tools a newer version adds ────────────────────────────────────
+
+    /// An access file as 1.0.0 left it: no `knownTools`, the day-one grant of
+    /// that release (which, with no modules on, had no module-bound tools).
+    fn pre_record_workspace(granted: &[&str]) -> (tempfile::TempDir, WorkspacePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WorkspacePaths::new(dir.path());
+        std::fs::create_dir_all(paths.nextup_dir()).unwrap();
+        let access = AgentAccess {
+            allowed_tools: granted.iter().map(|t| t.to_string()).collect(),
+            ..AgentAccess::default()
+        };
+        save_access(&paths.agent_access_file(), &access).unwrap();
+        (dir, paths)
+    }
+
+    fn day_one_at_1_0_0() -> Vec<&'static str> {
+        default_granted_tools(&WorkspaceModules::default())
+            .into_iter()
+            .filter(|t| KNOWN_BEFORE_RECORD.contains(t))
+            .collect()
+    }
+
+    #[test]
+    fn the_frozen_baseline_names_only_registered_write_tools() {
+        // A typo here would read as "never offered" and grant on upgrade.
+        for t in KNOWN_BEFORE_RECORD {
+            assert_eq!(tool_tier(t), Some(ToolTier::Write), "'{t}' is not a registered write tool");
+        }
+    }
+
+    #[test]
+    fn an_upgrade_grants_only_the_day_one_tools_added_since_the_grants_were_set() {
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        let pending = pending_default_grants(&paths).unwrap();
+        assert_eq!(pending, vec!["set_task_step", "ask_user"]);
+
+        let granted = grant_new_default_tools(&paths).unwrap();
+        assert_eq!(granted, vec!["set_task_step", "ask_user"]);
+        let access = get_access(&paths).unwrap();
+        assert!(access.tool_allowed("set_task_step") && access.tool_allowed("ask_user"));
+        assert_eq!(access.known_tools.as_deref(), Some(&all_write_tools()[..]));
+        // Never a guarded one, even though none of them is granted here.
+        for t in GUARDED_TOOLS.iter() {
+            assert!(!access.tool_allowed(t), "guarded '{t}' must stay off");
+        }
+        // Said out loud in the ledger, once.
+        let lines = crate::workspace::ledger::ledger_for(&paths).all().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].message.contains("set_task_step, ask_user"));
+
+        // A second press grants nothing and writes nothing more.
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        assert_eq!(crate::workspace::ledger::ledger_for(&paths).all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_tool_turned_off_after_it_was_offered_stays_off() {
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        grant_new_default_tools(&paths).unwrap();
+        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+        assert!(!get_access(&paths).unwrap().tool_allowed("ask_user"));
+    }
+
+    #[test]
+    fn a_new_tool_switched_on_and_off_before_the_upgrade_stays_off() {
+        // A 1.0.0 file has no knownTools, and the frozen baseline does not
+        // name ask_user — the switch itself has to record that it was seen.
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        set_tool_allowed(&paths, "ask_user", true).unwrap();
+        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        assert_eq!(pending_default_grants(&paths).unwrap(), vec!["set_task_step"]);
+        assert_eq!(grant_new_default_tools(&paths).unwrap(), vec!["set_task_step"]);
+        assert!(!get_access(&paths).unwrap().tool_allowed("ask_user"));
+
+        // The group switch and select-all record the same way.
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        set_tools_allowed(&paths, &["set_task_step".into()], false).unwrap();
+        assert_eq!(pending_default_grants(&paths).unwrap(), vec!["ask_user"]);
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        set_all_tools_allowed(&paths, false).unwrap();
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        // Older day-one tools are still read from the baseline, not regranted.
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restored_offers_merge_with_switches_made_before_accepting() {
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        save_restored_access(
+            &paths,
+            &RestoredAccess {
+                allowed_tools: vec![],
+                exported_at: "2026-11-21T00:00:00Z".into(),
+                known_tools: Some(vec!["set_task_step".into()]),
+            },
+        )
+        .unwrap();
+        resolve_restored_access(&paths, true).unwrap();
+        // Both the local switch and the source's offer count.
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_older_day_one_tool_missing_from_a_pre_record_file_is_left_alone() {
+        // edit_task predates the record: missing here may mean turned off.
+        let granted: Vec<&str> =
+            day_one_at_1_0_0().into_iter().filter(|t| *t != "edit_task").collect();
+        let (_dir, paths) = pre_record_workspace(&granted);
+        let granted = grant_new_default_tools(&paths).unwrap();
+        assert!(!granted.iter().any(|t| t == "edit_task"));
+        assert!(!get_access(&paths).unwrap().tool_allowed("edit_task"));
+    }
+
+    #[test]
+    fn a_new_workspace_has_nothing_pending_and_no_file_means_no_grant() {
+        // No access file: never granted anything, and the upgrade creates none.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WorkspacePaths::new(dir.path());
+        std::fs::create_dir_all(paths.nextup_dir()).unwrap();
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+        assert!(!paths.agent_access_file().exists());
+
+        // A workspace created today has been offered the whole registry.
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::workspace::init::InitProjectParams {
+            root: dir.path().to_string_lossy().into_owned(),
+            name: "d172".into(),
+            ..Default::default()
+        };
+        let keys = crate::security::keystore::StaticKeyProvider([1u8; 32]);
+        crate::workspace::init::initialize_project(&p, &keys, "0.1.0").unwrap();
+        let paths = WorkspacePaths::new(dir.path());
+        assert_eq!(get_access(&paths).unwrap().known_tools.as_deref(), Some(&all_write_tools()[..]));
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        // Turning a day-one tool off in a new workspace is final too.
+        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_switch_stays_closed() {
+        let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
+        set_enabled(&paths, false).unwrap();
+        grant_new_default_tools(&paths).unwrap();
+        let access = get_access(&paths).unwrap();
+        assert!(!access.enabled);
+        assert_eq!(
+            authorize(&access, "ask_user").unwrap_err().kind(),
+            "unauthorized",
+            "a grant behind a closed switch opens nothing"
+        );
+    }
+
+    #[test]
+    fn restored_grants_carry_what_was_offered() {
+        // The source had turned ask_user off after it was offered: accepting
+        // the restored grants must not leave it looking never offered.
+        let (_dir, paths) = pre_record_workspace(&[]);
+        std::fs::remove_file(paths.agent_access_file()).unwrap();
+        let offered: Vec<String> = all_write_tools();
+        save_restored_access(
+            &paths,
+            &RestoredAccess {
+                allowed_tools: vec!["create_task".into()],
+                exported_at: "2026-11-21T00:00:00Z".into(),
+                known_tools: Some(offered.clone()),
+            },
+        )
+        .unwrap();
+        let access = resolve_restored_access(&paths, true).unwrap();
+        assert_eq!(access.known_tools, Some(offered));
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
     }
 }

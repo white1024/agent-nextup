@@ -16,6 +16,24 @@ export function failedPhaseId(message: string): string | null {
 }
 
 /**
+ * A textarea's lines as instructions: trimmed, blank lines dropped (core
+ * refuses an empty ongoing line outright, and an empty phase line says
+ * nothing to an agent).
+ */
+export function instructionLines(lines: string[]): string[] {
+  return lines.map((l) => l.trim()).filter(Boolean);
+}
+
+/**
+ * The ongoing instructions as the template carries them (D171 ⑧): none at all
+ * when there are no lines, so an emptied field means "staged only" exactly as
+ * a template that never had the field — and the draft compares equal to it.
+ */
+export function ongoingOrNone(lines: string[]): string[] | undefined {
+  return lines.length > 0 ? lines : undefined;
+}
+
+/**
  * A sentence split so the few characters right before "——" stay on one line
  * with the dash (spec 60 `.tp-nw`): CJK may break anywhere, and a dash that
  * opens a line reads as a list item. Up to six characters, stopping at a space

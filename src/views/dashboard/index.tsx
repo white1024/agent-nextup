@@ -528,6 +528,11 @@ export default function Dashboard({
                 value={counts?.doneUnverified ?? 0}
                 tone={(counts?.doneUnverified ?? 0) > 0 ? "serious" : "neutral"}
               />
+              {/* Only once something was cancelled (D169): most projects never
+                  cancel anything, and a permanent zero is one more tile to read. */}
+              {(counts?.cancelled ?? 0) > 0 && (
+                <StatTile label={t("status.cancelled")} value={counts?.cancelled ?? 0} tone="neutral" />
+              )}
             </div>
           </section>
             <MilestonePanel refreshKey={refreshKey} onMutated={onMutated} />

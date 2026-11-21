@@ -115,6 +115,10 @@ pub fn export_backup(
         // Delivery envelopes are workspace state (pending sends, received
         // handoffs) — a restored copy keeps its exchange history (D48).
         paths.exchange_dir(),
+        // Questions for the user (D170): workspace state the ledger already
+        // refers to by id ("asked Q-0001", the answer decision). Dropping them
+        // would also let a restored copy mint Q-0001 a second time.
+        paths.questions_dir(),
         paths.tasks_dir(),
         // The curated spec layer (D79) is workspace content, not derived data.
         // A folded spec exists only here, so leaving it out drops the whole
@@ -246,7 +250,13 @@ pub fn import_backup(
     // Recreate the standard directories even if the archive had no entries
     // for them (e.g. empty artifacts/ exported without artifacts).
     std::fs::create_dir_all(dest_paths.tasks_dir())?;
-    std::fs::create_dir_all(dest_paths.artifacts_dir())?;
+    // Not for a project that brings its own method (D170): it never had one.
+    let own_method = crate::workspace::context::load_context(&dest_paths.context_file())
+        .map(|c| c.own_method)
+        .unwrap_or(false);
+    if !own_method {
+        std::fs::create_dir_all(dest_paths.artifacts_dir())?;
+    }
     std::fs::create_dir_all(dest_paths.snapshots_dir())?;
     // Same three lines init ships (init.rs): the restored workspace re-creates
     // all three machine-local files, so ignoring only secrets.enc would leave
@@ -269,7 +279,11 @@ pub fn import_backup(
         if !access.allowed_tools.is_empty() {
             save_restored_access(
                 &dest_paths,
-                &RestoredAccess { allowed_tools: access.allowed_tools, exported_at: manifest.exported_at.clone() },
+                &RestoredAccess {
+                    allowed_tools: access.allowed_tools,
+                    exported_at: manifest.exported_at.clone(),
+                    known_tools: access.known_tools.clone(),
+                },
             )?;
         }
     }

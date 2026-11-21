@@ -22,7 +22,18 @@ export type CellKind = "ver" | "unv" | "ip" | "todo" | "blk";
 /** Order the cells are laid out in: settled work first, what waits on you last. */
 const CELL_ORDER: CellKind[] = ["ver", "unv", "ip", "todo", "blk"];
 
-/** One cell per task, grouped by kind. */
+/**
+ * Done over the work still meant to happen: cancelled tasks leave the
+ * denominator (D169), the same rule the engine's `progress` uses. `live` is
+ * what the card prints as the total.
+ */
+export function progressOf(c: TaskCounts): { done: number; live: number; pct: number } {
+  const live = Math.max(0, c.total - (c.cancelled ?? 0));
+  return { done: c.done, live, pct: live > 0 ? c.done / live : 0 };
+}
+
+/** One cell per task, grouped by kind. Cancelled tasks draw no cell: the cells
+ *  are the work, and a cancelled task is not part of it any more (D169). */
 export function cellsOf(c: TaskCounts): CellKind[] {
   const n: Record<CellKind, number> = {
     ver: c.done - c.doneUnverified,
@@ -109,7 +120,11 @@ export function waitingTotal(
 ): number | null {
   if (activity === null) return null;
   const tasks = overview.reduce(
-    (n, w) => n + (w.taskCounts ? w.taskCounts.blocked + w.taskCounts.doneUnverified : 0),
+    (n, w) =>
+      n +
+      (w.taskCounts ? w.taskCounts.blocked + w.taskCounts.doneUnverified : 0) +
+      // D170: the To decide queue is on each card's amber line, so here too.
+      (w.youCounts ? w.youCounts.questions + w.youCounts.decisions : 0),
     0,
   );
   return tasks + activity.reduce((n, a) => n + a.waiting.length, 0);

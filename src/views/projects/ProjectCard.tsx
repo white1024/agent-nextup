@@ -7,8 +7,8 @@ import PathLabel from "../../components/PathLabel";
 import { IconWarn, IconX } from "../../components/icons";
 import { lightTheme, motionOff, tokenRgb } from "../../lib/fx";
 import { shownDomain } from "../../lib/domain";
-import type { TaskCounts } from "../../types";
-import { CELLS_MAX, cellsOf, changedCells, type CellKind } from "./overviewModel";
+import type { TaskCounts, YouCounts } from "../../types";
+import { CELLS_MAX, cellsOf, changedCells, progressOf, type CellKind } from "./overviewModel";
 
 /** What a card draws — a registry row, or the wizard's "this is what it will be". */
 export interface CardData {
@@ -18,10 +18,14 @@ export interface CardData {
   templateName?: string | null;
   exists: boolean;
   taskCounts?: TaskCounts | null;
+  /** Questions and provisional decisions waiting on the person (D170). */
+  youCounts?: YouCounts | null;
   phaseIndex?: number | null;
   phaseCount?: number | null;
   phaseTitle?: string | null;
   workflowCompleted: boolean;
+  /** Runs ongoing (D171): no position to show, just the mode. */
+  ongoing?: boolean;
   /** Last opened, or the last agent call when that is newer. */
   at?: string;
 }
@@ -77,7 +81,8 @@ export default function ProjectCard({
   const { t } = useTranslation();
   const ref = useRef<HTMLLIElement>(null);
   const counts = data.taskCounts ?? null;
-  const pct = counts && counts.total > 0 ? counts.done / counts.total : 0;
+  const progress = counts ? progressOf(counts) : null;
+  const pct = progress?.pct ?? 0;
   const cells = counts ? cellsOf(counts) : [];
   const shownCells = cells.slice(0, CELLS_MAX);
   const flips = useCellFlips(cells);
@@ -98,10 +103,14 @@ export default function ProjectCard({
 
   const live = !preview;
   const phaseLine =
-    data.workflowCompleted || data.phaseIndex == null || data.phaseCount == null
+    data.ongoing || data.workflowCompleted || data.phaseIndex == null || data.phaseCount == null
       ? " "
       : t("welcome.phaseOf", { i: data.phaseIndex + 1, n: data.phaseCount });
-  const phaseName = data.workflowCompleted ? t("welcome.recentDone") : (data.phaseTitle ?? "");
+  const phaseName = data.ongoing
+    ? t("workflow.ongoing")
+    : data.workflowCompleted
+      ? t("welcome.recentDone")
+      : (data.phaseTitle ?? "");
 
   // The button is named by the project alone and *described* by its state
   // (my-design review F12). A button's content is presentational to assistive
@@ -175,7 +184,7 @@ export default function ProjectCard({
             <span className="card-tasks">
               {counts && (
                 <Scramble
-                  value={t("welcome.recentTasks", { done: counts.done, total: counts.total })}
+                  value={t("welcome.recentTasks", { done: counts.done, total: progress?.live ?? counts.total })}
                 />
               )}
             </span>
@@ -207,7 +216,7 @@ export default function ProjectCard({
               {t("welcome.recentMissing")}
             </span>
           )}
-          <YouLine counts={counts} waiting={waiting} />
+          <YouLine counts={counts} waiting={waiting} you={data.youCounts ?? null} />
           {running && (
             <span className="card-run">
               <i className="dot-run amb" aria-hidden="true" />
@@ -252,10 +261,21 @@ export default function ProjectCard({
 }
 
 /** The amber line at the foot: who is waiting for authorization, then the counts. */
-function YouLine({ counts, waiting }: { counts: TaskCounts | null; waiting: string[] }) {
+function YouLine({
+  counts,
+  waiting,
+  you,
+}: {
+  counts: TaskCounts | null;
+  waiting: string[];
+  you: YouCounts | null;
+}) {
   const { t } = useTranslation();
   const parts = [
     ...waiting,
+    // D170: questions and provisional decisions agents left for the person.
+    you && you.questions > 0 ? t("welcome.footQuestions", { n: you.questions }) : "",
+    you && you.decisions > 0 ? t("welcome.footDecisions", { n: you.decisions }) : "",
     counts && counts.blocked > 0 ? t("welcome.footBlocked", { n: counts.blocked }) : "",
     counts && counts.doneUnverified > 0 ? t("welcome.footUnverified", { n: counts.doneUnverified }) : "",
   ].filter(Boolean);

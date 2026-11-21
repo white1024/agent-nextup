@@ -53,7 +53,16 @@ export default function WizardFrame({
  * `tasks` is how many tasks the project will start with, so a "create N
  * tasks" gate shows how far the draft already gets it.
  */
-export function FirstPhase({ templateId, tasks = 0 }: { templateId: string | null; tasks?: number }) {
+export function FirstPhase({
+  templateId,
+  tasks = 0,
+  staged = true,
+}: {
+  templateId: string | null;
+  tasks?: number;
+  /** Ongoing (D171) has no first phase to preview: it says how it runs instead. */
+  staged?: boolean;
+}) {
   const { t } = useTranslation();
   const gateLabel = useGateLabel();
   const [phase, setPhase] = useState<WorkflowPhase | null>(null);
@@ -76,6 +85,17 @@ export function FirstPhase({ templateId, tasks = 0 }: { templateId: string | nul
     };
   }, [templateId]);
 
+  if (!staged) {
+    return (
+      <div className="wz-first">
+        <small>{t("wizard.howItRuns")}</small>
+        <div className="wz-first-h">
+          <b>{t("workflow.ongoing")}</b>
+        </div>
+        <p>{t("wizard.ongoingPreview")}</p>
+      </div>
+    );
+  }
   // Invariant 10: not read yet draws nothing rather than an empty box.
   if (phase === null) return null;
   return (

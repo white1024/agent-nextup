@@ -38,6 +38,14 @@ pub struct ProjectContext {
     /// are history, removal is a deliberate human edit.
     #[serde(default)]
     pub rejected: Vec<RejectedAlternative>,
+    /// The folder brings its own method (D170): its own process, documents and
+    /// memory. Set at init or adoption; the engine then lays down only the
+    /// takeover layer — no `memory/`, `work_record/`, `artifacts/` or
+    /// `project.yaml` — and its material points at the project's own documents
+    /// for those. An external PM's workspace grew two of everything because
+    /// the engine laid its full skeleton next to a complete method.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_method: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -86,6 +94,7 @@ impl ProjectContext {
             boundaries,
             milestones: Vec::new(),
             rejected: Vec::new(),
+            own_method: false,
             created_at: now.clone(),
             updated_at: now,
         }

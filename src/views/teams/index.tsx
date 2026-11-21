@@ -2,14 +2,16 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { api } from "../../api";
+import { api, errorMessage } from "../../api";
 import { normRoot, readBoxes, sameRoot } from "../../lib/exchange";
-import { useGuardedMutation, useWorkspaceData } from "../../hooks";
+import { useFlash, useGuardedMutation, useWorkspaceData } from "../../hooks";
 import ConfirmDanger from "../../components/ConfirmDanger";
 import EmptyState from "../../components/EmptyState";
+import FlashBar from "../../components/FlashBar";
 import Modal from "../../components/Modal";
 import { IconPlus, IconRefresh, IconX } from "../../components/icons";
-import type { Team, WorkspaceOverview } from "../../types";
+import type { ImportPreview, Team, WorkspaceOverview } from "../../types";
+import { ExportDialog, ImportDialog, pickTeamFile } from "./TeamTransfer";
 import type { ToastSpec } from "../../lib/teamAutoRoute";
 import { motionOff, type Point } from "../../lib/fx";
 import { afterPaint, fadeRowsOut, rowTops, slideRows, EASE_OUT } from "../../lib/listMotion";
@@ -52,6 +54,10 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
   const [creating, setCreating] = useState(false);
   const [teamName, setTeamName] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<Team | null>(null);
+  /** Carrying teams to another machine (D173 ②). */
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState<{ file: string; preview: ImportPreview } | null>(null);
+  const { flash, showFlash } = useFlash(6000);
   /** C55: the cards and their stars come in once, when the page is entered. */
   const [entering, setEntering] = useState(true);
   /** C56 in progress: which card is opening (the rest sink), or the team flown back to. */
@@ -281,6 +287,26 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
     });
   }
 
+  /**
+   * Pick a team file and read what importing it would do. A file that is not
+   * a team file is refused here, on the page, before any dialog opens.
+   */
+  async function startImport() {
+    setError(null);
+    let file: string | null;
+    try {
+      file = await pickTeamFile(t("teams.fileKind"));
+    } catch (e) {
+      setError(errorMessage(e));
+      return;
+    }
+    if (file === null) return;
+    const picked = file;
+    await run(async () => {
+      setImporting({ file: picked, preview: await api.teamImportPreview(picked) });
+    });
+  }
+
   if (teams === null) {
     // Local JSON, read in a blink: blank, no skeleton (invariant 10(c)).
     return <div className="view tms" />;
@@ -327,12 +353,20 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
           >
             <IconRefresh size={14} />
           </button>
+          {/* D173 ②: the graph lives on this machine only; these carry it. */}
+          <button className="btn" disabled={busy || teams.length === 0} onClick={() => setExporting(true)}>
+            {t("teams.export")}
+          </button>
+          <button className="btn" disabled={busy} onClick={() => void startImport()}>
+            {t("teams.import")}
+          </button>
           <button className="btn btn-primary" onClick={() => setCreating(true)}>
             <IconPlus size={14} /> {t("teams.create")}
           </button>
         </div>
       </header>
 
+      <FlashBar message={flash} />
       {error && confirmDelete === null && !creating && <div className="alert alert-error">{error}</div>}
 
       {teams.length === 0 ? (
@@ -460,6 +494,26 @@ export default function TeamsHome({ refreshKey, pushToast }: Props) {
             </div>
           </div>
         </Modal>
+      )}
+
+      {exporting && (
+        <ExportDialog
+          teams={teams}
+          onClose={() => setExporting(false)}
+          onDone={(message) => {
+            setExporting(false);
+            showFlash(message);
+          }}
+        />
+      )}
+
+      {importing && (
+        <ImportDialog
+          file={importing.file}
+          preview={importing.preview}
+          onClose={() => setImporting(null)}
+          onTeams={setTeams}
+        />
       )}
 
       {confirmDelete && (

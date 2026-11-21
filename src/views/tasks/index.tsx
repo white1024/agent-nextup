@@ -34,7 +34,7 @@ import ConfirmDanger from "../../components/ConfirmDanger";
 import { Check, Switch } from "../../components/controls";
 import { IconArchive, IconCaretDown, IconPlus, IconSearch } from "../../components/icons";
 import type { SpecOverlap, Task, TaskStatus, TaskUpdate, WorkspaceSettings } from "../../types";
-import TaskRow, { STATUSES, type RowActions } from "./TaskRow";
+import TaskRow, { STATUSES, type ReasonStatus, type RowActions } from "./TaskRow";
 
 interface Props {
   refreshKey: number;
@@ -169,6 +169,8 @@ export default function Tasks({
   // Inline "blocked reason" prompt for one task at a time
   const [blockTarget, setBlockTarget] = useState<string | null>(null);
   const [blockReason, setBlockReason] = useState("");
+  // Which reason the inline prompt is collecting: blocked or cancelled (D169).
+  const [blockAs, setBlockAs] = useState<ReasonStatus>("blocked");
 
   // Inline "verification evidence" prompt for one done task at a time
   const [verifyTarget, setVerifyTarget] = useState<string | null>(null);
@@ -201,6 +203,8 @@ export default function Tasks({
   const [editDescription, setEditDescription] = useState("");
   const [editPriority, setEditPriority] = useState(1);
   const [editTags, setEditTags] = useState("");
+  // One step per line (D170); saving sends the whole list.
+  const [editSteps, setEditSteps] = useState("");
   const [editError, setEditError] = useState<string | null>(null);
   // Errors stay inside their own dialog — the form is still open and fixable —
   // so these two get their own error sinks rather than the view-level one.
@@ -348,7 +352,14 @@ export default function Tasks({
   // "show archived" is ticked — and ignore the other filters, so each number
   // says what clicking that cell would show before tags or search narrow it.
   const counts = useMemo(() => {
-    const c: Record<TaskStatus | "all", number> = { all: shelved.length, todo: 0, in_progress: 0, blocked: 0, done: 0 };
+    const c: Record<TaskStatus | "all", number> = {
+      all: shelved.length,
+      todo: 0,
+      in_progress: 0,
+      blocked: 0,
+      done: 0,
+      cancelled: 0,
+    };
     for (const task of shelved) c[task.status] += 1;
     return c;
   }, [shelved]);
@@ -695,6 +706,7 @@ export default function Tasks({
     setEditDescription(task.description);
     setEditPriority(task.priority);
     setEditTags(task.tags.join(", "));
+    setEditSteps((task.steps ?? []).map((s) => s.title).join("\n"));
     setEditError(null);
   }
 
@@ -708,6 +720,10 @@ export default function Tasks({
         description: editDescription,
         priority: editPriority,
         tags: parseTags(editTags),
+        steps: editSteps
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== ""),
       });
       setEditTarget(null);
       showFlash(t("tasks.editedHint"));
@@ -740,10 +756,11 @@ export default function Tasks({
 
   function onStatusSelect(task: Task, status: TaskStatus) {
     if (status === task.status) return;
-    if (status === "blocked") {
+    if (status === "blocked" || status === "cancelled") {
       // Ask first; the select stays on the old status until the reason is in.
       withSlide(() => {
         setBlockTarget(task.id);
+        setBlockAs(status);
         setBlockReason("");
       });
       return;
@@ -763,6 +780,12 @@ export default function Tasks({
       }),
     unverify: (id) => void applyVerification(id, false),
     archive: (task) => void applyArchived(task),
+    step: (task, step, done) =>
+      void guarded(async () => {
+        await api.setTaskStep(task.id, step, done);
+        await load();
+        onMutated();
+      }),
     edit: openEdit,
     remove: (task) => {
       setDeleteTarget(task);
@@ -780,7 +803,7 @@ export default function Tasks({
       void closePrompt("nudge");
     },
     blockCancel: () => void closePrompt("block"),
-    blockConfirm: (id) => void applyStatus(id, "blocked", blockReason),
+    blockConfirm: (id) => void applyStatus(id, blockAs, blockReason),
     verifyCancel: () => void closePrompt("verify"),
     verifyConfirm: (id) => void applyVerification(id, true, verifyNote),
   };
@@ -1048,6 +1071,7 @@ export default function Tasks({
                   mutating={mutating}
                   nudge={nudgeTarget === task.id}
                   blocking={blockTarget === task.id}
+                  blockAs={blockAs}
                   blockReason={blockReason}
                   setBlockReason={setBlockReason}
                   verifying={verifyTarget === task.id}
@@ -1110,6 +1134,17 @@ export default function Tasks({
                 value={editTags}
                 onChange={(e) => setEditTags(e.target.value)}
                 placeholder={t("tasks.tagsPlaceholder")}
+              />
+            </label>
+            <label className="field">
+              <span>
+                {t("tasks.stepsLabel")} {t("common.optional")}
+              </span>
+              <textarea
+                rows={4}
+                value={editSteps}
+                onChange={(e) => setEditSteps(e.target.value)}
+                placeholder={t("tasks.stepsPlaceholder")}
               />
             </label>
             <div className="form-actions">

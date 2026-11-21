@@ -409,15 +409,16 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
     });
   }
 
-  /** Lands an upgrade's result: rows that stay slide up into place. */
-  function settleAssets(outcome: AssetsUpgradeOutcome, fresh: AssetStatus[]) {
+  /** Lands an upgrade's result: rows that stay slide up into place. A press
+   *  that also granted new tools (D172) brings the switches along with it. */
+  function settleAssets(outcome: AssetsUpgradeOutcome, fresh: AssetStatus[], access?: AgentAccessView) {
     const list = assetListRef.current;
     const before = rowTops(list);
     afterCommit.current.push(() => slideRows(assetListRef.current, before, { duration: 380, easing: EASE_OUT }));
     setSweeping(new Set());
     setAssetsOutcome(outcome);
     setResultKey((k) => k + 1);
-    setData((d) => (d === null ? d : { ...d, assets: fresh }));
+    setData((d) => (d === null ? d : { ...d, assets: fresh, ...(access ? { agentAccess: access } : {}) }));
   }
 
   // One IPC for all three asset actions: the plain upgrade button sends no
@@ -446,7 +447,9 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
           api.workspaceAssetsUpgrade([], []),
           sleep(motion ? 120 + targets.length * 160 + 520 : 0),
         ]);
-        settleAssets(outcome, await api.workspaceAssetsStatus());
+        // Always re-read the access view: it also carries what is pending.
+        const [fresh, access] = await Promise.all([api.workspaceAssetsStatus(), api.agentAccessStatus()]);
+        settleAssets(outcome, fresh, access);
       } catch (e) {
         for (const a of fades) a.cancel();
         setSweeping(new Set());
@@ -501,6 +504,8 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
   const assetCount = (state: AssetStatus["state"]) => (assets ?? []).filter((a) => a.state === state).length;
   const staleAssets = (assets ?? []).filter((a) => a.state !== "up_to_date");
   const upgradableCount = assetCount("upgrade_safe") + assetCount("missing");
+  const pendingGrants = agentAccess?.pendingDefaultGrants ?? [];
+  const grantedNow = assetsOutcome?.grantedTools ?? [];
 
   const [countBefore, countAfter] = splitAroundCount((x) =>
     t("tools.authorizedCount", { n: x, total: writeTools.length }),
@@ -579,7 +584,7 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
                 <h2>{t("assets.heading")}</h2>
                 <button
                   className="btn"
-                  disabled={assetsBusy || upgradableCount === 0}
+                  disabled={assetsBusy || (upgradableCount === 0 && pendingGrants.length === 0)}
                   onClick={() => void upgradeAll()}
                 >
                   {assetsBusy ? t("assets.upgrading") : t("assets.upgrade")}
@@ -599,6 +604,11 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
                   })
                 )}
               </p>
+              {pendingGrants.length > 0 && (
+                <p className="tls-hint" data-pending-grants>
+                  {t("assets.pendingGrants", { n: pendingGrants.length, tools: pendingGrants.join(", ") })}
+                </p>
+              )}
               {staleAssets.length > 0 && (
                 <div className="tls-fs" ref={assetListRef}>
                   {staleAssets.map((a) => (
@@ -638,13 +648,19 @@ export default function Tools({ refreshKey, focusTool, onFocusHandled, focusAsse
                 </div>
               )}
               {assetsOutcome !== null &&
-                (assetsOutcome.upgraded.length > 0 || assetsOutcome.added.length > 0) && (
+                (assetsOutcome.upgraded.length > 0 || assetsOutcome.added.length > 0 || grantedNow.length > 0) && (
                   <p className={`tls-result${resultKey > 0 ? " in" : ""}`} key={resultKey}>
-                    {t("assets.resultLine", {
-                      up: assetsOutcome.upgraded.length,
-                      added: assetsOutcome.added.length,
-                    })}
-                    {assetsOutcome.backupDir && <> {t("assets.resultBackup", { dir: assetsOutcome.backupDir })}</>}
+                    {(assetsOutcome.upgraded.length > 0 || assetsOutcome.added.length > 0) && (
+                      <>
+                        {t("assets.resultLine", {
+                          up: assetsOutcome.upgraded.length,
+                          added: assetsOutcome.added.length,
+                        })}
+                        {assetsOutcome.backupDir && <> {t("assets.resultBackup", { dir: assetsOutcome.backupDir })}</>}{" "}
+                      </>
+                    )}
+                    {grantedNow.length > 0 &&
+                      t("assets.resultGranted", { n: grantedNow.length, tools: grantedNow.join(", ") })}
                   </p>
                 )}
             </section>

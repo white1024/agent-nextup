@@ -36,7 +36,8 @@ import {
   settleBox,
 } from "../lib/listMotion";
 import { growTo, projectCard } from "../lib/transitions";
-import type { ProjectContext, SystemStatus, WorkspaceModules } from "../types";
+import { modeSwitchKey } from "../lib/workflowMode";
+import type { ProjectContext, SystemStatus, WorkflowStatus, WorkspaceModules } from "../types";
 
 interface Props {
   status: SystemStatus;
@@ -349,6 +350,7 @@ export default function ProjectSettings({
               if (!wasRename) showFlash(t("settings.projectInfoSaved"));
             }}
           />
+          <WorkflowModePanel onError={setError} onAnnounce={showFlash} />
         </div>
 
         <div className="settings-col">
@@ -565,6 +567,99 @@ function navEntryMotion(view: string | null, on: boolean, sw: HTMLElement | null
  * sidebar's Ledger — where the edit was just written — before the result
  * line (C199). The fields fade in when the info arrives (C204).
  */
+/**
+ * Staged ⇄ ongoing (D171 ③). A person's switch with no hub tool behind it.
+ * It goes both ways and keeps the history, so it is tier 3 — no confirmation,
+ * no red — and says what changed instead (D103 ③). Absent on a legacy
+ * workspace with no harness: there is nothing to switch.
+ */
+function WorkflowModePanel({
+  onError,
+  onAnnounce,
+}: {
+  onError: (message: string | null) => void;
+  onAnnounce: (message: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<WorkflowStatus | null>(null);
+  // Ongoing needs instructions: the project's own copy, or — on a
+  // workflow.json from before D171 — its template's, looked up by id.
+  const [canOngoing, setCanOngoing] = useState(true);
+  const { busy, run } = useGuardedMutation((m) => onError(m));
+
+  useEffect(() => {
+    let stale = false;
+    api
+      .workflowStatus()
+      .then(async (read) => {
+        if (stale) return;
+        setStatus(read);
+        if ((read.workflow.ongoingInstructions ?? []).length > 0) return;
+        try {
+          const list = await api.listTemplates();
+          if (!stale) setCanOngoing(list.find((tpl) => tpl.id === read.workflow.templateId)?.supportsOngoing ?? false);
+        } catch {
+          if (!stale) setCanOngoing(false);
+        }
+      })
+      .catch(() => {
+        // No harness (a legacy workspace): nothing to switch, so no panel.
+      });
+    return () => {
+      stale = true;
+    };
+  }, []);
+
+  if (status === null) return null;
+  const staged = status.workflow.mode !== "ongoing";
+  const template = status.workflow.templateName;
+
+  function setStaged(next: boolean) {
+    void run(async () => {
+      onError(null);
+      const read = await api.setWorkflowMode(next ? "staged" : "ongoing");
+      setStatus(read);
+      const phase =
+        read.workflow.phases.find((p) => p.id === read.workflow.state.currentPhase)?.title ??
+        read.workflow.state.currentPhase;
+      // A finished workflow comes back finished: no phase to return to, and
+      // nothing is asked for again (workflow.rs set_mode).
+      onAnnounce(t(`settings.${modeSwitchKey(next, read.workflow.state)}`, { phase }));
+    });
+  }
+
+  return (
+    <section className="panel settings-sec">
+      <div className="panel-head">
+        <h2 className="panel-title">{t("settings.workflow")}</h2>
+        <InfoTip label={t("common.moreInfo")}>{t("settings.workflowHint")}</InfoTip>
+      </div>
+      <div className="settings-row">
+        <div className="sr-body">
+          <div className="sr-title">{t("settings.workflowStaged")}</div>
+          <Scramble
+            className="sr-desc"
+            durationMs={640}
+            value={
+              staged && !canOngoing
+                ? t("settings.workflowNoOngoing")
+                : staged
+                  ? t("settings.workflowOnStaged", { template })
+                  : t("settings.workflowOnOngoing", { template })
+            }
+          />
+        </div>
+        <Switch
+          checked={staged}
+          onChange={setStaged}
+          disabled={busy || (staged && !canOngoing)}
+          ariaLabel={t("settings.workflowStaged")}
+        />
+      </div>
+    </section>
+  );
+}
+
 function ProjectInfoPanel({
   root,
   onError,

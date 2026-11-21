@@ -8,7 +8,7 @@ The current-behaviour spec layer.
 
 The ledger records **why** (the timeline), `specs/` records **what** (the present). One file per capability at `specs/<capability>/spec.md`, describing how the system behaves **now**.
 
-A spec states the present, not a wish — wishes and motivation belong in the task artifact's `proposal.md`. A task that changes behaviour writes the difference as a **delta**, and the engine folds it into the main spec when the task is archived, which is what keeps `specs/` equal to the sum of completed work.
+A spec states the present, not a wish — wishes and motivation belong in the task artifact's `proposal.md`. A task that changes behaviour writes the difference as a **delta**, and the engine folds it into the main spec when the task is archived as done — a cancelled task's delta stays in its folder and never folds — which is what keeps `specs/` equal to the sum of completed work.
 
 ## Format (OpenSpec-compatible, plain Markdown)
 

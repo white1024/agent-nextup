@@ -13,6 +13,8 @@ import type { AdoptionDraft, NewTask, SystemStatus, TemplateSummary } from "../.
 import TemplatePicker from "./TemplatePicker";
 import ProjectCard from "./ProjectCard";
 import WizardFrame, { FirstPhase } from "./WizardFrame";
+import StagedCheck from "../../components/StagedCheck";
+import { modeToSend, runsStaged } from "../../lib/workflowMode";
 import { chargeCard } from "./motion";
 import { NO_TASKS } from "./InitWizard";
 
@@ -49,6 +51,11 @@ export default function AdoptWizard({
   const onTemplateResolved = useCallback((tpl: TemplateSummary | null) => setTemplate(tpl), []);
   const [taskSelected, setTaskSelected] = useState<boolean[]>([]);
   const [grantAll, setGrantAll] = useState(grantAllToolsPreferred);
+  // Pre-ticked when the folder already has its own entry or docs (D170).
+  const [ownMethod, setOwnMethod] = useState(false);
+  // D171 ②: phases are opt-in.
+  const [staged, setStaged] = useState(false);
+  const isStaged = runsStaged(staged, template);
   const { busy, run: runSubmit } = useGuardedMutation(onError);
   const preview = useRef<HTMLUListElement>(null);
   const taskList = useRef<HTMLUListElement>(null);
@@ -87,6 +94,7 @@ export default function AdoptWizard({
       setDomain(d.domain);
       setDescription(d.description);
       setTaskSelected(d.suggestedTasks.map(() => true));
+      setOwnMethod(d.ownMethodDetected);
       setTemplateId(d.domain === "coding" ? "coding-v1" : "generic-v1");
     });
   }
@@ -106,6 +114,8 @@ export default function AdoptWizard({
           boundaries: [],
           templateId,
           grantAllTools: grantAll,
+          ownMethod,
+          mode: modeToSend(staged, template),
         },
         tasks,
       );
@@ -136,15 +146,16 @@ export default function AdoptWizard({
               templateName: template?.name ?? null,
               exists: true,
               taskCounts: { ...NO_TASKS, total: taskCount, todo: taskCount },
-              phaseIndex: template ? 0 : null,
-              phaseCount: template?.phases.length ?? null,
-              phaseTitle: template?.phases[0]?.title ?? null,
+              ongoing: !isStaged,
+              phaseIndex: template && isStaged ? 0 : null,
+              phaseCount: isStaged ? (template?.phases.length ?? null) : null,
+              phaseTitle: isStaged ? (template?.phases[0]?.title ?? null) : null,
               workflowCompleted: false,
               at: new Date().toISOString(),
             }}
           />
         </ul>
-        <FirstPhase templateId={template?.id ?? null} tasks={taskCount} />
+        <FirstPhase templateId={template?.id ?? null} tasks={taskCount} staged={isStaged} />
       </>
     );
   } else if (analyzing) {
@@ -264,12 +275,21 @@ export default function AdoptWizard({
           )}
 
           <TemplatePicker templateId={templateId} onSelect={setTemplateId} onResolved={onTemplateResolved} />
+          <StagedCheck staged={staged} onChange={setStaged} template={template} />
 
           <div className="fh-grant">
             <Check checked={grantAll} onChange={setGrantAll}>
               <span>{t("wizard.grantAllTools")}</span>
             </Check>
             <p className="fh-grant-h">{t("wizard.grantAllToolsHint")}</p>
+          </div>
+          {/* D170: a folder that brings its own process gets only the takeover
+              layer — no memory/, work_record/, artifacts/ or project.yaml. */}
+          <div className="fh-grant">
+            <Check checked={ownMethod} onChange={setOwnMethod}>
+              <span>{t("wizard.ownMethod")}</span>
+            </Check>
+            <p className="fh-grant-h">{t("wizard.ownMethodHint")}</p>
           </div>
         </>
       )}

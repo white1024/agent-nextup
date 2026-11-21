@@ -1,6 +1,7 @@
 // DTO mirrors of the Rust core types (serde camelCase).
 
-export type TaskStatus = "todo" | "in_progress" | "blocked" | "done";
+/** `cancelled` (D169): closed without being done — superseded or dropped. */
+export type TaskStatus = "todo" | "in_progress" | "blocked" | "done" | "cancelled";
 
 export interface Task {
   schemaVersion: number;
@@ -14,9 +15,13 @@ export interface Task {
   /** When blockedReason was written. Nothing recomputes a reason, so its age
    * is the only cue that it may no longer hold. Cleared with the reason. */
   blockedAt?: string | null;
+  /** Why the task was cancelled (D169); required on the way in, cleared on the way out. */
+  cancelReason?: string | null;
   /** Collaboration fields (D31): always in the schema; the collab module only gates exposure. */
   assignee?: string;
   dependsOn?: string[];
+  /** The task's own checklist (D170): describes the work, never moves status. */
+  steps?: TaskStep[];
   /** Set only when the done claim was checked against reality (evidence in verifiedNote). */
   verifiedAt?: string | null;
   verifiedNote?: string | null;
@@ -43,11 +48,18 @@ export interface NewTask {
  * assignee each keep their own operation (own rules, own ledger kind) — an
  * edit can never move them.
  */
+export interface TaskStep {
+  title: string;
+  done: boolean;
+}
+
 export interface TaskEdit {
   title: string;
   description: string;
   priority: number;
   tags: string[];
+  /** The whole step list by title (D170); a title already there keeps its checkmark. */
+  steps?: string[] | null;
 }
 
 export interface TaskCounts {
@@ -56,6 +68,8 @@ export interface TaskCounts {
   inProgress: number;
   blocked: number;
   done: number;
+  /** Closed without being done (D169): in `total`, never in a progress denominator. */
+  cancelled: number;
   doneUnverified: number;
 }
 
@@ -78,6 +92,41 @@ export interface SystemStatus {
   keystoreDescription: string;
   workspace: WorkspaceInfo | null;
   taskCounts: TaskCounts | null;
+  /** Open questions and provisional decisions waiting on the person (D170). */
+  youCounts: YouCounts | null;
+}
+
+/** What the To decide page holds (D170). */
+export interface YouCounts {
+  questions: number;
+  decisions: number;
+}
+
+export type QuestionStatus = "open" | "answered" | "withdrawn";
+
+/** A question an agent left for the person (D170; `.nextup/questions/Q-0001.json`). */
+export interface Question {
+  schemaVersion: number;
+  id: string;
+  question: string;
+  recommendation?: string | null;
+  options?: string[];
+  /** Who should really answer, when not the user — the user forwards it. */
+  ask?: string | null;
+  /** Tasks this question holds up. */
+  blocks?: string[];
+  /** What the asker proceeds on if nobody answers. */
+  defaultAnswer?: string | null;
+  status: QuestionStatus;
+  answer?: string | null;
+  answeredAt?: string | null;
+  /** The decision the answer was ledgered as. */
+  decisionId?: string | null;
+  /** When an agent picked the answer up through the hub. */
+  seenAt?: string | null;
+  askedBy?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type LedgerKind =
@@ -151,6 +200,8 @@ export interface LedgerEvent {
   /** ── Decision identity and supersession — decisions only, absent on older lines ── */
   /** Workspace-local decision id (`D-0001`), so a later decision can point at this one. */
   id?: string;
+  /** Taken on a default, waiting for the person's review (D170). */
+  provisional?: boolean;
   /**
    * The decision id this decision overturns. Set on the NEW line only — the ledger is
    * append-only, so the superseded line is never edited. Read the other direction with
@@ -259,6 +310,10 @@ export interface InitProjectParams {
   createRoot?: boolean;
   /** Grant every exposed write tool at creation, guarded ones included (D150); omit for the D63 day-one grant. */
   grantAllTools?: boolean;
+  /** The folder brings its own method (D170): lay down only the takeover layer. */
+  ownMethod?: boolean;
+  /** Staged or ongoing (D171); omitted = ongoing when the template can run that way. */
+  mode?: WorkflowMode;
 }
 
 /** Live collision check for the init wizard's target folder (D44). */
@@ -268,6 +323,12 @@ export interface InitTargetProbe {
 }
 
 // ── Workflow harness ────────────────────────────────────────────────────────
+
+/**
+ * How a project runs its template (D171): staged = phases closed by exit
+ * gates; ongoing = the same method with no phases, a stream of tasks.
+ */
+export type WorkflowMode = "staged" | "ongoing";
 
 export type Gate =
   | { kind: "min_tasks"; count: number }
@@ -316,7 +377,11 @@ export interface Workflow {
   schemaVersion: number;
   templateId: string;
   templateName: string;
+  /** Absent on a staged project — the engine writes it only when ongoing (D171). */
+  mode?: WorkflowMode;
   phases: WorkflowPhase[];
+  /** What an agent follows while the project runs ongoing (D171). */
+  ongoingInstructions?: string[];
   state: WorkflowState;
 }
 
@@ -337,6 +402,8 @@ export interface TemplateSummary {
   /** Each phase's title and exit-gate kinds, in order (D155 ②) — enough to draw the band. */
   phases: PhaseOutline[];
   source: "built_in" | "custom";
+  /** Carries its own ongoing instructions (D171); without them a project can only run staged. */
+  supportsOngoing: boolean;
 }
 
 /** Just enough of a template phase to draw it. */
@@ -352,6 +419,8 @@ export interface WorkflowTemplate {
   description: string;
   domainHint: string;
   phases: WorkflowPhase[];
+  /** What a project made from it follows while it runs ongoing; absent = staged only (D171 ⑧). */
+  ongoingInstructions?: string[];
 }
 
 export interface WorkspaceChangedPayload {
@@ -377,6 +446,8 @@ export interface AgentAccess {
   schemaVersion: number;
   enabled: boolean;
   allowedTools: string[];
+  /** Every write tool this allowlist was settled against (D172); absent on files written before it. */
+  knownTools?: string[];
 }
 
 /** One semantic write-tool group (D39) — presentation bundling only. */
@@ -394,6 +465,8 @@ export interface AgentAccessView {
   guardedReasons: Record<string, string>;
   /** Grants a restored backup parked for a person to accept or drop (D143); null when none. */
   restoredAccess: RestoredAccess | null;
+  /** Day-one tools a newer version added, never offered here — what the asset upgrade will grant (D172). */
+  pendingDefaultGrants: string[];
 }
 
 /** What the update dialog checks before it offers an install (D144). */
@@ -409,6 +482,8 @@ export interface UpdatePreflight {
 export interface RestoredAccess {
   allowedTools: string[];
   exportedAt: string;
+  /** The source's knownTools, applied with the grants (D172). */
+  knownTools?: string[];
 }
 
 export interface AgentMcpStatus {
@@ -477,7 +552,52 @@ export interface Team {
    */
   prime?: TeamMember;
   createdAt: string;
+  /** When the team's content last changed. Re-linking a folder does not move it (D173 ③). */
   updatedAt: string;
+}
+
+/** One workspace a re-link pointed somewhere (D173 ①) — or, in `missing`, could not find. */
+export interface RelinkedWorkspace {
+  workspaceId: string;
+  name: string;
+  root: string;
+}
+
+export interface RelinkReport {
+  relinked: RelinkedWorkspace[];
+  missing: RelinkedWorkspace[];
+}
+
+export interface TeamsRelinked {
+  teams: Team[];
+  report: RelinkReport;
+}
+
+/** How one team in a team file relates to this machine's graph (D173 ②). */
+export type ImportStatus = "new" | "same" | "differs";
+
+export interface ImportRow {
+  id: string;
+  name: string;
+  status: ImportStatus;
+  members: number;
+  edges: number;
+  /** The coordinator's name — importing the team designates it here too. */
+  prime: string | null;
+  fileUpdatedAt: string;
+  localName: string | null;
+  localUpdatedAt: string | null;
+}
+
+export interface ImportPreview {
+  exportedAt: string;
+  appVersion: string;
+  teams: ImportRow[];
+}
+
+export interface TeamsImported {
+  teams: Team[];
+  outcome: { added: number; replaced: number; relink: RelinkReport };
 }
 
 export interface DeliverySource {
@@ -600,6 +720,8 @@ export interface AssetsUpgradeOutcome {
   needsReview: string[];
   /** Workspace-relative dir holding pre-overwrite copies (when any were taken). */
   backupDir?: string;
+  /** Tools a newer version added that the same press granted (D172); plain upgrade only. */
+  grantedTools?: string[];
 }
 
 // ── Workspace doctor (D18) ──────────────────────────────────────────────────
@@ -702,10 +824,14 @@ export interface WorkspaceOverview {
   lastOpened: string;
   exists: boolean;
   taskCounts?: TaskCounts | null;
+  /** Open questions and provisional decisions waiting on the person (D170). */
+  youCounts?: YouCounts | null;
   currentPhase?: string | null;
   /** Phase display title (D42 pure-Chinese); fall back to currentPhase id. */
   currentPhaseTitle?: string | null;
   workflowCompleted: boolean;
+  /** Runs ongoing (D171): no phase position to show. */
+  ongoing?: boolean;
   /** 0-based position of the current phase, and how many phases there are ("phase 2 / 5"). */
   currentPhaseIndex?: number | null;
   phaseCount?: number | null;
@@ -755,6 +881,8 @@ export interface AdoptionDraft {
   description: string;
   languages: string[];
   suggestedTasks: NewTask[];
+  /** The folder already has AGENTS.md, CLAUDE.md or docs/ (D170). */
+  ownMethodDetected: boolean;
 }
 
 // ── Embedded terminal & agent catalog (D50) ─────────────────────────────────

@@ -67,6 +67,11 @@ pub struct MemberStatus {
     pub current_phase_title: Option<String>,
     #[serde(default)]
     pub workflow_completed: bool,
+    /// The member runs ongoing (D171): it has no phase, so `currentPhase`
+    /// and `currentPhaseTitle` are left out rather than read as "stuck in
+    /// phase 1".
+    #[serde(default)]
+    pub ongoing: bool,
     /// Envelopes sitting in the member's outbox — what a prime would route.
     pub pending_outbox: usize,
     /// Envelopes delivered to the member and not yet turned into anything.
@@ -80,6 +85,7 @@ pub fn member_status(member: &TeamMember) -> MemberStatus {
     let paths = WorkspacePaths::new(&member.root);
     let exists = paths.is_initialized();
     let workflow = if exists { load_workflow(&paths.workflow_file()).ok() } else { None };
+    let staged = workflow.as_ref().filter(|w| !w.is_ongoing());
 
     MemberStatus {
         workspace_id: member.workspace_id.clone(),
@@ -89,11 +95,12 @@ pub fn member_status(member: &TeamMember) -> MemberStatus {
         team_module_on: exists
             && get_modules(&paths).map(|m| m.is_enabled(MODULE_TEAM)).unwrap_or(false),
         task_counts: if exists { counts_for_dir(&paths.tasks_dir()).ok() } else { None },
-        current_phase: workflow.as_ref().map(|w| w.state.current_phase.clone()),
-        current_phase_title: workflow.as_ref().and_then(|w| {
+        current_phase: staged.map(|w| w.state.current_phase.clone()),
+        current_phase_title: staged.and_then(|w| {
             w.phases.iter().find(|p| p.id == w.state.current_phase).map(|p| p.title.clone())
         }),
-        workflow_completed: workflow.map(|w| w.state.completed).unwrap_or(false),
+        workflow_completed: staged.map(|w| w.state.completed).unwrap_or(false),
+        ongoing: workflow.map(|w| w.is_ongoing()).unwrap_or(false),
         pending_outbox: count_box(&paths, exists, DeliveryBox::Outbox),
         inbox_count: count_box(&paths, exists, DeliveryBox::Inbox),
     }
@@ -237,6 +244,9 @@ mod tests {
             domain: "coding".into(),
             modules: vec![MODULE_TEAM.into()],
             create_root: true,
+            // Staged, so a summary has a phase to show; the ongoing case is
+            // asserted where it matters.
+            mode: Some(crate::workspace::workflow::WorkflowMode::Staged),
             ..Default::default()
         };
         let ctx = initialize_project(&params, &StaticKeyProvider([7u8; 32]), "0.1.0").unwrap();
@@ -267,6 +277,7 @@ mod tests {
                 "exists",
                 "inboxCount",
                 "name",
+                "ongoing",
                 "pendingOutbox",
                 "root",
                 "taskCounts",
@@ -276,6 +287,20 @@ mod tests {
             ],
             "a prime sees counts and phase — never task bodies, decisions or ledger lines"
         );
+
+        // An ongoing member (D171) has no phase to report, so the two phase
+        // fields drop out instead of reading as "stuck in phase 1".
+        crate::workspace::workflow::set_mode(
+            &WorkspacePaths::new(&member.root),
+            "0.1.0",
+            crate::workspace::workflow::WorkflowMode::Ongoing,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let ongoing = serde_json::to_value(member_status(&member)).unwrap();
+        assert_eq!(ongoing["ongoing"], true);
+        assert!(ongoing.get("currentPhase").is_none() && ongoing.get("currentPhaseTitle").is_none());
 
         // taskCounts is the one nested object; it must be numbers only.
         let counts = json.get("taskCounts").unwrap().as_object().unwrap();

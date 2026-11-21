@@ -33,6 +33,14 @@ use crate::workspace::tasks::{Task, TaskStatus};
 pub const CLAUDE_MD_MAX_BYTES: u64 = 20 * 1024;
 /// A handoff older than this while open tasks exist is treated as stale.
 pub const HANDOFF_STALE_DAYS: i64 = 7;
+/// A phase whose exit gates all pass and that has not advanced for this long
+/// is reported (D169). A week, like the handoff: long enough that nobody is
+/// mid-way through advancing it, short enough to beat the 26 days an external
+/// workspace sat in its first phase with the gate already passed.
+pub const PHASE_READY_IDLE_DAYS: i64 = 7;
+/// An in-progress task untouched for this long is reported (D169): someone
+/// claimed it and stopped, and every takeover surface still lists it first.
+pub const TASK_STALLED_DAYS: i64 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +113,9 @@ pub fn run_doctor_at(root: &Path, now: DateTime<Utc>) -> Result<DoctorReport> {
         check_shipped_assets(&paths, &mut findings);
         check_exchange(&paths, &mut findings);
         check_specs(&paths, &mut findings)?;
+        // Last: a `doctor_clean` gate in the current phase reads the verdict
+        // every other check has reached, and this one only ever warns.
+        check_stalls(&paths, now, &mut findings)?;
     }
 
     let errors = findings.iter().filter(|f| f.severity == DoctorSeverity::Error).count();
@@ -469,6 +480,28 @@ fn check_task_files(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -
             }
         }
     }
+    // A cancelled prerequisite never completes (D169), so an open task that
+    // still points at one can never start. Not an error — the graph is
+    // intact, and re-pointing it is one `edit_task` away — but nothing else
+    // says so until someone tries to start it.
+    let cancelled: std::collections::HashSet<&str> = parsed
+        .iter()
+        .filter(|t| t.status == TaskStatus::Cancelled)
+        .map(|t| t.id.as_str())
+        .collect();
+    for task in parsed.iter().filter(|t| !t.status.is_closed()) {
+        for dep in task.depends_on.iter().filter(|d| cancelled.contains(d.as_str())) {
+            findings.push(finding(
+                "cancelled_dependency",
+                DoctorSeverity::Warning,
+                format!("tasks/{}.json", task.id),
+                format!(
+                    "depends on {dep}, which was cancelled — it will never unlock; point its \
+                     dependsOn at whatever replaced {dep}"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -629,7 +662,10 @@ fn check_specs(paths: &WorkspacePaths, findings: &mut Vec<DoctorFinding>) -> Res
 
     // A corrupt task file is check_task_files' finding, not a doctor crash.
     let Ok(tasks) = TaskStore::new(paths.tasks_dir()).list() else { return Ok(()) };
-    for task in &tasks {
+    // A cancelled task's deltas never fold (D169): they are left in its folder
+    // as a record and are no longer a proposal, so nothing below applies —
+    // least of all "unarchive and re-archive to fold them", which cannot work.
+    for task in tasks.iter().filter(|t| t.status != TaskStatus::Cancelled) {
         let rel = format!("tasks/{}/specs/", task.id);
         let deltas = match specs::read_task_deltas(paths, &task.id) {
             Ok(deltas) => deltas,
@@ -883,7 +919,7 @@ fn check_handoff(
     let age_days = (now - generated.with_timezone(&Utc)).num_days();
     if age_days >= HANDOFF_STALE_DAYS {
         let tasks = crate::workspace::tasks::TaskStore::new(paths.tasks_dir()).list()?;
-        let open = tasks.iter().filter(|t| t.status != TaskStatus::Done).count();
+        let open = tasks.iter().filter(|t| !t.status.is_closed()).count();
         if open > 0 {
             findings.push(finding(
                 "handoff_stale",
@@ -892,6 +928,56 @@ fn check_handoff(
                 format!(
                     "handoff snapshot is {age_days} days old while {open} task(s) are \
                      still open — regenerate it so the next session starts from reality"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Work that stopped moving (D169). Both checks read the state the engine
+/// already keeps — the phase history and the task's own `updatedAt` — and
+/// neither blocks a gate: they are warnings, the same tier as a stale handoff.
+fn check_stalls(
+    paths: &WorkspacePaths,
+    now: DateTime<Utc>,
+    findings: &mut Vec<DoctorFinding>,
+) -> Result<()> {
+    let days_since = |at: &str| {
+        DateTime::parse_from_rfc3339(at).ok().map(|t| (now - t.with_timezone(&Utc)).num_days())
+    };
+    // A malformed workflow.json is somebody else's finding; a missing one
+    // means there is no phase to be stuck in.
+    let errors = findings.iter().filter(|f| f.severity == DoctorSeverity::Error).count();
+    let warnings = findings.len() - errors;
+    if let Ok(Some(ws)) = crate::workspace::workflow::try_evaluate_for_doctor(paths, errors, warnings) {
+        if ws.can_advance {
+            if let Some(at) = ws.current_phase_entered_at() {
+                if let Some(days) = days_since(&at).filter(|d| *d >= PHASE_READY_IDLE_DAYS) {
+                    findings.push(finding(
+                        "phase_ready_idle",
+                        DoctorSeverity::Warning,
+                        ".nextup/workflow.json",
+                        format!(
+                            "phase «{}» was entered {days} days ago and every exit gate passes, \
+                             but it has not advanced — advance it, or record why it is waiting",
+                            ws.current_phase_title()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let tasks = crate::workspace::tasks::TaskStore::new(paths.tasks_dir()).list()?;
+    for task in tasks.iter().filter(|t| t.status == TaskStatus::InProgress) {
+        if let Some(days) = days_since(&task.updated_at).filter(|d| *d >= TASK_STALLED_DAYS) {
+            findings.push(finding(
+                "task_stalled",
+                DoctorSeverity::Warning,
+                format!("tasks/{}.json", task.id),
+                format!(
+                    "in progress with no change for {days} days — finish it, mark it blocked \
+                     with what it waits on, or put it back to todo"
                 ),
             ));
         }
@@ -916,6 +1002,9 @@ mod tests {
                 description: String::new(),
                 goals: vec![],
                 boundaries: vec![],
+                // Staged so the D169 phase checks have a phase to watch; the
+                // ongoing case has its own test.
+                mode: Some(crate::workspace::workflow::WorkflowMode::Staged),
                 ..Default::default()
             },
             &StaticKeyProvider([9u8; 32]),
@@ -1553,5 +1642,106 @@ mod tests {
             .find(|f| f.check == "spec_delta_orphan" && f.target.contains("T-9999"))
             .expect("ownerless bundle dir flagged");
         assert_eq!(orphan.severity, DoctorSeverity::Warning);
+    }
+
+    // ── Stalls and cancelled prerequisites (D169) ────────────────────────────
+
+    #[test]
+    fn a_ready_phase_left_alone_and_a_stalled_task_are_reported() {
+        let (_g, paths) = managed_workspace();
+        let t = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "claimed and left".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        crate::workspace::ops::update_task_status(&paths, "0.0.0-test", &t.id, TaskStatus::InProgress, None).unwrap();
+
+        // Today: the plan gate (min_tasks 1) passes, but nothing is old yet.
+        let today = run_doctor(paths.root()).unwrap();
+        assert!(!checks_of(&today).contains(&"phase_ready_idle"));
+        assert!(!checks_of(&today).contains(&"task_stalled"));
+
+        let later = Utc::now() + chrono::Duration::days(20);
+        let report = run_doctor_at(paths.root(), later).unwrap();
+        let checks = checks_of(&report);
+        assert!(checks.contains(&"phase_ready_idle"), "{checks:?}");
+        assert!(checks.contains(&"task_stalled"), "{checks:?}");
+        assert!(report.is_clean(), "stalls warn, they never fail a gate");
+    }
+
+    /// An ongoing project has no phase to sit in (D171 ④): twenty days on,
+    /// only the task-level stall speaks.
+    #[test]
+    fn an_ongoing_project_reports_stalled_tasks_but_never_an_idle_phase() {
+        let (_g, paths) = managed_workspace();
+        crate::workspace::workflow::set_mode(
+            &paths,
+            "0.0.0-test",
+            crate::workspace::workflow::WorkflowMode::Ongoing,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let t = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "claimed and left".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        crate::workspace::ops::update_task_status(&paths, "0.0.0-test", &t.id, TaskStatus::InProgress, None).unwrap();
+
+        let later = Utc::now() + chrono::Duration::days(20);
+        let checks = checks_of(&run_doctor_at(paths.root(), later).unwrap()).join(",");
+        assert!(!checks.contains("phase_ready_idle"), "{checks}");
+        assert!(checks.contains("task_stalled"), "{checks}");
+    }
+
+    #[test]
+    fn an_open_task_on_a_cancelled_prerequisite_is_reported() {
+        let (_g, paths) = managed_workspace();
+        let old = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "old".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        let dependent = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "dependent".into(), depends_on: vec![old.id.clone()], ..Default::default() },
+        )
+        .unwrap();
+        crate::workspace::ops::update_task_status(&paths, "0.0.0-test", &old.id, TaskStatus::Cancelled, Some("x".into()))
+            .unwrap();
+        let report = run_doctor(paths.root()).unwrap();
+        let hit = report.findings.iter().find(|f| f.check == "cancelled_dependency").unwrap();
+        assert_eq!(hit.target, format!("tasks/{}.json", dependent.id));
+        assert_eq!(hit.severity, DoctorSeverity::Warning);
+    }
+
+    #[test]
+    fn a_cancelled_tasks_deltas_are_inert() {
+        let (_g, paths) = managed_workspace();
+        let t = crate::workspace::ops::create_task(
+            &paths,
+            "0.0.0-test",
+            NewTask { title: "abandoned".into(), priority: 1, ..Default::default() },
+        )
+        .unwrap();
+        let dir = paths.task_delta_specs_dir(&t.id).join("export");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("spec.md"),
+            "## ADDED Requirements\n\n### Requirement: X\nMUST.\n\n#### Scenario: s\n- **WHEN** a\n- **THEN** b\n",
+        )
+        .unwrap();
+        crate::workspace::ops::update_task_status(&paths, "0.0.0-test", &t.id, TaskStatus::Cancelled, Some("x".into()))
+            .unwrap();
+        crate::workspace::ops::set_task_archived(&paths, "0.0.0-test", &t.id, true).unwrap();
+
+        let report = run_doctor(paths.root()).unwrap();
+        assert!(!checks_of(&report).contains(&"spec_delta_orphan"), "{:?}", checks_of(&report));
+        assert!(crate::workspace::ops::pending_spec_folds(&paths).unwrap().is_empty());
     }
 }

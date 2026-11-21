@@ -252,6 +252,9 @@ fn gate_pulse(paths: &WorkspacePaths) -> Option<String> {
 }
 
 fn pulse_line(status: &workflow::WorkflowStatus) -> String {
+    if status.is_ongoing() {
+        return "ongoing — no phases or exit gates".into();
+    }
     if status.workflow.state.completed {
         return "workflow completed".into();
     }
@@ -448,7 +451,7 @@ impl Hub {
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksArgs {
-    /// Filter by status: todo | in_progress | blocked | done (omit = all)
+    /// Filter by status: todo | in_progress | blocked | done | cancelled (omit = all)
     #[serde(default)]
     pub status: Option<String>,
     /// Filter by assignee: an agent or person name; an empty string lists only unassigned (omit = all)
@@ -500,15 +503,21 @@ pub struct CreateTaskArgs {
     /// Prerequisite task ids (they must exist; this task cannot start or complete until all of them are done)
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// The task's own checklist, by step title, all unchecked (at most 50). Tick them with set_task_step
+    #[serde(default)]
+    pub steps: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTaskStatusArgs {
     pub id: String,
-    /// todo | in_progress | blocked | done
+    /// todo | in_progress | blocked | done | cancelled
     pub status: String,
-    /// Required when moving to blocked: what is blocking it
+    /// Required when moving to blocked (what is blocking it) or to cancelled (what replaced the task, or why it was dropped)
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Older name for reason, still accepted for blocked
     #[serde(default)]
     pub blocked_reason: Option<String>,
 }
@@ -549,6 +558,23 @@ pub struct EditTaskArgs {
     /// The complete new tag list (replaces it; [] clears it); omit to keep it
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// The complete new list of prerequisite task ids (replaces it; [] clears it); omit to keep it
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
+    /// The complete new checklist by step title (replaces it; [] clears it; a title already there keeps its checkmark); omit to keep it
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTaskStepArgs {
+    /// Task id, e.g. "T-0001"
+    pub id: String,
+    /// Which step, counting from 1 as the task lists them
+    pub step: usize,
+    /// true = done, false = not done
+    pub done: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -583,6 +609,39 @@ pub struct RecordDecisionArgs {
     /// this decision actually reverses a previous one.
     #[serde(default)]
     pub supersedes: Option<String>,
+    /// true = you took this on a default without asking (reversible, obvious default); it waits in the user's To decide page until they confirm or revise it, and it does not count toward a phase's decision gate
+    #[serde(default)]
+    pub provisional: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserArgs {
+    /// The question, answerable on its own; put the context a reader needs in the first line
+    pub question: String,
+    /// What you would do — offered to the user as the one-press answer
+    #[serde(default)]
+    pub recommendation: Option<String>,
+    /// Answer choices, when the question has a closed set (at most 10)
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Who should really answer, when it is not the user (e.g. "legal", "the vendor") — the user forwards it
+    #[serde(default)]
+    pub ask: Option<String>,
+    /// Ids of the tasks this question holds up
+    #[serde(default)]
+    pub blocks: Vec<String>,
+    /// What you will proceed on if nobody answers
+    #[serde(default)]
+    pub default_answer: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListQuestionsArgs {
+    /// true = every question, answered and withdrawn ones included; default = the open ones plus answers you have not read yet
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -714,10 +773,10 @@ pub struct TeamMemberTasksArgs {
     pub team_id: String,
     /// workspaceId of the member whose tasks you want to read
     pub workspace_id: String,
-    /// Filter by status: todo | in_progress | blocked | done. Omit for all of them
+    /// Filter by status: todo | in_progress | blocked | done | cancelled. Omit for all of them
     #[serde(default)]
     pub status: Option<String>,
-    /// Include archived tasks (default false — archived means done and folded away)
+    /// Include archived tasks (default false — archived means closed (done, or cancelled) and filed away)
     #[serde(default)]
     pub include_archived: bool,
 }
@@ -753,7 +812,7 @@ pub struct TeamArchiveTaskArgs {
     pub team_id: String,
     /// workspaceId of the member holding the task
     pub workspace_id: String,
-    /// Task id to archive, e.g. T-0007. It must already be done
+    /// Task id to archive, e.g. T-0007. It must already be done (a cancelled task is refused)
     pub task_id: String,
 }
 
@@ -848,7 +907,7 @@ pub struct UpgradeAssetsArgs {
 impl Hub {
     #[tool(
         name = "workspace_status",
-        description = "Workspace overview: project context (goals, boundaries, milestones), task statistics and the current phase. Call this first when you arrive."
+        description = "Workspace overview: project context (goals, boundaries, milestones), task statistics and the workflow (its mode — ongoing or staged — and, staged, the current phase). Call this first when you arrive."
     )]
     async fn workspace_status(&self) -> Result<CallToolResult, McpError> {
         self.dispatch("workspace_status", ops::workspace_summary).await
@@ -865,7 +924,7 @@ impl Hub {
         self.dispatch("list_tasks", move |paths| {
             let mut tasks = TaskStore::new(paths.tasks_dir()).list()?;
             // Readiness first, against every file: a dependency may point at
-            // an archived task, and archived means done.
+            // an archived task — done (satisfied) or cancelled (never, D169).
             if args.ready {
                 let ready: Vec<String> = tasks
                     .iter()
@@ -907,7 +966,7 @@ impl Hub {
 
     #[tool(
         name = "create_task",
-        description = "Create a task. This also writes to the ledger and regenerates the handoff layer (the handoff snapshot and the CLAUDE.md state block)."
+        description = "Create a task. This also writes to the ledger and regenerates the handoff layer (the handoff snapshot and the AGENTS.md state block)."
     )]
     async fn create_task(
         &self,
@@ -924,6 +983,7 @@ impl Hub {
                     tags: args.tags,
                     assignee: args.assignee,
                     depends_on: args.depends_on,
+                    steps: args.steps,
                 },
             )
         })
@@ -932,7 +992,7 @@ impl Hub {
 
     #[tool(
         name = "update_task_status",
-        description = "Change a task's status. Moving to blocked requires blockedReason. Every change regenerates the handoff snapshot. Note that done is only a claim of completion — once you have actually tested it, mark it verified separately with set_task_verification. Returns a compact result (the task plus a one-line exit-gate summary); call generate_handoff for the full snapshot."
+        description = "Change a task's status. Moving to blocked or cancelled requires reason. Use cancelled, not done, for work that will not happen — superseded, dropped, overtaken: it leaves progress and the next steps, and a task that depends on it will not unlock (point that task's dependsOn elsewhere with edit_task). Every change regenerates the handoff snapshot. Note that done is only a claim of completion — once you have actually tested it, mark it verified separately with set_task_verification. Returns a compact result (the task plus a one-line exit-gate summary); call generate_handoff for the full snapshot."
     )]
     async fn update_task_status(
         &self,
@@ -940,8 +1000,8 @@ impl Hub {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("update_task_status", move |paths| {
             let status: TaskStatus = args.status.parse()?;
-            let update =
-                ops::update_task_status(paths, APP_VERSION, &args.id, status, args.blocked_reason)?;
+            let reason = args.reason.or(args.blocked_reason);
+            let update = ops::update_task_status(paths, APP_VERSION, &args.id, status, reason)?;
             Ok(TaskWriteResult::new(paths, update))
         })
         .await
@@ -965,7 +1025,7 @@ impl Hub {
 
     #[tool(
         name = "edit_task",
-        description = "Change a task's title, description, priority or tags after it was created. Only the fields you pass change; tags, when passed, replaces the whole list. Status, verification, assignee and dependencies are not edited here — each has its own tool and rules. Editing does not clear a verification: fix wording freely, but if the substance of the work changed, that is a new task. Writes to the ledger (what changed), regenerates the handoff layer and returns a compact result."
+        description = "Change a task's title, description, priority, tags, dependencies or step list after it was created. Only the fields you pass change; tags, dependsOn and steps, when passed, replace the whole list (an unknown id, a self-dependency or a cycle is refused). Status, verification and assignee are not edited here — each has its own tool and rules. Editing does not clear a verification: fix wording freely, but if the substance of the work changed, that is a new task. Writes to the ledger (what changed), regenerates the handoff layer and returns a compact result."
     )]
     async fn edit_task(
         &self,
@@ -981,8 +1041,25 @@ impl Hub {
                     description: args.description,
                     priority: args.priority,
                     tags: args.tags,
+                    depends_on: args.depends_on,
+                    steps: args.steps,
                 },
             )?;
+            Ok(TaskWriteResult::new(paths, update))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "set_task_step",
+        description = "Tick or untick one step of a task's checklist (steps are numbered from 1 in the order the task lists them). Steps describe how the work breaks down: ticking every one does not mark the task done, and unticking one does not reopen it — status, verification and gates are untouched. Writes to the ledger, regenerates the handoff layer (next steps show each task's step count) and returns a compact result."
+    )]
+    async fn set_task_step(
+        &self,
+        Parameters(args): Parameters<SetTaskStepArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch("set_task_step", move |paths| {
+            let update = ops::set_task_step(paths, APP_VERSION, &args.id, args.step, args.done)?;
             Ok(TaskWriteResult::new(paths, update))
         })
         .await
@@ -1030,16 +1107,62 @@ impl Hub {
 
     #[tool(
         name = "record_decision",
-        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. Each decision is given an id (D-0001) shown beside it in the handoff snapshot. When this decision reverses an earlier one, pass that decision's id as `supersedes`: the old decision is kept in the record but marked SUPERSEDED, so a later session can see it was made and that it no longer holds. Reversing an earlier decision without saying so is how a workspace ends up acting on a decision nobody still stands behind. The handoff surface renders only the first line; the full text is kept in the ledger forever."
+        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. Each decision is given an id (D-0001) shown beside it in the handoff snapshot. When this decision reverses an earlier one, pass that decision's id as `supersedes`: the old decision is kept in the record but marked SUPERSEDED, so a later session can see it was made and that it no longer holds. Reversing an earlier decision without saying so is how a workspace ends up acting on a decision nobody still stands behind. Pass `provisional: true` when you took a reversible choice on an obvious default instead of asking: it goes to the user's To decide page for review and does not count toward a phase's decision gate. The handoff surface renders only the first line; the full text is kept in the ledger forever."
     )]
     async fn record_decision(
         &self,
         Parameters(args): Parameters<RecordDecisionArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("record_decision", move |paths| {
-            let event =
-                ops::add_decision(paths, APP_VERSION, &args.message, args.supersedes.as_deref())?;
+            let event = ops::add_decision_with(
+                paths,
+                APP_VERSION,
+                &args.message,
+                args.supersedes.as_deref(),
+                args.provisional,
+            )?;
             verbosity_checked(event)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "ask_user",
+        description = "Put a question in the user's To decide page instead of stopping to ask in the chat. Use it for what you cannot settle yourself and that can wait: carry on with other work, and read the answer later with list_questions (answered questions are also listed first in the handoff). Give your recommended answer, who should really answer if not the user, the tasks it holds up (mark those blocked yourself if they cannot proceed), and what you will assume if nobody answers. Ask in the chat only when you truly cannot continue without the answer. Writes a note to the ledger and regenerates the handoff layer; the user's answer is recorded as a decision."
+    )]
+    async fn ask_user(
+        &self,
+        Parameters(args): Parameters<AskUserArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = self.agent.clone();
+        self.dispatch("ask_user", move |paths| {
+            ops::ask_user(
+                paths,
+                APP_VERSION,
+                nextup_core::workspace::questions::NewQuestion {
+                    question: args.question,
+                    recommendation: args.recommendation,
+                    options: args.options,
+                    ask: args.ask,
+                    blocks: args.blocks,
+                    default_answer: args.default_answer,
+                },
+                actor,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "list_questions",
+        description = "Read the questions in the user's To decide page: by default the open ones plus answers you have not read yet. Reading an answer here marks it read, so the handoff stops listing it — act on it (and update the tasks it held) in the same session."
+    )]
+    async fn list_questions(
+        &self,
+        Parameters(args): Parameters<ListQuestionsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch("list_questions", move |paths| {
+            ops::read_questions_as_agent(paths, APP_VERSION, args.all)
         })
         .await
     }
@@ -1090,7 +1213,7 @@ impl Hub {
 
     #[tool(
         name = "workflow_status",
-        description = "The full state of the execution harness: the phase list, the exit-gate evaluation for the current phase, and whether it can advance."
+        description = "The full state of the execution harness: its mode (staged or ongoing), the phase list, the exit-gate evaluation for the current phase, and whether it can advance. An ongoing project has no phases to advance and no gates — follow its ongoingInstructions."
     )]
     async fn workflow_status(&self) -> Result<CallToolResult, McpError> {
         self.dispatch("workflow_status", |paths| workflow::try_evaluate(paths)).await
@@ -1098,7 +1221,7 @@ impl Hub {
 
     #[tool(
         name = "advance_phase",
-        description = "Advance to the next phase. Every exit gate must pass, otherwise this fails and lists the gates that did not. Forcing an advance (override) is available only to a human in the GUI. Returns a compact result — the new phase with its aiInstructions and a one-line exit-gate summary; call workflow_status for the full picture across all phases."
+        description = "Advance to the next phase of a staged project. Every exit gate must pass, otherwise this fails and lists the gates that did not; an ongoing project has no phases and always refuses. Forcing an advance (override) is available only to a human in the GUI. Returns a compact result — the new phase with its aiInstructions and a one-line exit-gate summary; call workflow_status for the full picture across all phases."
     )]
     async fn advance_phase(&self) -> Result<CallToolResult, McpError> {
         self.dispatch("advance_phase", |paths| {
@@ -1217,7 +1340,7 @@ impl Hub {
 
     #[tool(
         name = "generate_handoff",
-        description = "Regenerate the handoff snapshot immediately (latest_handoff.md and the CLAUDE.md state block). The snapshot is already regenerated after every state change, so this is for wrapping up a session, or for refreshing after something that changed no state — editing rules.json by hand after a post-mortem, for instance. Returns the full snapshot."
+        description = "Regenerate the handoff snapshot immediately (latest_handoff.md and the AGENTS.md state block). The snapshot is already regenerated after every state change, so this is for wrapping up a session, or for refreshing after something that changed no state — editing rules.json by hand after a post-mortem, for instance. Returns the full snapshot."
     )]
     async fn generate_handoff(&self) -> Result<CallToolResult, McpError> {
         // dispatch_text: the snapshot is markdown for the agent to read —
@@ -1364,7 +1487,7 @@ impl Hub {
 
     #[tool(
         name = "team_overview",
-        description = "List the teams this workspace is the prime of (prime module): members, the delivery flow between them, and each member's status summary — task counts, current phase, and how many envelopes wait in its outbox and inbox. This is the whole picture you coordinate from. You see counts and phase, never the members' task text, decisions or ledgers: when you need detail, ask that project to publish a delivery — deciding what to share is its call, not yours."
+        description = "List the teams this workspace is the prime of (prime module): members, the delivery flow between them, and each member's status summary — task counts, current phase (or that it runs ongoing), and how many envelopes wait in its outbox and inbox. This is the whole picture you coordinate from. You see counts and phase, never the members' task text, decisions or ledgers: when you need detail, ask that project to publish a delivery — deciding what to share is its call, not yours."
     )]
     async fn team_overview(&self) -> Result<CallToolResult, McpError> {
         let app_dir = self.app_dir.clone();
@@ -1390,7 +1513,7 @@ impl Hub {
 
     #[tool(
         name = "team_member_status",
-        description = "Status summary for one member of a team you are the prime of (prime module): task counts, current phase, mailbox sizes, and whether it has the team module on. Counts only — no task text, no decisions, no ledger lines."
+        description = "Status summary for one member of a team you are the prime of (prime module): task counts, current phase (or that it runs ongoing), mailbox sizes, and whether it has the team module on. Counts only — no task text, no decisions, no ledger lines."
     )]
     async fn team_member_status(
         &self,
@@ -1520,6 +1643,16 @@ impl Hub {
             let (_, team) = primed(paths, app_dir.as_ref(), &args.team_id)?;
             let member = find_member(&team, &args.workspace_id)?;
             let member_paths = prime::member_paths(member)?;
+            // The sign-off is for finished work. D169 let a user file a
+            // cancelled task away too, through the same archive call; that
+            // stays the user's, as the description above says.
+            let status = TaskStore::new(member_paths.tasks_dir()).get(&args.task_id)?.status;
+            if status != TaskStatus::Done {
+                return Err(nextup_core::NextUpError::InvalidInput(format!(
+                    "{} is not done — a prime archives only finished work; a cancelled task is filed away by the user in the app",
+                    args.task_id
+                )));
+            }
             // The ambient ActorScope is already this agent, so the member's own
             // ledger lines for the archive and the fold carry the same
             // attribution a routed delivery does — no extra plumbing needed.
@@ -1718,7 +1851,7 @@ impl Hub {
 
     #[tool(
         name = "team_create_member",
-        description = "Create a brand-new project and join it to a team you are the prime of, in one step (prime module) — for when the work needs a home that does not exist yet. The folder must not exist: this never adopts an existing directory. The new project starts empty with its own workflow, ledger and inbox; nobody works in it until an agent is pointed at it."
+        description = "Create a brand-new project and join it to a team you are the prime of, in one step (prime module) — for when the work needs a home that does not exist yet. The folder must not exist: this never adopts an existing directory. The new project starts empty with its own workflow, ledger and inbox, and runs ongoing — no phases or gates — like any project created in the app. Nobody works in it until an agent is pointed at it."
     )]
     async fn team_create_member(
         &self,
@@ -1833,7 +1966,7 @@ impl Hub {
 
     #[tool(
         name = "workspace_doctor",
-        description = "Read-only health check of the workspace documents: broken links, an oversized CLAUDE.md, marker blocks, task files that still parse, a stale handoff, outdated engine material. error means the handoff mechanism is broken and needs fixing; warning means a health risk."
+        description = "Read-only health check of the workspace documents: broken links, an oversized AGENTS.md, marker blocks, task files that still parse, a stale handoff, outdated engine material, plus warnings for tasks or a ready phase left untouched for days and prerequisites that were cancelled. error means the handoff mechanism is broken and needs fixing; warning means a health risk."
     )]
     async fn workspace_doctor(&self) -> Result<CallToolResult, McpError> {
         self.dispatch("workspace_doctor", |paths| doctor::run_doctor(paths.root())).await
@@ -1997,6 +2130,9 @@ mod tests {
                 description: String::new(),
                 goals: vec![],
                 boundaries: vec![],
+                // Staged: several tests here walk the phase tools. The
+                // ongoing default (D171) has its own test below.
+                mode: Some(nextup_core::workspace::workflow::WorkflowMode::Staged),
                 ..Default::default()
             },
             &StaticKeyProvider([7u8; 32]),
@@ -2205,6 +2341,116 @@ mod tests {
         server.abort();
     }
 
+    /// D170 over the wire: a question goes into the queue, the person's answer
+    /// comes back through list_questions exactly once, and a provisional
+    /// decision is marked as such.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_user_round_trips_and_provisional_decisions_are_marked() {
+        let (_guard, paths) = workspace();
+        for tool in ["ask_user", "record_decision"] {
+            agent::set_tool_allowed(&paths, tool, true).unwrap();
+        }
+        let client = serve_as(&paths, Some("agent-a")).await;
+        let asked = call(
+            &client,
+            "ask_user",
+            json!({ "question": "Which rounding?", "recommendation": "once at the end", "ask": "legal" }),
+        )
+        .await;
+        assert_ne!(asked.is_error, Some(true), "got: {}", text_of(&asked));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&asked)).unwrap();
+        assert_eq!(body["id"], "Q-0001");
+        assert_eq!(body["askedBy"], "agent-a");
+
+        ops::answer_question(&paths, "0.1.0", "Q-0001", "once at the end").unwrap();
+        let first = call(&client, "list_questions", json!({})).await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&first)).unwrap();
+        assert_eq!(body[0]["answer"], "once at the end");
+        let again = call(&client, "list_questions", json!({})).await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&again)).unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 0, "an answer is picked up once");
+
+        let provisional = call(
+            &client,
+            "record_decision",
+            json!({ "message": "Assumed 1.0's rounding", "provisional": true }),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&provisional)).unwrap();
+        assert_eq!(body["provisional"], true, "got: {body}");
+    }
+
+    /// D170 over the wire: steps arrive with create_task, change with
+    /// edit_task and tick with set_task_step — and none of it moves status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steps_ride_create_edit_and_set_task_step() {
+        let (_guard, paths) = workspace();
+        for tool in ["create_task", "edit_task", "set_task_step"] {
+            agent::set_tool_allowed(&paths, tool, true).unwrap();
+        }
+        let client = serve_as(&paths, None).await;
+        call(&client, "create_task", json!({ "title": "section", "steps": ["draft", "review"] })).await;
+        let ticked = call(&client, "set_task_step", json!({ "id": "T-0001", "step": 2, "done": true })).await;
+        assert_ne!(ticked.is_error, Some(true), "got: {}", text_of(&ticked));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&ticked)).unwrap();
+        assert_eq!(body["task"]["steps"][1]["done"], true);
+        assert_eq!(body["task"]["status"], "todo");
+
+        let edited = call(&client, "edit_task", json!({ "id": "T-0001", "steps": ["draft", "review", "sign-off"] })).await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&edited)).unwrap();
+        assert_eq!(body["task"]["steps"][1]["done"], true, "review keeps its checkmark");
+        assert_eq!(body["task"]["steps"].as_array().unwrap().len(), 3);
+
+        let out_of_range = call(&client, "set_task_step", json!({ "id": "T-0001", "step": 9, "done": true })).await;
+        assert_eq!(out_of_range.is_error, Some(true));
+    }
+
+    /// D169 over the wire: `cancelled` takes `reason` (the old `blockedReason`
+    /// still works for blocked), and `edit_task` can re-point a dependency —
+    /// the one way out for a task left waiting on a cancelled prerequisite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_takes_a_reason_and_edit_task_repoints_dependencies() {
+        let (_guard, paths) = workspace();
+        for tool in ["create_task", "update_task_status", "edit_task"] {
+            agent::set_tool_allowed(&paths, tool, true).unwrap();
+        }
+        let client = serve_as(&paths, None).await;
+        call(&client, "create_task", json!({ "title": "old plan" })).await;
+        call(&client, "create_task", json!({ "title": "new plan" })).await;
+        call(&client, "create_task", json!({ "title": "follow-up", "dependsOn": ["T-0001"] })).await;
+
+        let bare = call(&client, "update_task_status", json!({ "id": "T-0001", "status": "cancelled" })).await;
+        assert_eq!(bare.is_error, Some(true), "a cancellation without a reason is refused");
+
+        let cancelled = call(
+            &client,
+            "update_task_status",
+            json!({ "id": "T-0001", "status": "cancelled", "reason": "replaced by T-0002" }),
+        )
+        .await;
+        assert_ne!(cancelled.is_error, Some(true), "got: {}", text_of(&cancelled));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&cancelled)).unwrap();
+        assert_eq!(body["task"]["status"], "cancelled");
+        assert_eq!(body["task"]["cancelReason"], "replaced by T-0002");
+
+        let stuck = call(&client, "update_task_status", json!({ "id": "T-0003", "status": "in_progress" })).await;
+        assert_eq!(stuck.is_error, Some(true));
+        assert!(text_of(&stuck).contains("cancelled"), "got: {}", text_of(&stuck));
+
+        let repointed = call(&client, "edit_task", json!({ "id": "T-0003", "dependsOn": ["T-0002"] })).await;
+        assert_ne!(repointed.is_error, Some(true), "got: {}", text_of(&repointed));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&repointed)).unwrap();
+        assert_eq!(body["task"]["dependsOn"], json!(["T-0002"]));
+
+        let old_name = call(
+            &client,
+            "update_task_status",
+            json!({ "id": "T-0002", "status": "blocked", "blockedReason": "waiting on review" }),
+        )
+        .await;
+        assert_ne!(old_name.is_error, Some(true), "blockedReason must keep working: {}", text_of(&old_name));
+    }
+
     /// D78: the progress channel writes its own kind, and a verbose
     /// decision/progress entry succeeds but carries a soft warning — the
     /// agent hears about the first-line-only lens while it can still adjust.
@@ -2300,6 +2546,43 @@ mod tests {
         let refused = call(&client, "advance_phase", json!({})).await;
         assert_eq!(refused.is_error, Some(true));
         assert!(text_of(&refused).contains("exit gates not satisfied"));
+
+        client.cancel().await.unwrap();
+    }
+
+    /// An ongoing project (D171) has nothing to advance: the hub says so and
+    /// tells the agent what to do instead, and workflow_status reports the
+    /// mode and the working instructions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ongoing_project_refuses_to_advance_and_reports_its_mode() {
+        let (_guard, paths) = workspace();
+        nextup_core::workspace::workflow::set_mode(
+            &paths,
+            "0.0.0-test",
+            nextup_core::workspace::workflow::WorkflowMode::Ongoing,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        agent::set_tool_allowed(&paths, "advance_phase", true).unwrap();
+        let client = serve_as(&paths, None).await;
+
+        let refused = call(&client, "advance_phase", json!({})).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(text_of(&refused).contains("runs ongoing"), "got: {}", text_of(&refused));
+
+        let status = call(&client, "workflow_status", json!({})).await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&status)).unwrap();
+        assert_eq!(body["workflow"]["mode"], "ongoing");
+        assert!(!body["workflow"]["ongoingInstructions"].as_array().unwrap().is_empty());
+        assert_eq!(body["canAdvance"], false);
+
+        // The overview an agent reads first reports no position (review W1).
+        let summary = call(&client, "workspace_status", json!({})).await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&summary)).unwrap();
+        assert_eq!(body["workflow"]["mode"], "ongoing");
+        assert!(body["workflow"].get("phase").is_none(), "got: {}", body["workflow"]);
+        assert!(body["workflow"].get("currentPhase").is_none());
 
         client.cancel().await.unwrap();
     }
@@ -2513,6 +2796,42 @@ mod tests {
             text_of(&outside).contains("not the prime"),
             "authority is per team, not per machine"
         );
+
+        client.cancel().await.unwrap();
+    }
+
+    /// The prime's sign-off covers finished work only: D169 widened the
+    /// archive call to cancelled tasks for the user, and that must not leak
+    /// into what a prime may do in someone else's project.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prime_archives_done_tasks_but_not_cancelled_ones() {
+        let (dir, boss, team_id, worker_id) = primed_team();
+        let app = dir.path().join("app");
+        let worker = WorkspacePaths::new(dir.path().join("worker"));
+        let client = serve_prime(&boss, &app).await;
+        agent::set_tool_allowed(&boss, "team_archive_task", true).unwrap();
+
+        let dropped = ops::create_task(&worker, "0.0.0-test", NewTask { title: "dropped".into(), ..Default::default() })
+            .unwrap();
+        ops::update_task_status(&worker, "0.0.0-test", &dropped.id, TaskStatus::Cancelled, Some("overtaken".into()))
+            .unwrap();
+        let refused =
+            call(&client, "team_archive_task", json!({ "teamId": team_id, "workspaceId": worker_id, "taskId": dropped.id }))
+                .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(text_of(&refused).contains("not done"), "{}", text_of(&refused));
+        let store = TaskStore::new(worker.tasks_dir());
+        assert!(!store.get(&dropped.id).unwrap().archived, "the cancelled task stays where the user can see it");
+
+        let shipped = ops::create_task(&worker, "0.0.0-test", NewTask { title: "shipped".into(), ..Default::default() })
+            .unwrap();
+        ops::update_task_status(&worker, "0.0.0-test", &shipped.id, TaskStatus::Done, None).unwrap();
+        ops::set_task_verification(&worker, "0.0.0-test", &shipped.id, true, Some("ran it".into())).unwrap();
+        let signed =
+            call(&client, "team_archive_task", json!({ "teamId": team_id, "workspaceId": worker_id, "taskId": shipped.id }))
+                .await;
+        assert_ne!(signed.is_error, Some(true), "{}", text_of(&signed));
+        assert!(store.get(&shipped.id).unwrap().archived);
 
         client.cancel().await.unwrap();
     }

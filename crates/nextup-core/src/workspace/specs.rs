@@ -1382,9 +1382,11 @@ pub fn dry_run_task_specs(paths: &WorkspacePaths, task_id: &str) -> Result<TaskS
     if deltas.is_empty() {
         return Ok(report);
     }
+    // A cancelled task's bundle never folds (D169), so it overlaps nothing.
     let others: Vec<(String, bool)> = crate::workspace::tasks::TaskStore::new(paths.tasks_dir())
         .list()?
         .into_iter()
+        .filter(|t| t.status != crate::workspace::tasks::TaskStatus::Cancelled)
         .map(|t| (t.id, t.spec_folded_at.is_some()))
         .collect();
     report.overlaps = cross_task_overlaps(paths, task_id, &others)?;

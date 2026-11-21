@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { dashParts, failedPhaseId } from "./model";
+import { dashParts, failedPhaseId, instructionLines, ongoingOrNone } from "./model";
 
 // No CJK in source outside i18n.ts (D81's publish scan): the helpers are
 // character-agnostic, so Latin stand-ins carry the cases; the one CJK-specific
@@ -25,6 +25,23 @@ describe("failedPhaseId", () => {
   it("is null for refusals about the template as a whole", () => {
     expect(failedPhaseId("template id cannot be empty")).toBeNull();
     expect(failedPhaseId("'coding-v1' is a built-in template id")).toBeNull();
+  });
+});
+
+describe("instructionLines", () => {
+  it("trims each line and drops the blank ones", () => {
+    expect(instructionLines(["  Work the tasks ", "", "   ", "Ship it"])).toEqual(["Work the tasks", "Ship it"]);
+  });
+});
+
+describe("ongoingOrNone", () => {
+  it("keeps the lines when there are any", () => {
+    expect(ongoingOrNone(["Work the tasks"])).toEqual(["Work the tasks"]);
+  });
+
+  it("is absent when there are none, so the template runs staged only", () => {
+    expect(ongoingOrNone([])).toBeUndefined();
+    expect(ongoingOrNone(instructionLines(["", "  "]))).toBeUndefined();
   });
 });
 

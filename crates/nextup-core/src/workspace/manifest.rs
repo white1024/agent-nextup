@@ -63,6 +63,18 @@ provides: []
     )
 }
 
+/// What `project.yaml`'s `phase:` line says: `ongoing` for a project with no
+/// phases (D171), `complete` for a finished staged one, else the phase title.
+pub(crate) fn phase_field(ws: &WorkflowStatus) -> String {
+    if ws.is_ongoing() {
+        "ongoing".to_string()
+    } else if ws.workflow.state.completed {
+        "complete".to_string()
+    } else {
+        ws.current_phase_title()
+    }
+}
+
 /// Replace only the top-level `phase:` / `progress:` / `updated:` lines,
 /// leaving every other line (including comments and hand edits) untouched.
 pub(crate) fn sync_manifest(
@@ -74,19 +86,8 @@ pub(crate) fn sync_manifest(
     if !path.is_file() {
         return Ok(());
     }
-    let counts = compute_counts(tasks);
-    let progress = if counts.total == 0 {
-        0
-    } else {
-        (counts.done * 100) / counts.total
-    };
-    let phase = workflow.map(|ws| {
-        if ws.workflow.state.completed {
-            "complete".to_string()
-        } else {
-            ws.current_phase_title()
-        }
-    });
+    let progress = compute_counts(tasks).progress_percent();
+    let phase = workflow.map(phase_field);
 
     let content = std::fs::read_to_string(&path)?;
     let mut changed = false;

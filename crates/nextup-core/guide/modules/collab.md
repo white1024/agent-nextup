@@ -18,7 +18,7 @@ If you cannot claim a task, do not use `assign_task` to put yourself on it — t
 
 ## Dependencies and waves
 
-A task cannot start or complete until every entry in `dependsOn` is `done` (main guide §2). When blocked, the error kind is `dependencies_unmet` and carries `blockingTasks[]` (each `{id, status}`) — decide which task to wait on from the fields, without parsing the message.
+A task cannot start or complete until every entry in `dependsOn` is `done` (main guide §2). When blocked, the error kind is `dependencies_unmet` and carries `blockingTasks[]` (each `{id, status}`) — decide which task to wait on from the fields, without parsing the message. A prerequisite whose status is `cancelled` will never be done: re-point `dependsOn` with `edit_task` instead of waiting.
 
 When planning parallel work, make tasks within a wave independent of each other and dependent only on the previous wave. When a dependency blocks you, look at that task's status first rather than routing around the check.
 

@@ -40,13 +40,15 @@ pub struct HandoffInput<'a> {
     pub progress: &'a [LedgerEvent],
     /// Live harness status; `None` for legacy workspaces without workflow.json.
     pub workflow: Option<&'a WorkflowStatus>,
+    /// Questions and provisional decisions waiting on the person (D170).
+    pub asks: &'a crate::workspace::questions::AskSummary,
     pub app_version: &'a str,
     pub generated_at: String,
 }
 
 /// Regenerate every takeover surface and return the fresh snapshot markdown.
 /// The name is historical shorthand — this writes the snapshot, ledgers it
-/// AND refreshes the CLAUDE.md state block + manifest. It is a thin alias for
+/// AND refreshes the AGENTS.md state block + manifest. It is a thin alias for
 /// [`crate::workspace::sync::sync_after_mutation`]; see that module for the
 /// full contract.
 pub fn generate_handoff(paths: &WorkspacePaths, app_version: &str) -> Result<String> {
@@ -105,11 +107,16 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
     } else {
         String::new()
     };
+    let cancelled_suffix = if counts.cancelled > 0 {
+        format!(" / {} cancelled", counts.cancelled)
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         md,
-        "- **Task state:** {} total — {} todo / {} in progress / {} blocked / {} done{}",
+        "- **Task state:** {} total — {} todo / {} in progress / {} blocked / {} done{}{}",
         counts.total, counts.todo, counts.in_progress, counts.blocked, counts.done,
-        unverified_suffix
+        unverified_suffix, cancelled_suffix
     );
     // Who this project can hand work to (D128). One line per team, and it
     // names the downstream members specifically: the shipped curriculum tells
@@ -141,7 +148,13 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
             .get(ws.current_index)
             .map(|p| p.title.as_str())
             .unwrap_or("?");
-        if ws.workflow.state.completed {
+        if ws.is_ongoing() {
+            let _ = writeln!(
+                md,
+                "- **Workflow:** ongoing — no phases to advance, no exit gates (template: {})",
+                ws.workflow.template_name
+            );
+        } else if ws.workflow.state.completed {
             let _ = writeln!(
                 md,
                 "- **Workflow:** COMPLETED — all {} phases done (template: {})",
@@ -237,13 +250,25 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
     // ── 3. Next immediate steps ─────────────────────────────────────────────
     let _ = writeln!(md, "\n## 3. Next Immediate Steps\n");
     if let Some(ws) = input.workflow {
-        if ws.workflow.state.completed {
+        if ws.is_ongoing() {
+            if !ws.workflow.ongoing_instructions.is_empty() {
+                let _ = writeln!(md, "**Working instructions** (ongoing — no phases, no exit gates):");
+                for instruction in &ws.workflow.ongoing_instructions {
+                    let _ = writeln!(md, "- {instruction}");
+                }
+                let _ = writeln!(md);
+            }
+        } else if ws.workflow.state.completed {
             let _ = writeln!(
                 md,
-                "**Workflow completed.** Run a post-mortem review or start the next cycle.\n"
+                "**Workflow completed.** Run a post-mortem review. To keep working, the user can switch the project to ongoing or step back a phase in the app.\n"
             );
         } else if let Some(phase) = ws.workflow.phases.get(ws.current_index) {
-            let _ = writeln!(md, "**Current phase: {}** — {}", phase.title, phase.description);
+            let since = ws
+                .current_phase_entered_on()
+                .map(|day| format!(" (entered {day})"))
+                .unwrap_or_default();
+            let _ = writeln!(md, "**Current phase: {}**{since} — {}", phase.title, phase.description);
             if !phase.ai_instructions.is_empty() {
                 let _ = writeln!(md, "\nPhase directives (follow in order):");
                 for instruction in &phase.ai_instructions {
@@ -259,6 +284,13 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
                         if gate.passed { "x" } else { " " },
                         gate_label(&gate.gate),
                         gate.observed
+                    );
+                }
+                if ws.can_advance {
+                    let _ = writeln!(
+                        md,
+                        "
+**All exit gates pass — this phase is ready to advance.** Call `advance_phase`; if it is refused as not authorised, tell the user it is ready — they can advance it in the app."
                     );
                 }
             }
@@ -286,6 +318,8 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
             );
         }
     }
+
+    md.push_str(&input.asks.render(|t| lens_line(t).to_string()));
 
     // ── 4. Current blockers / technical decisions ──────────────────────────
     let _ = writeln!(md, "\n## 4. Current Blockers / Technical Decisions\n");
@@ -363,6 +397,14 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
                         by.join(", ")
                     );
                 }
+                None if decision.provisional => {
+                    let _ = writeln!(
+                        md,
+                        "- `{}` (provisional — awaiting the user's review) {}",
+                        tag,
+                        lens_line(&decision.message)
+                    );
+                }
                 None => {
                     let _ = writeln!(md, "- `{}` {}", tag, lens_line(&decision.message));
                 }
@@ -407,6 +449,7 @@ mod tests {
             teams,
             progress: &[],
             workflow: None,
+            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-09-16T00:00:00Z".into(),
         })
@@ -461,6 +504,7 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: None,
+            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         })
@@ -482,6 +526,7 @@ mod tests {
             teams: &[],
             progress: &[progress],
             workflow: None,
+            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         });
@@ -629,6 +674,7 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: None,
+            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-07T00:00:00Z".into(),
         });
@@ -669,6 +715,8 @@ mod tests {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             template_id: "generic-v1".into(),
             template_name: "Generic flow".into(),
+            mode: Default::default(),
+            ongoing_instructions: vec![],
             phases: vec![
                 Phase {
                     id: "plan".into(),
@@ -717,6 +765,7 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: Some(&status),
+            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         });

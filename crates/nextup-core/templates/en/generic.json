@@ -3,6 +3,15 @@
   "name": "Generic Workflow",
   "description": "A basic loop for any domain: Plan → Execute → Review → Retrospect.",
   "domainHint": "general",
+  "ongoingInstructions": [
+    "Read .nextup/snapshots/latest_handoff.md and context.json first to calibrate goals and boundaries.",
+    "When new work arrives, settle who the deliverable is for: for each reader, the setting they read it in and what they must be able to understand or do afterwards. Record it as a decision, and show one early piece to a reader before producing the rest.",
+    "Break new work into tasks with slice-work (call the Skill tool with it): each one deliverable and verifiable on its own, with its acceptance criteria, priority and dependencies.",
+    "Claim tasks by priority and mark them in_progress — one thing at a time. Mark done as soon as a task completes; mark blocked immediately with the reason when stuck.",
+    "If validate_task_specs is in your tool list, a task that changes behaviour writes its spec delta under tasks/<task-id>/specs/ before it is marked done (nextup_docs/modules/specs.md).",
+    "Before marking a task done, check it against its acceptance criteria and the goals in context.json; if something is missing, add a task rather than call it done. All deliverables go into artifacts/.",
+    "When a stretch of work closes — a milestone, a delivery, or a few weeks of tasks — call the Skill tool with retrospect and write the improvements back into executionGuidelines of rules.json."
+  ],
   "phases": [
     {
       "id": "plan",
@@ -10,6 +19,7 @@
       "description": "Break the goal into atomic tasks completable within a single session.",
       "aiInstructions": [
         "Read .nextup/snapshots/latest_handoff.md and context.json first to calibrate goals and boundaries.",
+        "Settle who the deliverable is for: for each reader, the setting they read it in and what they must be able to understand or do afterwards. Record it as a decision, and plan to show one early piece to a reader before producing the rest.",
         "Break the work into tasks with slice-work (call the Skill tool with it): each one deliverable and verifiable on its own, with its acceptance criteria, priority and dependencies."
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]

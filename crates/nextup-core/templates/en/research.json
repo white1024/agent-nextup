@@ -3,6 +3,15 @@
   "name": "Research",
   "description": "Scope → Gather → Synthesize → Draft → Review, for literature and investigative work.",
   "domainHint": "research",
+  "ongoingInstructions": [
+    "Keep the research question, sub-questions and exclusions in goals/boundaries of context.json; when a new question comes in, write it there before gathering.",
+    "Settle who reads each result, in what setting, and what they must understand or decide afterwards; record it as a decision, and show one section to a reader before writing the rest.",
+    "Turn questions into tasks with slice-work (call the Skill tool with it): gathering, synthesis and writing tasks, with the dependencies between them.",
+    "Gather task by task; store sources and excerpts in artifacts/ with citations. Quality over quantity — discard unverifiable sources outright and record why.",
+    "Cross-check sources and flag conflicts; record each conclusion and its supporting grounds as a decision.",
+    "Before a write-up counts as done, verify its citations and figures section by section.",
+    "When a line of inquiry closes, call the Skill tool with retrospect and write the improvements to the research process back into rules.json."
+  ],
   "phases": [
     {
       "id": "scope",
@@ -10,6 +19,7 @@
       "description": "Narrow the research question into an answerable scope.",
       "aiInstructions": [
         "Write the research question, sub-questions and exclusions into goals/boundaries of context.json.",
+        "Settle who reads the result, in what setting, and what they must understand or decide afterwards; record it as a decision, and plan to show one section to a reader before writing the rest.",
         "Turn the sub-questions into tasks with slice-work (call the Skill tool with it): one gathering task per sub-question (source types, keywords), with the dependencies between them."
       ],
       "exitGates": [{ "kind": "min_tasks", "count": 1 }]

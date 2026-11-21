@@ -6,7 +6,7 @@
 //! brings every takeover surface up to date from that single snapshot:
 //! - `.nextup/snapshots/latest_handoff.md` (via `handoff::render_handoff`),
 //! - the `HandoffGenerated` ledger line,
-//! - the CLAUDE.md state block + `project.yaml` manifest
+//! - the AGENTS.md state block + `project.yaml` manifest
 //!   (via `bootstrap::refresh_with`).
 //!
 //! The call graph is a straight line ending here: this module never calls
@@ -64,6 +64,7 @@ pub fn sync_after_mutation(paths: &WorkspacePaths, app_version: &str) -> Result<
         teams: &teams,
         progress: &progress,
         workflow: workflow.as_ref(),
+        asks: &crate::workspace::questions::ask_summary(paths)?,
         app_version,
         generated_at: now_rfc3339(),
     });

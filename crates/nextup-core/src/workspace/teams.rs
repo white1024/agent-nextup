@@ -252,7 +252,9 @@ pub fn load_teams(path: &Path) -> Result<TeamsFile> {
     super::atomic::read_json_file(path)
 }
 
-fn save(path: &Path, mut file: TeamsFile) -> Result<()> {
+/// ⚠️ Callers outside this module (`team_transfer`) must hold
+/// [`with_app_lock`] around their load → save, same as every writer here.
+pub(crate) fn save(path: &Path, mut file: TeamsFile) -> Result<()> {
     file.schema_version = TEAMS_SCHEMA_VERSION;
     atomic_write_json(path, &file)
 }
@@ -550,10 +552,18 @@ pub fn check_rebind_identity(expected: &str, actual: Option<&str>) -> Result<()>
 }
 
 /// Re-link a moved workspace (D52, team module design §2, added later): update the root/name display
-/// caches of member `workspace_id` across **every** team — a folder move is a
-/// fact about the workspace, not about one team. The caller has already
-/// verified identity via `check_rebind_identity`. Returns how many teams were
-/// touched.
+/// caches of `workspace_id` across **every** team — a folder move is a fact
+/// about the workspace, not about one team. The caller has already verified
+/// identity via `check_rebind_identity`. Returns how many teams were touched.
+///
+/// Prime slots move too (D173 ④): until then only member entries did, so a
+/// workspace that was only some team's prime could not be re-linked at all and
+/// its path stayed wrong on every surface that shows it.
+///
+/// ⚠️ **`updatedAt` does not move** (D173 ③). A root is where the folder sits
+/// on *this* machine, not part of the team; the import preview compares
+/// `updatedAt` to suggest which side is newer, and a re-link that bumped it
+/// would make this machine's copy look newer for no change anyone made.
 pub fn rebind_workspace(
     path: &Path,
     workspace_id: &str,
@@ -566,23 +576,22 @@ pub fn rebind_workspace(
     }
     with_app_lock(path, || {
         let mut file = load_teams(path)?;
-        let now = now_rfc3339();
         let mut touched = 0usize;
         for team in file.teams.iter_mut() {
             let mut hit = false;
-            for member in team.members.iter_mut().filter(|m| m.workspace_id == workspace_id) {
-                member.root = new_root.to_string();
-                member.name = new_name.to_string();
+            let entries = team.members.iter_mut().chain(team.prime.iter_mut());
+            for entry in entries.filter(|m| m.workspace_id == workspace_id) {
+                entry.root = new_root.to_string();
+                entry.name = new_name.to_string();
                 hit = true;
             }
             if hit {
-                team.updated_at = now.clone();
                 touched += 1;
             }
         }
         if touched == 0 {
             return Err(NextUpError::NotFound(format!(
-                "workspace {workspace_id} is not a member of any team"
+                "workspace {workspace_id} is not a member or prime of any team"
             )));
         }
         save(path, file)?;
@@ -1315,6 +1324,36 @@ mod tests {
             rebind_workspace(&path, "ghost", "D:/x", "x").unwrap_err().kind(),
             "not_found"
         );
+    }
+
+    /// D173 ③④: a workspace that is only some team's prime re-links too, and a
+    /// re-link is not a change to the team — `updatedAt` is what the import
+    /// preview compares, so moving it would make this machine look newer.
+    #[test]
+    fn rebind_moves_prime_slots_and_leaves_updated_at_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teams.json");
+        let team = create_team(&path, "one").unwrap();
+        add_member(&path, &team.id, member("a")).unwrap();
+        set_prime(&path, &team.id, Some(member("boss"))).unwrap();
+        // An old stamp, so a bump inside the same second cannot pass for "unchanged".
+        let mut file = load_teams(&path).unwrap();
+        file.teams[0].updated_at = "2000-01-01T00:00:00Z".into();
+        save(&path, file).unwrap();
+        let before = "2000-01-01T00:00:00Z".to_string();
+
+        assert_eq!(rebind_workspace(&path, "boss", "D:/moved/boss", "Boss").unwrap(), 1);
+        assert_eq!(rebind_workspace(&path, "a", "D:/moved/a", "a").unwrap(), 1);
+
+        let after = &load_teams(&path).unwrap().teams[0];
+        let prime = after.prime.as_ref().unwrap();
+        assert_eq!((prime.root.as_str(), prime.name.as_str()), ("D:/moved/boss", "Boss"));
+        assert_eq!(after.updated_at, before, "a root is this machine's cache, not team content");
+    }
+
+    #[test]
+    fn rebind_rejects_a_blank_root() {
+        let (_g, path, _team) = seeded();
         assert_eq!(
             rebind_workspace(&path, "a", "  ", "x").unwrap_err().kind(),
             "invalid_input"

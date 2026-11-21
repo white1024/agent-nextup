@@ -231,6 +231,9 @@ export default function TemplatesHome() {
         onCopy={(base) =>
           setSession({
             mode: "create",
+            // The ongoing instructions come along (D171 ⑧): the editor shows
+            // them under the phases, so whoever rewrites the phases sees what
+            // an ongoing project would follow and can rewrite or empty it.
             template: { ...base, id: "", name: `${base.name}${t("tpl.copySuffix")}` },
             from: session.from,
             seq: ++seq.current,

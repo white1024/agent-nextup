@@ -30,6 +30,8 @@ Sort everything this session claims to have finished:
 
 Add this session's progress, the decisions that were settled and the pitfalls you hit to **the project's own record mechanism** (a progress log, a decision record, memory, task state — whichever exists). Where the project provides tools for recording, use the tools rather than editing files by hand.
 
+**Loose ends become tasks.** Anything this session leaves open — a next step, a question waiting on someone, a follow-up you promised — belongs in the project's task mechanism where it has one: a task for work still to do, a blocked task naming who or what it waits on. That is its home; a progress note can name the task rather than restate it. Work that turned out to be unnecessary is closed as cancelled with the reason, not left open and not marked done. The next session picks its work from the tasks — a to-do kept only in prose is easy to miss.
+
 The discipline: **every fact goes into its own source of truth and is not copied to a second place** — in particular, do not push current state or decisions back into an index or entry file such as `CLAUDE.md`.
 
 After writing, follow whatever **maintenance rules the record file states in its own header** (retention window, rolling archive, compaction — only if the header says so; skip it otherwise): keep hot data in the main file and move entries that fall outside the retention window into the archive **whole**, so the takeover entry point stays light.
