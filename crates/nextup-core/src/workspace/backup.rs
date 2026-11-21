@@ -115,10 +115,6 @@ pub fn export_backup(
         // Delivery envelopes are workspace state (pending sends, received
         // handoffs) — a restored copy keeps its exchange history (D48).
         paths.exchange_dir(),
-        // Questions for the user (D170): workspace state the ledger already
-        // refers to by id ("asked Q-0001", the answer decision). Dropping them
-        // would also let a restored copy mint Q-0001 a second time.
-        paths.questions_dir(),
         paths.tasks_dir(),
         // The curated spec layer (D79) is workspace content, not derived data.
         // A folded spec exists only here, so leaving it out drops the whole

@@ -40,19 +40,34 @@ import {
   NODE_H,
   NODE_W,
   canConnect,
+  drawnTeam,
   edgeGeo,
   edgeGeos,
   edgeKey,
   fitViewport,
   layersOf,
+  linesOf,
   markPoints,
+  reversedPath,
   viewportLeftOf,
   type Pos,
   type Positions,
   type Rect,
 } from "./layout";
 import { lookOf } from "./looks";
-import { ARROW_PATH, nearCore, orbitDraws, orbitPlan, planetOf, sideOf, type OrbitDraw, type OrbitGeo, type OrbitPlan } from "./orbit";
+import {
+  ARROW_PATH,
+  bezPath,
+  nearCore,
+  orbitDraws,
+  orbitPlan,
+  planetOf,
+  reverseBez,
+  sideOf,
+  type OrbitDraw,
+  type OrbitGeo,
+  type OrbitPlan,
+} from "./orbit";
 import OrbitCore from "./OrbitCore";
 import type { LayoutSkin, Team } from "../../types";
 import PathLabel from "../../components/PathLabel";
@@ -99,6 +114,8 @@ type FlowEdgeData = {
   onRemove: () => void;
   span: number;
   autoRoute: boolean;
+  /** The way back on a two-way line (D176), null on a one-way line. */
+  back: { autoRoute: boolean } | null;
   mark: (Pos & { a: number }) | null;
   /** The orbit's arc for this flow (D157), or null on the star map. */
   draw: OrbitDraw | null;
@@ -148,6 +165,8 @@ interface Props {
   onSelect: (workspaceId: string | null) => void;
   onAddEdge: (from: string, to: string) => void;
   onRemoveEdge: (from: string, to: string) => void;
+  /** Remove a two-way line, both directions (D176). */
+  onRemoveLine: (a: string, b: string) => void;
   /** Full position map after a drag ends or a tidy settles (D53 §4 — the only write moments). */
   onPersistLayout: (positions: Positions) => void;
   /** Bumped by "Tidy up": nodes slide to their auto slots (C54), then persist. */
@@ -195,6 +214,7 @@ export default function Canvas({
   onSelect,
   onAddEdge,
   onRemoveEdge,
+  onRemoveLine,
   onPersistLayout,
   tidy,
   freshEdge,
@@ -281,11 +301,13 @@ export default function Canvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [team, skin, missing, pending, lastDelivery, selectedId, got, highlight, born, setNodes]);
 
+  // D176: two members that send to each other are one line, drawn along its
+  // forward direction and marked as running both ways.
   useEffect(() => {
     const layer = layersOf(team);
     setEdges((prev) => {
       const sel = new Set(prev.filter((e) => e.selected === true).map((e) => e.id));
-      return team.edges.map((edge) => {
+      return linesOf(team.edges).map(({ ab: edge, ba }) => {
         const from = layer.get(edge.from);
         const to = layer.get(edge.to);
         const id = edgeKey(edge);
@@ -296,16 +318,20 @@ export default function Canvas({
           type: "flow" as const,
           selected: sel.has(id),
           data: {
-            onRemove: () => onRemoveEdge(edge.from, edge.to),
+            onRemove: ba === null ? () => onRemoveEdge(edge.from, edge.to) : () => onRemoveLine(edge.from, edge.to),
             span: from !== undefined && to !== undefined ? to - from : 1,
             autoRoute: edge.autoRoute,
+            back: ba === null ? null : { autoRoute: ba.autoRoute },
             mark: null,
             draw: null,
           },
         };
       });
     });
-  }, [team, setEdges, onRemoveEdge]);
+  }, [team, setEdges, onRemoveEdge, onRemoveLine]);
+
+  /** One edge per line — what the marks, arcs and lights are worked out on. */
+  const drawn = useMemo(() => drawnTeam(team), [team]);
 
   /** Where every node is right now — dragging included. */
   const positions = useMemo(() => {
@@ -318,7 +344,7 @@ export default function Canvas({
   // whole team at once and handed to each edge.
   // On the orbit the whole arc is worked out here too: it starts and ends at
   // planets, not at xyflow's handles, and its bolt avoids the cube as well.
-  const draws = useMemo(() => (plan === null ? null : orbitDraws(team, plan, positions)), [plan, team, positions]);
+  const draws = useMemo(() => (plan === null ? null : orbitDraws(drawn, plan, positions)), [plan, drawn, positions]);
   // The latest arcs and orbit, for work that runs a frame or more later than
   // the render that scheduled it: a new flow's draw (C65) is scheduled as the
   // flow is created, before the team that contains it has rendered.
@@ -331,9 +357,9 @@ export default function Canvas({
         return e.data === undefined || d === undefined ? e : { ...e, data: { ...e.data, draw: d, mark: { ...d.mark, a: 0 } } };
       });
     }
-    const marks = markPoints(team, positions);
+    const marks = markPoints(drawn, positions);
     return edges.map((e) => (e.data === undefined ? e : { ...e, data: { ...e.data, mark: marks[e.id] ?? null } }));
-  }, [edges, positions, team, draws]);
+  }, [edges, positions, drawn, draws]);
 
   const isValidConnection = useCallback(
     (conn: Connection | FlowEdge) => canConnect(conn.source ?? "", conn.target ?? "", team.edges),
@@ -563,8 +589,12 @@ export default function Canvas({
     if (freshEdge === null) return;
     let id = 0;
     let tries = 0;
+    // A new direction on an existing pair is drawn as part of the line that
+    // runs the other way (D176), so look for that too.
+    const [freshFrom, freshTo] = freshEdge.split("->");
+    const lineKey = (k: string) => boxRef.current?.querySelector(`[data-edge="${CSS.escape(k)}"]`) ?? null;
     const run = () => {
-      const g = boxRef.current?.querySelector(`[data-edge="${CSS.escape(freshEdge)}"]`) ?? null;
+      const g = lineKey(freshEdge) ?? lineKey(`${freshTo}->${freshFrom}`);
       if (g === null && tries++ < 30) {
         id = requestAnimationFrame(run);
         return;
@@ -575,7 +605,7 @@ export default function Canvas({
         // C65: the arc draws itself, flaring the cube as it passes.
         const marks = g ? Array.from(g.querySelectorAll(".tvo-arrow, .tvo-bolt, .tv-flow, .tv-flow-glow")) : [];
         const now = latest.current;
-        const d = now.draws?.[freshEdge];
+        const d = now.draws?.[freshEdge] ?? now.draws?.[`${freshTo}->${freshFrom}`];
         drawArc(path, marks, d !== undefined && now.plan !== null ? nearCore(now.plan, d.q) : null, flare, () => bloomAt(to));
       } else {
         const marks = g ? Array.from(g.querySelectorAll(".tsm-chev, .tsm-drop, .tv-flow, .tv-flow-glow")) : [];
@@ -694,16 +724,30 @@ export default function Canvas({
       );
     },
     comet: (from, to, delay, dur) => {
+      // On a two-way line (D176) the way back is the drawn line run backwards.
       const key = `${from}->${to}`;
+      const back = `${to}->${from}`;
       if (plan !== null) {
         const d = draws?.[key];
-        if (d === undefined) return null;
-        comet(viewportEl(), d.d, delay, dur);
-        return { core: nearCore(plan, d.q) };
+        if (d !== undefined) {
+          comet(viewportEl(), d.d, delay, dur);
+          return { core: nearCore(plan, d.q) };
+        }
+        const r = draws?.[back];
+        if (r === undefined) return null;
+        const q = reverseBez(r.q);
+        comet(viewportEl(), bezPath(q), delay, dur);
+        return { core: nearCore(plan, q) };
       }
-      const g = edgeGeos(team, positions)[key];
-      if (g === undefined) return null;
-      comet(viewportEl(), g.d, delay, dur);
+      const geos = edgeGeos(drawn, positions);
+      const g = geos[key];
+      if (g !== undefined) {
+        comet(viewportEl(), g.d, delay, dur);
+        return { core: null };
+      }
+      const r = geos[back];
+      if (r === undefined) return null;
+      comet(viewportEl(), reversedPath(r.n), delay, dur);
       return { core: null };
     },
     bloom: bloomAt,
@@ -1022,7 +1066,11 @@ function FlowEdgeComp({
 }: EdgeProps<FlowEdge>) {
   const { t } = useTranslation();
   const geo = edgeGeo({ x: sourceX, y: sourceY }, { x: targetX, y: targetY }, data?.span ?? 1);
-  const auto = data?.autoRoute === true;
+  const fwdAuto = data?.autoRoute === true;
+  /** A two-way line (D176): the way back, and whether that way is automatic. */
+  const back = data?.back ?? null;
+  const backAuto = back?.autoRoute === true;
+  const auto = fwdAuto || backAuto;
   /** The orbit's arc (D157), drawn from planet to planet rather than handle to handle. */
   const draw = data?.draw ?? null;
   const d = draw?.d ?? geo.d;
@@ -1044,12 +1092,20 @@ function FlowEdgeComp({
           // The orbit drops them on a selected flow, as the design does: the
           // line itself turns ink and the lights would only cover it.
           !(draw !== null && selected === true) &&
-          [0, 1].map((k) => {
-            const delay = { animationDelay: `-${Math.round((phase + (k * FLOW_MS) / 2) % FLOW_MS)}ms` };
+          // Each automatic direction gets its pair of lights; the way back
+          // on a two-way line runs them backwards along the same path.
+          [
+            ...(fwdAuto ? [0, 1].map((k) => ({ k, rev: false })) : []),
+            ...(backAuto ? [0, 1].map((k) => ({ k, rev: true })) : []),
+          ].map(({ k, rev }) => {
+            const style: CSSProperties = {
+              animationDelay: `-${Math.round((phase + (k * FLOW_MS) / 2 + (rev ? FLOW_MS / 4 : 0)) % FLOW_MS)}ms`,
+              animationDirection: rev ? "reverse" : undefined,
+            };
             return (
-              <g key={k} aria-hidden="true">
-                <path className="tv-flow-glow" d={d} pathLength={100} style={delay} />
-                <path className="tv-flow" d={d} pathLength={100} style={delay} />
+              <g key={`${rev ? "b" : "f"}${k}`} aria-hidden="true">
+                <path className="tv-flow-glow" d={d} pathLength={100} style={style} />
+                <path className="tv-flow" d={d} pathLength={100} style={style} />
               </g>
             );
           })}
@@ -1063,6 +1119,7 @@ function FlowEdgeComp({
         {draw !== null ? (
           <>
             <path className="tvo-arrow" d={ARROW_PATH} transform={draw.arrow} aria-hidden="true" />
+            {back !== null && <path className="tvo-arrow" d={ARROW_PATH} transform={draw.back} aria-hidden="true" />}
             {auto && selected !== true && (
               <g className="tvo-bolt" transform={`translate(${draw.mark.x.toFixed(1)} ${draw.mark.y.toFixed(1)})`} aria-hidden="true">
                 <title>{t("teams.autoChip")}</title>
@@ -1071,6 +1128,23 @@ function FlowEdgeComp({
               </g>
             )}
           </>
+        ) : back !== null ? (
+          // Two-way (D176): chevrons pointing both ways, and on an automatic
+          // line a round drop with the bolt between them — a drop's point
+          // would name one direction.
+          <g transform={tf} aria-hidden="true">
+            {auto && <title>{t("teams.autoChip")}</title>}
+            {auto && (
+              <g className="tsm-drop">
+                <circle className="tsm-drop-o" r={8} />
+                <path className="tsm-bolt" d={BOLT_PATH} transform={`rotate(${(-deg).toFixed(1)}) scale(.5) translate(-12 -12)`} />
+              </g>
+            )}
+            <path
+              className="tsm-chev"
+              d={auto ? "M-11,-4.5 L-16.5,0 L-11,4.5 M11,-4.5 L16.5,0 L11,4.5" : "M-1.5,-4.5 L-7,0 L-1.5,4.5 M1.5,-4.5 L7,0 L1.5,4.5"}
+            />
+          </g>
         ) : auto ? (
           <g className="tsm-drop" transform={tf} aria-hidden="true">
             <title>{t("teams.autoChip")}</title>
@@ -1091,7 +1165,7 @@ function FlowEdgeComp({
             style={{ transform: `translate(-50%, -50%) translate(${at.x}px, ${at.y}px)` }}
             onClick={data.onRemove}
           >
-            <IconX size={12} /> {t("teams.removeEdge")}
+            <IconX size={12} /> {back !== null ? t("teams.removeLine") : t("teams.removeEdge")}
           </button>
         </EdgeLabelRenderer>
       )}

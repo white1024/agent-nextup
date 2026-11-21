@@ -46,10 +46,6 @@ pub struct WorkspaceOverview {
     pub exists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_counts: Option<TaskCounts>,
-    /// Open questions and provisional decisions waiting on the person (D170)
-    /// — the project card's amber line counts them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub you_counts: Option<crate::workspace::questions::YouCounts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_phase: Option<String>,
     /// Display title of the current phase (D42 pure-Chinese titles); None
@@ -161,7 +157,6 @@ pub fn overview(path: &Path) -> Result<Vec<WorkspaceOverview>> {
                 last_opened: entry.last_opened,
                 exists,
                 task_counts: if exists { counts_for_dir(&paths.tasks_dir()).ok() } else { None },
-                you_counts: exists.then(|| crate::workspace::questions::you_counts(&paths)),
                 current_phase: staged.map(|w| w.state.current_phase.clone()),
                 current_phase_title: staged.and_then(|w| {
                     w.phases

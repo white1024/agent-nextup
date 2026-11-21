@@ -229,65 +229,6 @@ pub async fn edit_task(
     blocking(move || ops::edit_task(&ws.paths(), APP_VERSION, &id, edit)).await
 }
 
-// ── To decide: questions and provisional decisions (D170) ─────────────────
-
-/// Every question, oldest first. The app reads without stamping anything —
-/// "seen" means an agent picked the answer up, not that a person looked.
-#[tauri::command]
-pub async fn list_questions(
-    state: tauri::State<'_, AppState>,
-) -> CmdResult<Vec<nextup_core::workspace::questions::Question>> {
-    let ws = state.require_workspace()?;
-    blocking(move || nextup_core::workspace::questions::QuestionStore::new(&ws.paths()).list()).await
-}
-
-/// The person answers; ledgered as a decision.
-#[tauri::command]
-pub async fn answer_question(
-    state: tauri::State<'_, AppState>,
-    id: String,
-    answer: String,
-) -> CmdResult<nextup_core::workspace::questions::Question> {
-    let ws = state.require_workspace()?;
-    blocking(move || ops::answer_question(&ws.paths(), APP_VERSION, &id, &answer)).await
-}
-
-/// The question no longer needs an answer.
-#[tauri::command]
-pub async fn withdraw_question(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> CmdResult<nextup_core::workspace::questions::Question> {
-    let ws = state.require_workspace()?;
-    blocking(move || ops::withdraw_question(&ws.paths(), APP_VERSION, &id)).await
-}
-
-/// Provisional decisions nobody has reviewed yet, oldest first.
-#[tauri::command]
-pub async fn list_provisional_decisions(
-    state: tauri::State<'_, AppState>,
-) -> CmdResult<Vec<nextup_core::workspace::ledger::LedgerEvent>> {
-    let ws = state.require_workspace()?;
-    blocking(move || {
-        nextup_core::workspace::questions::pending_provisional(&nextup_core::workspace::ledger::Ledger::new(
-            ws.paths().ledger_file(),
-        ))
-    })
-    .await
-}
-
-/// Confirm a provisional decision as it stands (`revised` absent) or replace
-/// it; either way a settled decision supersedes it.
-#[tauri::command]
-pub async fn review_decision(
-    state: tauri::State<'_, AppState>,
-    id: String,
-    revised: Option<String>,
-) -> CmdResult<nextup_core::workspace::ledger::LedgerEvent> {
-    let ws = state.require_workspace()?;
-    blocking(move || ops::review_decision(&ws.paths(), APP_VERSION, &id, revised.as_deref())).await
-}
-
 /// Tick or untick one step of a task's checklist (D170; 1-based).
 #[tauri::command]
 pub async fn set_task_step(
@@ -1463,6 +1404,18 @@ pub async fn team_add_edge(team_id: String, from: String, to: String) -> CmdResu
     blocking(move || teams::mutate(|path| teams::add_edge(path, &team_id, &from, &to))).await
 }
 
+/// One line, both ways (D176): adds whichever direction is missing.
+#[tauri::command]
+pub async fn team_link(team_id: String, a: String, b: String) -> CmdResult<Vec<Team>> {
+    blocking(move || teams::mutate(|path| teams::link_members(path, &team_id, &a, &b))).await
+}
+
+/// Remove the line between two members, both directions.
+#[tauri::command]
+pub async fn team_unlink(team_id: String, a: String, b: String) -> CmdResult<Vec<Team>> {
+    blocking(move || teams::mutate(|path| teams::unlink_members(path, &team_id, &a, &b))).await
+}
+
 #[tauri::command]
 pub async fn team_remove_edge(team_id: String, from: String, to: String) -> CmdResult<Vec<Team>> {
     blocking(move || teams::mutate(|path| teams::remove_edge(path, &team_id, &from, &to))).await
@@ -1596,7 +1549,7 @@ pub async fn exchange_publish(
             APP_VERSION,
             note,
             &files,
-            exchange::PublishOptions { supersedes },
+            exchange::PublishOptions { supersedes, ..Default::default() },
         )
     })
     .await

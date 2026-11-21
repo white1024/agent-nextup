@@ -92,41 +92,6 @@ export interface SystemStatus {
   keystoreDescription: string;
   workspace: WorkspaceInfo | null;
   taskCounts: TaskCounts | null;
-  /** Open questions and provisional decisions waiting on the person (D170). */
-  youCounts: YouCounts | null;
-}
-
-/** What the To decide page holds (D170). */
-export interface YouCounts {
-  questions: number;
-  decisions: number;
-}
-
-export type QuestionStatus = "open" | "answered" | "withdrawn";
-
-/** A question an agent left for the person (D170; `.nextup/questions/Q-0001.json`). */
-export interface Question {
-  schemaVersion: number;
-  id: string;
-  question: string;
-  recommendation?: string | null;
-  options?: string[];
-  /** Who should really answer, when not the user — the user forwards it. */
-  ask?: string | null;
-  /** Tasks this question holds up. */
-  blocks?: string[];
-  /** What the asker proceeds on if nobody answers. */
-  defaultAnswer?: string | null;
-  status: QuestionStatus;
-  answer?: string | null;
-  answeredAt?: string | null;
-  /** The decision the answer was ledgered as. */
-  decisionId?: string | null;
-  /** When an agent picked the answer up through the hub. */
-  seenAt?: string | null;
-  askedBy?: string | null;
-  createdAt: string;
-  updatedAt: string;
 }
 
 export type LedgerKind =
@@ -200,8 +165,6 @@ export interface LedgerEvent {
   /** ── Decision identity and supersession — decisions only, absent on older lines ── */
   /** Workspace-local decision id (`D-0001`), so a later decision can point at this one. */
   id?: string;
-  /** Taken on a default, waiting for the person's review (D170). */
-  provisional?: boolean;
   /**
    * The decision id this decision overturns. Set on the NEW line only — the ledger is
    * append-only, so the superseded line is never edited. Read the other direction with
@@ -634,6 +597,8 @@ export interface DeliverySummary {
    * the correction was sent. */
   supersedes?: string | null;
   supersededBy?: string | null;
+  /** The downstream projects the publisher named (D176); absent = every one. */
+  addressedTo?: DeliverySource[];
   note?: string;
   /** The note was clamped to its first line for a brief listing; the rest is
    * behind `exchange_get`. Only the hub asks for brief listings today. */
@@ -666,6 +631,8 @@ export interface DeliveryEnvelope {
    * that replaced it (D87). Nothing is deleted — the older envelope is marked. */
   supersedes?: string | null;
   supersededBy?: string | null;
+  /** See `DeliverySummary.addressedTo` (D176). */
+  addressedTo?: DeliverySource[];
   deliveredAt?: string;
   deliveredVia?: DeliveredVia;
   /** See `DeliverySummary.agentReadAt` (D160). */
@@ -824,8 +791,6 @@ export interface WorkspaceOverview {
   lastOpened: string;
   exists: boolean;
   taskCounts?: TaskCounts | null;
-  /** Open questions and provisional decisions waiting on the person (D170). */
-  youCounts?: YouCounts | null;
   currentPhase?: string | null;
   /** Phase display title (D42 pure-Chinese); fall back to currentPhase id. */
   currentPhaseTitle?: string | null;

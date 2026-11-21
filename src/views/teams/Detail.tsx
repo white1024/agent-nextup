@@ -369,10 +369,12 @@ export default function TeamDetail({
   );
 
   // Stable canvas callbacks (the edge-sync effect in Canvas depends on them).
+  // D176: drawing a line connects both ways; a one-way line is a direction
+  // removed afterwards in the inspector.
   const addEdge = useCallback(
     (from: string, to: string) =>
       void runFlow(async () => {
-        const list = await api.teamAddEdge(team.id, from, to);
+        const list = await api.teamLink(team.id, from, to);
         // C59: the new line draws itself once the canvas has it; C51: its row
         // slides into the inspector.
         const key = `${from}->${to}`;
@@ -385,6 +387,10 @@ export default function TeamDetail({
   );
   const removeEdge = useCallback(
     (from: string, to: string) => void runFlow(() => api.teamRemoveEdge(team.id, from, to)),
+    [runFlow, team.id],
+  );
+  const removeLine = useCallback(
+    (a: string, b: string) => void runFlow(() => api.teamUnlink(team.id, a, b)),
     [runFlow, team.id],
   );
   const setEdgeAuto = useCallback(
@@ -960,6 +966,7 @@ export default function TeamDetail({
             onSelect={setSelectedId}
             onAddEdge={addEdge}
             onRemoveEdge={removeEdge}
+            onRemoveLine={removeLine}
             onPersistLayout={persistLayout}
             tidy={tidy}
             freshEdge={freshEdge}
@@ -1068,6 +1075,9 @@ export default function TeamDetail({
                       </div>
                       <div className="tmi-rd">
                         <TimeAgo at={row.publishedAt} />
+                        {/* D176: the publisher named who it is for. */}
+                        {row.addressedTo && row.addressedTo.length > 0 &&
+                          ` · ${t("teams.addressedTo", { names: row.addressedTo.map((d) => d.name).join(t("teams.listSep")) })}`}
                         {row.supersededBy && ` · ${t("teams.supersededBy", { id: row.supersededBy.slice(0, 8) })}`}
                       </div>
                     </div>
@@ -1083,12 +1093,16 @@ export default function TeamDetail({
                       })}
                       onClick={() => {
                         const candidates = candidatesFor(selectedMember.workspaceId);
+                        // D176: an addressed envelope starts with only the
+                        // projects it names ticked; the person can still change it.
+                        const named = new Set((row.addressedTo ?? []).map((d) => d.workspaceId));
+                        const preset = named.size > 0 ? candidates.filter((c) => named.has(c.workspaceId)) : candidates;
                         setRouting({
                           root: selectedMember.root,
                           workspaceId: selectedMember.workspaceId,
                           delivery: row,
                           candidates,
-                          checked: new Set(candidates.map(candidateKey)),
+                          checked: new Set(preset.map(candidateKey)),
                         });
                       }}
                     >
@@ -1180,6 +1194,9 @@ export default function TeamDetail({
                     </div>
                   ))}
 
+                  {flowsOf.upstream.length + flowsOf.downstream.length > 0 && (
+                    <p className="tmi-hint">{t("teams.twoWayHint")}</p>
+                  )}
                   {flowsOf.downstream.length > 0 && (
                     <p className="tmi-hint">{t("teams.autoRouteHint")}</p>
                   )}

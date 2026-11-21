@@ -7,7 +7,7 @@ import PathLabel from "../../components/PathLabel";
 import { IconWarn, IconX } from "../../components/icons";
 import { lightTheme, motionOff, tokenRgb } from "../../lib/fx";
 import { shownDomain } from "../../lib/domain";
-import type { TaskCounts, YouCounts } from "../../types";
+import type { TaskCounts } from "../../types";
 import { CELLS_MAX, cellsOf, changedCells, progressOf, type CellKind } from "./overviewModel";
 
 /** What a card draws — a registry row, or the wizard's "this is what it will be". */
@@ -18,8 +18,6 @@ export interface CardData {
   templateName?: string | null;
   exists: boolean;
   taskCounts?: TaskCounts | null;
-  /** Questions and provisional decisions waiting on the person (D170). */
-  youCounts?: YouCounts | null;
   phaseIndex?: number | null;
   phaseCount?: number | null;
   phaseTitle?: string | null;
@@ -216,7 +214,7 @@ export default function ProjectCard({
               {t("welcome.recentMissing")}
             </span>
           )}
-          <YouLine counts={counts} waiting={waiting} you={data.youCounts ?? null} />
+          <YouLine counts={counts} waiting={waiting} />
           {running && (
             <span className="card-run">
               <i className="dot-run amb" aria-hidden="true" />
@@ -261,21 +259,10 @@ export default function ProjectCard({
 }
 
 /** The amber line at the foot: who is waiting for authorization, then the counts. */
-function YouLine({
-  counts,
-  waiting,
-  you,
-}: {
-  counts: TaskCounts | null;
-  waiting: string[];
-  you: YouCounts | null;
-}) {
+function YouLine({ counts, waiting }: { counts: TaskCounts | null; waiting: string[] }) {
   const { t } = useTranslation();
   const parts = [
     ...waiting,
-    // D170: questions and provisional decisions agents left for the person.
-    you && you.questions > 0 ? t("welcome.footQuestions", { n: you.questions }) : "",
-    you && you.decisions > 0 ? t("welcome.footDecisions", { n: you.decisions }) : "",
     counts && counts.blocked > 0 ? t("welcome.footBlocked", { n: counts.blocked }) : "",
     counts && counts.doneUnverified > 0 ? t("welcome.footUnverified", { n: counts.doneUnverified }) : "",
   ].filter(Boolean);

@@ -511,6 +511,55 @@ pub fn remove_edge(path: &Path, team_id: &str, from: &str, to: &str) -> Result<(
     })
 }
 
+/// Connect two members both ways (D176): one line on the canvas carries
+/// deliveries in both directions. On disk it is still two directed edges —
+/// so an older app reads it, a one-way line is just one of them removed, and
+/// each direction keeps its own automatic switch. Adds whichever direction is
+/// missing; refused only when both already exist. New directions start
+/// manual, like every new edge.
+pub fn link_members(path: &Path, team_id: &str, a: &str, b: &str) -> Result<()> {
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        if a == b {
+            return Err(NextUpError::InvalidInput("a line cannot connect a workspace to itself".into()));
+        }
+        for endpoint in [a, b] {
+            if !team.members.iter().any(|m| m.workspace_id == endpoint) {
+                return Err(NextUpError::InvalidInput(not_a_member_message(team, endpoint)));
+            }
+        }
+        let mut added = false;
+        for (from, to) in [(a, b), (b, a)] {
+            if !team.edges.iter().any(|e| e.from == from && e.to == to) {
+                team.edges.push(TeamEdge { from: from.to_string(), to: to.to_string(), auto_route: false });
+                added = true;
+            }
+        }
+        if !added {
+            return Err(NextUpError::InvalidInput("these two are already connected both ways".into()));
+        }
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
+}
+
+/// Remove the line between two members — both directions, whichever exist
+/// (D176). Refused when there is no line at all.
+pub fn unlink_members(path: &Path, team_id: &str, a: &str, b: &str) -> Result<()> {
+    with_app_lock(path, || {
+        let mut file = load_teams(path)?;
+        let team = team_mut(&mut file, team_id)?;
+        let before = team.edges.len();
+        team.edges.retain(|e| !((e.from == a && e.to == b) || (e.from == b && e.to == a)));
+        if team.edges.len() == before {
+            return Err(NextUpError::NotFound(format!("no line between {a} and {b} in this team")));
+        }
+        team.updated_at = now_rfc3339();
+        save(path, file)
+    })
+}
+
 /// Set the auto-route policy on an existing edge (D71). Edges carry no id of
 /// their own — the (from, to) pair names them, same as `remove_edge`.
 pub fn set_edge_auto_route(
@@ -1501,5 +1550,32 @@ mod tests {
         assert_eq!(remove_edge(&path, &team.id, "b", "a").unwrap_err().kind(), "not_found");
         remove_edge(&path, &team.id, "a", "b").unwrap();
         assert!(load_teams(&path).unwrap().teams[0].edges.is_empty());
+    }
+
+    #[test]
+    fn one_line_connects_both_ways_and_goes_away_whole() {
+        let (_g, path, team) = seeded();
+        link_members(&path, &team.id, "a", "b").unwrap();
+        let pairs = |p: &Path| -> Vec<(String, bool)> {
+            load_teams(p).unwrap().teams[0].edges.iter().map(|e| (format!("{}{}", e.from, e.to), e.auto_route)).collect()
+        };
+        assert_eq!(pairs(&path), [("ab".to_string(), false), ("ba".to_string(), false)], "both directions, both manual");
+        assert_eq!(link_members(&path, &team.id, "b", "a").unwrap_err().kind(), "invalid_input");
+
+        // A one-way line made two-way: only the missing direction is added,
+        // and the existing one keeps its switch.
+        add_edge(&path, &team.id, "b", "c").unwrap();
+        set_edge_auto_route(&path, &team.id, "b", "c", true).unwrap();
+        link_members(&path, &team.id, "c", "b").unwrap();
+        let now = pairs(&path);
+        assert!(now.contains(&("bc".to_string(), true)) && now.contains(&("cb".to_string(), false)), "{now:?}");
+
+        assert_eq!(link_members(&path, &team.id, "a", "a").unwrap_err().kind(), "invalid_input");
+        assert_eq!(link_members(&path, &team.id, "a", "zz").unwrap_err().kind(), "invalid_input");
+
+        unlink_members(&path, &team.id, "b", "a").unwrap();
+        let left: Vec<_> = pairs(&path).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(left, ["bc", "cb"]);
+        assert_eq!(unlink_members(&path, &team.id, "a", "b").unwrap_err().kind(), "not_found");
     }
 }

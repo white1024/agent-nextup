@@ -78,8 +78,6 @@ One JSON event per line, **append only**:
 
 **Reversing an earlier decision**: each `decision` line carries an id (`D-0001`), shown beside it in the handoff snapshot. When a decision reverses an earlier one, record the new decision with `supersedes` set to that id. The old decision is **kept** — the ledger is append-only and a decision that was made stays made — but every takeover surface then shows it struck through and marked `SUPERSEDED`, so no later session acts on it. Reversing a decision without saying so is the failure this exists to stop: the old line goes on reading as current, and the next session has no way to tell which of two contradictory decisions is live. Decisions recorded before ids existed have none and cannot be named this way. Supersession is recorded **forwards only** — nothing ever edits the old line, because a ledger you can go back and rewrite is not an audit record.
 
-**Provisional decisions and questions for the user**: a decision taken on an obvious, reversible default rather than asked carries `"provisional": true` (set through `record_decision` — a hand-written line has no id, so it cannot be reviewed). It is marked provisional on the takeover surfaces, waits in the user's **To decide** page, and does not count toward `min_decisions`; the user keeps it or changes it, and either way a new decision supersedes it. Questions go to the same page through `ask_user` and live one file each in `.nextup/questions/` (`Q-0001.json`; `status` is `open`, `answered` or `withdrawn`). The user's answer is recorded as a `decision` whose first line names the question, and the handoff lists it under **Answered — read these first** until an agent reads it with `list_questions`. Questions are engine-written: ask through the tool, and when the tools cannot be reached, ask in the chat instead of writing the file.
-
 **What not to do**: task progress and phase-completion reports are not `decision` entries (use `progress`); long analysis and delivery detail do not belong in the ledger body (put them in memory or `artifacts/` and reference the path from the ledger line); and **a change in actual behaviour belongs in no ledger channel at all** — write it as a spec delta in the task artifact (spec module) and the engine folds it into `specs/` on archive. The ledger records what was chosen and why; the spec records how things now are. The takeover surfaces render only the **first line** of each entry, capped at @SUMMARY_CAP@ characters — the full text is kept in the ledger forever, but nothing past that point reaches the next session. So lead with the conclusion in one short line and put the reasoning on the lines below it. There is only ever that one number: `record_decision` and `record_progress` return a warning on the spot when a first line runs past it, while the entry is still fresh enough to rewrite.
 
 ## 4. Workflow harness (`.nextup/workflow.json`)
@@ -94,7 +92,7 @@ One JSON event per line, **append only**:
 | `all_tasks_done` | At least one task is not `cancelled`, and every task is `done` or `cancelled` |
 | `no_blocked_tasks` | No task is `blocked` |
 | `artifact_exists(path)` | The relative path exists inside the workspace |
-| `min_decisions(n)` | `decision` events **since entering this phase**, not counting provisional ones, >= n |
+| `min_decisions(n)` | `decision` events **since entering this phase** >= n |
 | `manual_confirm(prompt)` | The user has confirmed it in the app (recorded in `state.confirmations`) |
 | `doctor_clean` | The workspace health check (`workspace_doctor`) reports zero errors (warnings do not block) |
 
@@ -128,8 +126,7 @@ One JSON event per line, **append only**:
 | Finish a task | `update_task_status` (-> `done`, regenerates the snapshot) | `status` -> `done`; a running app refreshes automatically |
 | Drop a task that will not happen | `update_task_status` (-> `cancelled`, `reason` required) | `status` -> `cancelled` plus `cancelReason` (§2) |
 | Mark verified or unverified | `set_task_verification` (verified requires an evidence note) | Add or remove the `verifiedAt` and `verifiedNote` fields (§2) |
-| Record a decision | `record_decision` (`provisional: true` for one taken on a default) | Append a `decision` line to the ledger; `supersedes` marks an earlier one reversed (§3) |
-| Leave a question for the user | `ask_user` (then carry on; answers come back through `list_questions`) | Ask in the chat (questions are engine-written, §3) |
+| Record a decision | `record_decision` | Append a `decision` line to the ledger; `supersedes` marks an earlier one reversed (§3) |
 | Tick a step of a task's checklist | `set_task_step` | Set that step's `done` in the task file, update `updatedAt` |
 | Record a progress summary | `record_progress` | Append a `progress` line to the ledger (§3) |
 | Create a task | `create_task` | Create `tasks/T-XXXX.json` per §2, plus a `task_created` ledger line |

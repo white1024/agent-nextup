@@ -48,8 +48,6 @@ pub struct SystemStatus {
     pub keystore_description: String,
     pub workspace: Option<WorkspaceInfo>,
     pub task_counts: Option<TaskCounts>,
-    /// Open questions and provisional decisions waiting on the person (D170).
-    pub you_counts: Option<crate::workspace::questions::YouCounts>,
 }
 
 impl AppState {
@@ -97,10 +95,9 @@ impl AppState {
     /// disk on demand — files are the source of truth, not this struct.
     pub fn status(&self, app_version: &str) -> SystemStatus {
         let workspace = self.workspace();
-        let (info, counts, you) = match &workspace {
+        let (info, counts) = match &workspace {
             Some(ws) => {
                 let counts = counts_for_dir(&ws.paths().tasks_dir()).ok();
-                let you = Some(crate::workspace::questions::you_counts(&ws.paths()));
                 (
                     Some(WorkspaceInfo {
                         root: ws.root.to_string_lossy().into_owned(),
@@ -109,10 +106,9 @@ impl AppState {
                         description: ws.context.description.clone(),
                     }),
                     counts,
-                    you,
                 )
             }
-            None => (None, None, None),
+            None => (None, None),
         };
         SystemStatus {
             app_version: app_version.to_string(),
@@ -122,7 +118,6 @@ impl AppState {
             keystore_description: self.keys.describe(),
             workspace: info,
             task_counts: counts,
-            you_counts: you,
         }
     }
 }

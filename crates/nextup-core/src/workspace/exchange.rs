@@ -129,6 +129,15 @@ pub struct DeliveryEnvelope {
     /// precisely the moment it started mattering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// The downstream projects the publisher named (D176). Empty = every
+    /// project downstream of the sender, which is what an envelope meant
+    /// before this field existed — so older envelopes load unchanged and an
+    /// older app, which ignores the field, still sends to everyone.
+    ///
+    /// Narrows, never widens: each entry was resolved against the sender's
+    /// own outgoing edges at publish time, and routing still needs an edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addressed_to: Vec<DeliverySource>,
     /// Stamped by routing on the inbox copy; the outbox original has neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
@@ -418,12 +427,75 @@ pub struct PublishOptions {
     /// outbox: once routed, the copies downstream cannot be recalled and
     /// claiming otherwise would be a lie.
     pub supersedes: Option<String>,
+    /// Who it is for (D176), already resolved with [`resolve_recipients`].
+    /// Empty = every downstream project.
+    pub addressed_to: Vec<DeliverySource>,
+}
+
+/// Turn the names (or workspace ids) a publisher gave into the downstream
+/// projects they mean (D176). Only projects this workspace already has an
+/// edge to are candidates: naming narrows a delivery, it can never reach a
+/// project the user did not wire. A name shared by two different projects is
+/// refused rather than guessed — the id settles it. Duplicates collapse.
+pub fn resolve_recipients(
+    paths: &WorkspacePaths,
+    teams: &[crate::workspace::teams::Team],
+    wanted: &[String],
+) -> Result<Vec<DeliverySource>> {
+    let wanted: Vec<&str> = wanted.iter().map(|w| w.trim()).filter(|w| !w.is_empty()).collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx = load_context(&paths.context_file())?;
+    let Some(me) = ctx.workspace_id.as_deref() else {
+        return Err(NextUpError::InvalidInput(
+            "`to` names downstream projects, but this project is not in any team yet".into(),
+        ));
+    };
+    let mut downstream: Vec<DeliverySource> = Vec::new();
+    for team in teams {
+        for edge in team.edges.iter().filter(|e| e.from == me) {
+            if let Some(m) = team.members.iter().find(|m| m.workspace_id == edge.to) {
+                if !downstream.iter().any(|d| d.workspace_id == m.workspace_id) {
+                    downstream.push(DeliverySource { workspace_id: m.workspace_id.clone(), name: m.name.clone() });
+                }
+            }
+        }
+    }
+    let known = || downstream.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ");
+    let mut out: Vec<DeliverySource> = Vec::new();
+    for w in wanted {
+        let hits: Vec<&DeliverySource> = downstream
+            .iter()
+            .filter(|d| d.workspace_id == w || d.name.eq_ignore_ascii_case(w))
+            .collect();
+        let hit = match hits.as_slice() {
+            [one] => *one,
+            [] => {
+                return Err(NextUpError::InvalidInput(format!(
+                    "`to` names {w}, which is not downstream of this project — it can send to: {}",
+                    if downstream.is_empty() { "nobody yet (no flow leaves this project)".to_string() } else { known() }
+                )))
+            }
+            _ => {
+                return Err(NextUpError::InvalidInput(format!(
+                    "`to` names {w}, and more than one downstream project has that name — use its workspace id                      ({})",
+                    hits.iter().map(|h| h.workspace_id.as_str()).collect::<Vec<_>>().join(", ")
+                )))
+            }
+        };
+        if !out.iter().any(|o| o.workspace_id == hit.workspace_id) {
+            out.push(hit.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Package the sender's note and attachments as a delivery envelope in this
 /// workspace's outbox (D73 — no longer the handoff snapshot). Requires a note
 /// or at least one attachment. Where the delivery goes is decided later by
-/// routing along the team graph, never here (09 §12 Q2).
+/// routing along the team graph (09 §12 Q2); since D176 the publisher may name
+/// which of its downstream projects it is for, and routing honours that.
 pub fn publish_delivery(
     paths: &WorkspacePaths,
     app_version: &str,
@@ -483,6 +555,7 @@ pub fn publish_delivery(
             published_at: now_rfc3339(),
             supersedes: options.supersedes.clone(),
             superseded_by: None,
+            addressed_to: options.addressed_to.clone(),
             delivered_at: None,
             delivered_via: None,
             agent_read_at: None,
@@ -507,6 +580,12 @@ pub fn publish_delivery(
             }
         }
         let suffix = note.map(|n| format!(" — {n}")).unwrap_or_default();
+        let for_whom = if options.addressed_to.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = options.addressed_to.iter().map(|d| d.name.as_str()).collect();
+            format!(" for {}", names.join(", "))
+        };
         let replacing = options
             .supersedes
             .as_deref()
@@ -514,7 +593,7 @@ pub fn publish_delivery(
             .unwrap_or_default();
         ledger_for(paths).append(&LedgerEvent::new(
             LedgerKind::DeliveryPublished,
-            format!("delivery {} published to outbox{replacing}{suffix}", envelope.id),
+            format!("delivery {} published to outbox{for_whom}{replacing}{suffix}", envelope.id),
             None,
         ))?;
         generate_handoff(paths, app_version)?;
@@ -734,6 +813,8 @@ pub struct AutoRouted {
 /// - **only automatic edges** are sent, and while any manual edge leaves this
 ///   workspace the original stays pending (`keep_pending`): nobody decided to
 ///   skip those (13 §3);
+/// - **an addressed envelope** (D176) goes only along the flows to the
+///   projects it names, and only manual flows to those projects hold it back;
 /// - **a superseded envelope never travels** on its own — its publisher has
 ///   declared it wrong, an automatic line has nobody to read that tag, and a
 ///   delivery cannot be recalled. The correction is what goes out;
@@ -753,24 +834,25 @@ pub fn auto_route(
         // Never joined a team: no id was minted, so no edge can name it.
         return Ok(Vec::new());
     };
-    let mut destinations = Vec::new();
-    let mut manual_edges = 0usize;
+    // Every flow leaving this workspace: who it reaches and whether a human
+    // switched it to automatic.
+    let mut flows: Vec<(String, bool, RouteDestination)> = Vec::new();
     for team in teams {
         for edge in team.edges.iter().filter(|e| e.from == me) {
-            if !edge.auto_route {
-                manual_edges += 1;
-                continue;
-            }
             if let Some(target) = team.members.iter().find(|m| m.workspace_id == edge.to) {
-                destinations.push(RouteDestination {
-                    root: PathBuf::from(&target.root),
-                    team_id: team.id.clone(),
-                    team_name: team.name.clone(),
-                });
+                flows.push((
+                    edge.to.clone(),
+                    edge.auto_route,
+                    RouteDestination {
+                        root: PathBuf::from(&target.root),
+                        team_id: team.id.clone(),
+                        team_name: team.name.clone(),
+                    },
+                ));
             }
         }
     }
-    if destinations.is_empty() {
+    if !flows.iter().any(|(_, auto, _)| *auto) {
         return Ok(Vec::new());
     }
 
@@ -780,10 +862,20 @@ pub fn auto_route(
         .filter(|row| only.is_none_or(|id| row.id == id))
         .collect();
     pending.reverse(); // list_deliveries is newest first
-    let opts = RouteOptions { auto: true, keep_pending: manual_edges > 0, actor: None };
     let mut results = Vec::with_capacity(pending.len());
     for row in pending {
-        match route_delivery(upstream, app_version, &row.id, &destinations, opts.clone()) {
+        // D176: an addressed envelope travels only to the projects it names.
+        // The flows it does not name are not waiting for it, so they do not
+        // hold the original back either.
+        let wants = |to: &str| row.addressed_to.is_empty() || row.addressed_to.iter().any(|d| d.workspace_id == to);
+        let destinations: Vec<RouteDestination> =
+            flows.iter().filter(|(to, auto, _)| *auto && wants(to)).map(|(_, _, d)| d.clone()).collect();
+        if destinations.is_empty() {
+            continue;
+        }
+        let manual_edges = flows.iter().filter(|(to, auto, _)| !*auto && wants(to)).count();
+        let opts = RouteOptions { auto: true, keep_pending: manual_edges > 0, actor: None };
+        match route_delivery(upstream, app_version, &row.id, &destinations, opts) {
             Ok(outcome) => results.push(AutoRouted { envelope_id: row.id, outcome: Some(outcome), error: None }),
             Err(e) if e.kind() == "not_found" => {}
             Err(e) => results.push(AutoRouted { envelope_id: row.id, outcome: None, error: Some(e.to_string()) }),
@@ -816,6 +908,9 @@ pub struct DeliverySummary {
     pub supersedes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Who the publisher named (D176); empty = every downstream project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addressed_to: Vec<DeliverySource>,
     pub published_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
@@ -872,6 +967,7 @@ pub fn list_deliveries(
             note_truncated,
             supersedes: envelope.supersedes,
             superseded_by: envelope.superseded_by,
+            addressed_to: envelope.addressed_to,
             published_at: envelope.published_at,
             delivered_at: envelope.delivered_at,
             delivered_via: envelope.delivered_via,
@@ -1298,7 +1394,7 @@ mod tests {
             "0.1.0",
             Some("corrected figures".into()),
             &[],
-            PublishOptions { supersedes: Some(first.id.clone()) },
+            PublishOptions { supersedes: Some(first.id.clone()), ..Default::default() },
         )
         .unwrap();
 
@@ -1345,7 +1441,7 @@ mod tests {
             "0.1.0",
             Some("right".into()),
             &[],
-            PublishOptions { supersedes: Some(first.id.clone()) },
+            PublishOptions { supersedes: Some(first.id.clone()), ..Default::default() },
         )
         .unwrap();
 
@@ -1377,7 +1473,7 @@ mod tests {
             "0.1.0",
             Some("too late".into()),
             &[],
-            PublishOptions { supersedes: Some(sent.id.clone()) },
+            PublishOptions { supersedes: Some(sent.id.clone()), ..Default::default() },
         )
         .unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
@@ -1481,7 +1577,7 @@ mod tests {
             "0.1.0",
             Some("v2".into()),
             &[],
-            PublishOptions { supersedes: Some(wrong.id.clone()) },
+            PublishOptions { supersedes: Some(wrong.id.clone()), ..Default::default() },
         )
         .unwrap();
 
@@ -1504,6 +1600,119 @@ mod tests {
         // A later full sweep picks up the rest, oldest first.
         auto_route(&up, "0.1.0", &graph(&up, &[(&down, true)]), None).unwrap();
         assert!(inbox_ids(&down).contains(&older.id));
+    }
+
+    // ── D176: a publisher may name who a delivery is for ────────────────────
+
+    #[test]
+    fn an_addressed_delivery_travels_only_to_the_projects_it_names() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, beta) = workspace("beta");
+        let (_gc, gamma) = workspace("gamma");
+        crate::workspace::ops::ensure_workspace_id(&up, "0.1.0").unwrap();
+        let teams = graph(&up, &[(&beta, true), (&gamma, true)]);
+
+        let to = resolve_recipients(&up, &teams, &["DOWN-1".into()]).unwrap();
+        assert_eq!(to.len(), 1, "names match without regard to case");
+        assert_eq!(to[0].workspace_id, "down-1");
+        let envelope = publish_delivery(
+            &up,
+            "0.1.0",
+            Some("for gamma only".into()),
+            &[],
+            PublishOptions { addressed_to: to, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(envelope.addressed_to[0].name, "down-1");
+
+        let results = auto_route(&up, "0.1.0", &teams, None).unwrap();
+        let outcome = results[0].outcome.as_ref().unwrap();
+        assert_eq!(outcome.delivered, vec!["gamma".to_string()]);
+        assert!(outcome.outbox_cleared, "nobody else was owed a copy");
+        assert!(inbox_ids(&beta).is_empty());
+        assert_eq!(inbox_ids(&gamma), vec![envelope.id.clone()]);
+        let copy = get_delivery(&gamma, DeliveryBox::Inbox, &envelope.id).unwrap();
+        assert_eq!(copy.addressed_to.len(), 1, "the receiver can see who it was for");
+        let up_log = Ledger::new(up.ledger_file()).recent_of_kind(LedgerKind::DeliveryPublished, 1).unwrap();
+        assert!(up_log[0].message.contains(" for down-1"), "{}", up_log[0].message);
+    }
+
+    #[test]
+    fn an_addressed_delivery_waits_only_for_the_manual_flows_it_names() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, beta) = workspace("beta");
+        let (_gc, gamma) = workspace("gamma");
+        crate::workspace::ops::ensure_workspace_id(&up, "0.1.0").unwrap();
+        // beta automatic, gamma manual.
+        let teams = graph(&up, &[(&beta, true), (&gamma, false)]);
+
+        // Named the automatic one: the manual flow to gamma is not waiting.
+        let to = resolve_recipients(&up, &teams, &["down-0".into()]).unwrap();
+        publish_delivery(&up, "0.1.0", Some("a".into()), &[], PublishOptions { addressed_to: to, ..Default::default() })
+            .unwrap();
+        let outcome = auto_route(&up, "0.1.0", &teams, None).unwrap().remove(0).outcome.unwrap();
+        assert!(outcome.outbox_cleared);
+
+        // Named only the manual one: nothing goes by policy, it waits for a person.
+        let to = resolve_recipients(&up, &teams, &["down-1".into()]).unwrap();
+        let held = publish_delivery(&up, "0.1.0", Some("b".into()), &[], PublishOptions { addressed_to: to, ..Default::default() })
+            .unwrap();
+        assert!(auto_route(&up, "0.1.0", &teams, None).unwrap().is_empty());
+        let waiting: Vec<_> = list_deliveries(&up, DeliveryBox::Outbox, NoteDetail::Brief).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, held.id);
+        assert_eq!(waiting[0].addressed_to[0].workspace_id, "down-1", "the send dialog can preselect it");
+    }
+
+    #[test]
+    fn naming_a_recipient_never_reaches_past_the_drawn_flows() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, beta) = workspace("beta");
+        // On a team, but with no flow leaving it: nobody can be named.
+        let unwired = graph_without_id(&up);
+        let err = resolve_recipients(&up, &unwired, &["beta".into()]).unwrap_err();
+        assert!(err.to_string().contains("nobody yet"), "{err}");
+
+        crate::workspace::ops::ensure_workspace_id(&up, "0.1.0").unwrap();
+        let teams = graph(&up, &[(&beta, true)]);
+        let err = resolve_recipients(&up, &teams, &["up".into()]).unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+        assert!(err.to_string().contains("can send to: down-0"), "{err}");
+        // Blank names are no names: the delivery goes everywhere, as before.
+        assert!(resolve_recipients(&up, &teams, &["  ".into()]).unwrap().is_empty());
+        // The same project named twice, by name and by id, is one recipient.
+        assert_eq!(resolve_recipients(&up, &teams, &["down-0".into(), "down-0".into()]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_name_two_downstream_projects_share_is_refused_not_guessed() {
+        let (_ga, up) = workspace("alpha");
+        let (_gb, beta) = workspace("beta");
+        let (_gc, gamma) = workspace("gamma");
+        crate::workspace::ops::ensure_workspace_id(&up, "0.1.0").unwrap();
+        let mut teams = graph(&up, &[(&beta, true), (&gamma, true)]);
+        for m in teams[0].members.iter_mut().filter(|m| m.workspace_id.starts_with("down-")) {
+            m.name = "twin".into();
+        }
+        let err = resolve_recipients(&up, &teams, &["twin".into()]).unwrap_err();
+        assert!(err.to_string().contains("down-0, down-1"), "{err}");
+        assert_eq!(resolve_recipients(&up, &teams, &["down-1".into()]).unwrap()[0].workspace_id, "down-1");
+    }
+
+    /// A team with `up` on it under a made-up id and no flows at all.
+    fn graph_without_id(up: &WorkspacePaths) -> Vec<crate::workspace::teams::Team> {
+        use crate::workspace::teams::{Team, TeamMember};
+        vec![Team {
+            id: "team-1".into(),
+            name: "t".into(),
+            members: vec![TeamMember { workspace_id: "x".into(), root: up.root().display().to_string(), name: "up".into() }],
+            edges: vec![],
+            layout: Default::default(),
+            orbit_layout: Default::default(),
+            prime: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        }]
     }
 
     #[test]

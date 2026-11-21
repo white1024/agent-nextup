@@ -39,7 +39,6 @@ import {
   IconFlow,
   IconFolder,
   IconInbox,
-  IconClipboardCheck,
   IconLayers,
   AppMark,
   IconBack,
@@ -68,7 +67,6 @@ import Dashboard from "./views/dashboard";
 import Tasks from "./views/tasks";
 import Collab from "./views/collab";
 import Inbox from "./views/Inbox";
-import Decide from "./views/decide";
 import Specs from "./views/specs";
 import Teams from "./views/teams";
 import Ledger from "./views/Ledger";
@@ -96,7 +94,6 @@ type View =
   | "collab"
   | "specs"
   | "inbox"
-  | "decide"
   | "ledger"
   | "search"
   | "tools"
@@ -115,8 +112,6 @@ type StatusChange = "enter" | "switch" | "refresh";
 const NAV: { view: View; icon: ComponentType<IconProps> }[] = [
   { view: "dashboard", icon: IconDashboard },
   { view: "tasks", icon: IconTasks },
-  // D170: what agents left for the person to settle.
-  { view: "decide", icon: IconClipboardCheck },
   { view: "collab", icon: IconUsers },
   { view: "specs", icon: IconDoc },
   { view: "inbox", icon: IconInbox },
@@ -152,7 +147,6 @@ const VIEW_SCOPE: Record<View, "app" | "workspace"> = {
   collab: "workspace",
   specs: "workspace",
   inbox: "workspace",
-  decide: "workspace",
   ledger: "workspace",
   search: "workspace",
   tools: "workspace",
@@ -372,17 +366,6 @@ export default function App() {
   useEffect(() => {
     const unlisten = listen<WorkspaceChangedPayload>("workspace://changed", () => {
       setRefreshKey((k) => k + 1);
-      void refresh();
-    });
-    return () => {
-      void unlisten.then((f) => f());
-    };
-  }, [refresh]);
-
-  // A provisional decision lives only in the ledger (D170), so the To decide
-  // badge also has to follow ledger appends; the status read is cheap.
-  useEffect(() => {
-    const unlisten = listen("ledger://appended", () => {
       void refresh();
     });
     return () => {
@@ -982,7 +965,6 @@ export default function App() {
   }
 
   const blocked = status.taskCounts?.blocked ?? 0;
-  const waitingOnYou = (status.youCounts?.questions ?? 0) + (status.youCounts?.decisions ?? 0);
   const cats = categoryItems(recent ?? [], templates, t).filter((c) => c.id !== CAT_ALL);
   // Built-ins and the custom bucket are always listed, so an emptied
   // selection just shows the empty-category message. Only "No template" can
@@ -1063,7 +1045,6 @@ export default function App() {
                     <Icon size={17} className="nav-icon" />
                     {t(`nav.${v}`)}
                     {v === "tasks" && <NavBadge count={blocked} title={t("status.blocked")} />}
-                    {v === "decide" && <NavBadge count={waitingOnYou} title={t("nav.decide")} />}
                     {v === "inbox" && (
                       <NavBadge count={inboxUnseen} title={t("notify.unreadDeliveries")} />
                     )}
@@ -1290,7 +1271,6 @@ export default function App() {
                   onGoToTasks={() => setView("tasks")}
                 />
               )}
-              {view === "decide" && <Decide refreshKey={refreshKey} onMutated={onMutated} />}
               {view === "ledger" && <Ledger refreshKey={refreshKey} onMutated={onMutated} />}
               {view === "search" && <Search refreshKey={refreshKey} />}
               {view === "tools" && (

@@ -288,6 +288,8 @@ export function bezAt(P: Bez, u: number): Pos {
 
 const mix = (a: Pos, b: Pos, u: number): Pos => ({ x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u });
 const rev = (P: Bez): Bez => [P[3], P[2], P[1], P[0]];
+/** The same arc run the other way (D176: a light travelling back along a two-way line). */
+export const reverseBez = rev;
 
 /** The u0…u1 piece of a curve, itself a cubic Bézier (de Casteljau). */
 function cut(P: Bez, u0: number, u1: number): Bez {
@@ -404,6 +406,8 @@ export interface OrbitDraw {
   mark: Pos;
   /** The arrowhead's SVG transform: its tip on the arc's end. */
   arrow: string;
+  /** The same at the arc's start, for a line that also runs back (D176). */
+  back: string;
 }
 
 /** The arrowhead: a notched triangle drawn pointing +x, tip at the origin. */
@@ -431,7 +435,7 @@ export function orbitDraws(team: Team, g: OrbitGeo, pos: Positions): Record<stri
   const marks = orbitMarks(team, g, curves, pos);
   const out: Record<string, OrbitDraw> = {};
   for (const [k, Q] of Object.entries(curves)) {
-    out[k] = { q: Q, d: bezPath(Q), mark: marks[k] ?? bezAt(Q, 0.5), arrow: arrowAt(Q) };
+    out[k] = { q: Q, d: bezPath(Q), mark: marks[k] ?? bezAt(Q, 0.5), arrow: arrowAt(Q), back: arrowAt(rev(Q)) };
   }
   return out;
 }

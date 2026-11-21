@@ -140,13 +140,9 @@ pub struct LedgerEvent {
     /// ledger worth having.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
-    /// A decision taken on a default and not yet reviewed by the person
-    /// (D170). It waits in the app's "to decide" queue until a later decision
-    /// supersedes it — the confirmation and the revision are both just that —
-    /// and it never counts toward a phase's `min_decisions` gate: the gate
-    /// asks for a decision someone made, not one an agent assumed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub provisional: bool,
+    // 1.1.0 wrote a `provisional` flag on some decision lines (D170). It was
+    // withdrawn with the To decide queue (D175); those lines now read as plain
+    // decisions — the field is simply ignored on the way in.
 }
 
 /// How a hub tool attempt ended (D75) — structured mirror of the
@@ -352,7 +348,6 @@ impl LedgerEvent {
             to: None,
             id: None,
             supersedes: None,
-            provisional: false,
         }
     }
 
@@ -400,12 +395,6 @@ impl LedgerEvent {
     /// Stamp the id of the decision this one overturns.
     pub fn superseding(mut self, target: Option<String>) -> Self {
         self.supersedes = target;
-        self
-    }
-
-    /// Mark a decision as taken on a default, awaiting review (D170).
-    pub fn provisionally(mut self, provisional: bool) -> Self {
-        self.provisional = provisional;
         self
     }
 }

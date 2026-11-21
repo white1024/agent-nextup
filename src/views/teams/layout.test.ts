@@ -8,10 +8,12 @@ import {
   ROW,
   autoPositions,
   canConnect,
+  drawnTeam,
   edgeGeo,
   edgeGeos,
   fitViewport,
   layersOf,
+  linesOf,
   markPoints,
   returnEdges,
   returnLinePoints,
@@ -123,8 +125,13 @@ describe("canConnect", () => {
     expect(canConnect("a", "", chain)).toBe(false);
   });
 
-  it("rejects an edge that already exists", () => {
-    expect(canConnect("a", "b", chain)).toBe(false);
+  // D176: a line connects both ways, so drawing over a one-way line adds the
+  // way back; only a pair already connected both ways is refused.
+  it("allows a line over a one-way flow and refuses a pair already connected both ways", () => {
+    expect(canConnect("a", "b", chain)).toBe(true);
+    const both = [edge("a", "b"), edge("b", "a")];
+    expect(canConnect("a", "b", both)).toBe(false);
+    expect(canConnect("b", "a", both)).toBe(false);
   });
 
   // D161: findings go back upstream, so an edge that closes a loop is a
@@ -132,6 +139,30 @@ describe("canConnect", () => {
   it("allows a flow back upstream, however long the way round", () => {
     expect(canConnect("b", "a", chain)).toBe(true);
     expect(canConnect("c", "a", chain)).toBe(true);
+  });
+});
+
+describe("linesOf (D176)", () => {
+  it("draws two members that send to each other as one line", () => {
+    const lines = linesOf([edge("a", "b"), edge("b", "c"), edge("b", "a")]);
+    expect(lines.map((l) => [`${l.ab.from}${l.ab.to}`, l.ba && `${l.ba.from}${l.ba.to}`])).toEqual([
+      ["ab", "ba"],
+      ["bc", null],
+    ]);
+  });
+
+  it("draws a pair along the direction that is not the way back upstream", () => {
+    // Of the pair, the edge that closed the loop is the way back (D161); the
+    // line is drawn along the other one, whichever was drawn first.
+    const lines = linesOf([edge("a", "b"), edge("b", "c"), edge("c", "b")]);
+    expect(lines.find((l) => l.ba !== null)!.ab).toEqual(edge("b", "c"));
+    const flipped = linesOf([edge("c", "b"), edge("a", "b"), edge("b", "c")]);
+    expect(flipped.find((l) => l.ba !== null)!.ab).toEqual(edge("c", "b"));
+  });
+
+  it("gives the canvas one edge per line, automatic when either way is", () => {
+    const t = team(["a", "b"], [edge("a", "b"), { from: "b", to: "a", autoRoute: true }]);
+    expect(drawnTeam(t).edges).toEqual([{ from: "a", to: "b", autoRoute: true }]);
   });
 });
 

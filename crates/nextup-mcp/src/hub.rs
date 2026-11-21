@@ -609,39 +609,6 @@ pub struct RecordDecisionArgs {
     /// this decision actually reverses a previous one.
     #[serde(default)]
     pub supersedes: Option<String>,
-    /// true = you took this on a default without asking (reversible, obvious default); it waits in the user's To decide page until they confirm or revise it, and it does not count toward a phase's decision gate
-    #[serde(default)]
-    pub provisional: bool,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AskUserArgs {
-    /// The question, answerable on its own; put the context a reader needs in the first line
-    pub question: String,
-    /// What you would do — offered to the user as the one-press answer
-    #[serde(default)]
-    pub recommendation: Option<String>,
-    /// Answer choices, when the question has a closed set (at most 10)
-    #[serde(default)]
-    pub options: Vec<String>,
-    /// Who should really answer, when it is not the user (e.g. "legal", "the vendor") — the user forwards it
-    #[serde(default)]
-    pub ask: Option<String>,
-    /// Ids of the tasks this question holds up
-    #[serde(default)]
-    pub blocks: Vec<String>,
-    /// What you will proceed on if nobody answers
-    #[serde(default)]
-    pub default_answer: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ListQuestionsArgs {
-    /// true = every question, answered and withdrawn ones included; default = the open ones plus answers you have not read yet
-    #[serde(default)]
-    pub all: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -725,6 +692,11 @@ pub struct PublishDeliveryArgs {
     /// Id of an outbox envelope this one corrects. The old one is not deleted — it is marked as replaced so the user does not send it by mistake. Only works while it is still waiting in the outbox: once sent, the downstream copy cannot be recalled
     #[serde(default)]
     pub supersedes: Option<String>,
+    /// Which downstream projects this is for, by name (or workspace id) as list_teammates shows them.
+    /// Omit to send to every project downstream of this one. Only projects with a flow from here can be named;
+    /// naming narrows a delivery, it never reaches a project the user did not connect.
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1107,62 +1079,16 @@ impl Hub {
 
     #[tool(
         name = "record_decision",
-        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. Each decision is given an id (D-0001) shown beside it in the handoff snapshot. When this decision reverses an earlier one, pass that decision's id as `supersedes`: the old decision is kept in the record but marked SUPERSEDED, so a later session can see it was made and that it no longer holds. Reversing an earlier decision without saying so is how a workspace ends up acting on a decision nobody still stands behind. Pass `provisional: true` when you took a reversible choice on an obvious default instead of asking: it goes to the user's To decide page for review and does not count toward a phase's decision gate. The handoff surface renders only the first line; the full text is kept in the ledger forever."
+        description = "Write one technical decision to the ledger; it surfaces under Recent decisions in the handoff document. One entry = one directional choice plus its reasoning, within a few lines. Task progress and phase-completion reports are not decisions — use record_progress for those. Each decision is given an id (D-0001) shown beside it in the handoff snapshot. When this decision reverses an earlier one, pass that decision's id as `supersedes`: the old decision is kept in the record but marked SUPERSEDED, so a later session can see it was made and that it no longer holds. Reversing an earlier decision without saying so is how a workspace ends up acting on a decision nobody still stands behind. The handoff surface renders only the first line; the full text is kept in the ledger forever."
     )]
     async fn record_decision(
         &self,
         Parameters(args): Parameters<RecordDecisionArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch("record_decision", move |paths| {
-            let event = ops::add_decision_with(
-                paths,
-                APP_VERSION,
-                &args.message,
-                args.supersedes.as_deref(),
-                args.provisional,
-            )?;
+            let event =
+                ops::add_decision(paths, APP_VERSION, &args.message, args.supersedes.as_deref())?;
             verbosity_checked(event)
-        })
-        .await
-    }
-
-    #[tool(
-        name = "ask_user",
-        description = "Put a question in the user's To decide page instead of stopping to ask in the chat. Use it for what you cannot settle yourself and that can wait: carry on with other work, and read the answer later with list_questions (answered questions are also listed first in the handoff). Give your recommended answer, who should really answer if not the user, the tasks it holds up (mark those blocked yourself if they cannot proceed), and what you will assume if nobody answers. Ask in the chat only when you truly cannot continue without the answer. Writes a note to the ledger and regenerates the handoff layer; the user's answer is recorded as a decision."
-    )]
-    async fn ask_user(
-        &self,
-        Parameters(args): Parameters<AskUserArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let actor = self.agent.clone();
-        self.dispatch("ask_user", move |paths| {
-            ops::ask_user(
-                paths,
-                APP_VERSION,
-                nextup_core::workspace::questions::NewQuestion {
-                    question: args.question,
-                    recommendation: args.recommendation,
-                    options: args.options,
-                    ask: args.ask,
-                    blocks: args.blocks,
-                    default_answer: args.default_answer,
-                },
-                actor,
-            )
-        })
-        .await
-    }
-
-    #[tool(
-        name = "list_questions",
-        description = "Read the questions in the user's To decide page: by default the open ones plus answers you have not read yet. Reading an answer here marks it read, so the handoff stops listing it — act on it (and update the tasks it held) in the same session."
-    )]
-    async fn list_questions(
-        &self,
-        Parameters(args): Parameters<ListQuestionsArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.dispatch("list_questions", move |paths| {
-            ops::read_questions_as_agent(paths, APP_VERSION, args.all)
         })
         .await
     }
@@ -1353,7 +1279,7 @@ impl Hub {
 
     #[tool(
         name = "publish_delivery",
-        description = "Publish a deliverable (team module): package what you are handing downstream into an envelope in this workspace's outbox. Content = note (what you are delivering and how to use it) plus files (the actual delivered artifacts: code, reports, data). At least one of note and files must be present; an empty pair is rejected. This is something you assemble deliberately for another project — it is not this project's handoff snapshot. Where it goes is decided by the user, never by you: on flows the user has switched to automatic it is sent the moment you publish, and otherwise it waits in the outbox until the user sends it from the Agent NextUp team view. You never name a recipient. Returns the envelope id, its publication time, `sentTo` (projects that received it just now) and `pendingRouting` (still in the outbox, waiting for the user or for a retry)."
+        description = "Publish a deliverable (team module): package what you are handing downstream into an envelope in this workspace's outbox. Content = note (what you are delivering and how to use it) plus files (the actual delivered artifacts: code, reports, data). At least one of note and files must be present; an empty pair is rejected. This is something you assemble deliberately for another project — it is not this project's handoff snapshot. Where it can go is decided by the user, never by you: only along the flows the user drew from this project. Within those, name who it is for with `to` (names from list_teammates, `downstream: true`) when it is not meant for every downstream project — otherwise each of them gets a copy. On flows the user has switched to automatic it is sent the moment you publish; otherwise it waits in the outbox until the user sends it from the Agent NextUp team view, with the projects you named already selected. Returns the envelope id, its publication time, `sentTo` (projects that received it just now) and `pendingRouting` (still in the outbox, waiting for the user or for a retry)."
     )]
     async fn publish_delivery(
         &self,
@@ -1368,12 +1294,20 @@ impl Hub {
             for rel in &args.files {
                 attachment_paths.push(exchange::resolve_workspace_relative(paths, rel)?);
             }
+            // D176: resolve who it is for before anything is written, so a
+            // name that is not downstream refuses the publish outright.
+            let addressed_to = if args.to.iter().all(|t| t.trim().is_empty()) {
+                Vec::new()
+            } else {
+                let teams = nextup_core::workspace::teams::load_teams(&app_teams_path(app_dir.as_ref())?)?;
+                exchange::resolve_recipients(paths, &teams.teams, &args.to)?
+            };
             let envelope = exchange::publish_delivery(
                 paths,
                 APP_VERSION,
                 args.note,
                 &attachment_paths,
-                exchange::PublishOptions { supersedes: args.supersedes },
+                exchange::PublishOptions { supersedes: args.supersedes, addressed_to },
             )?;
             // D152: an edge the user switched to automatic is that user's
             // standing decision to send, so honour it now rather than when the
@@ -1417,7 +1351,7 @@ impl Hub {
 
     #[tool(
         name = "list_teammates",
-        description = "List the projects on the teams this workspace belongs to (team module), and which of them are downstream of it. Use it before writing a delivery note: a note is written FOR the project that receives it, and `downstream: true` marks the ones a delivery published here can actually be sent to. A teammate that is not downstream is on the team but has no flow edge from here — publishing does not reach them. This is read-only and scoped to this workspace's own teams: you still name no recipient — where a delivery goes is decided by the flow edges a human drew (sent the moment you publish on an automatic edge, otherwise when a human sends it) — and you learn nothing about teams this workspace is not on. An empty result means this workspace is on no team, or the app-level team store is not reachable."
+        description = "List the projects on the teams this workspace belongs to (team module), and which of them are downstream of it. Use it before writing a delivery note: a note is written FOR the project that receives it, and `downstream: true` marks the ones a delivery published here can actually be sent to. A teammate that is not downstream is on the team but has no flow edge from here — publishing does not reach them. This is read-only and scoped to this workspace's own teams: a delivery can only travel along the flow edges a human drew (sent the moment you publish on an automatic edge, otherwise when a human sends it); pass the names of the downstream projects it is for as publish_delivery's `to`, or omit it to reach all of them. You learn nothing about teams this workspace is not on. An empty result means this workspace is on no team, or the app-level team store is not reachable."
     )]
     async fn list_teammates(&self) -> Result<CallToolResult, McpError> {
         self.dispatch("list_teammates", move |paths| {
@@ -1725,7 +1659,7 @@ impl Hub {
 
     #[tool(
         name = "team_route",
-        description = "Send a published envelope on to other workspaces in a team you are the prime of (prime module) — the same move a user makes with the send button in the team view. When a member sends, destinations must be downstream of it in the flow graph. When you send from your own outbox, any member of the team may receive it: you coordinate from above the flow and have no edges. Omit `to` to send to everyone reachable. Both sides' ledgers record that you did this, not a human. Delivering the same envelope twice is harmless: the receiver skips a copy it already has."
+        description = "Send a published envelope on to other workspaces in a team you are the prime of (prime module) — the same move a user makes with the send button in the team view. When a member sends, destinations must be downstream of it in the flow graph. When you send from your own outbox, any member of the team may receive it: you coordinate from above the flow and have no edges. Omit `to` to send to everyone reachable — or, when the envelope's publisher named recipients (`addressedTo`), to those of them that are reachable. Both sides' ledgers record that you did this, not a human. Delivering the same envelope twice is harmless: the receiver skips a copy it already has."
     )]
     async fn team_route(
         &self,
@@ -1757,8 +1691,21 @@ impl Hub {
                     .map(|e| e.to.as_str())
                     .collect()
             };
+            // D176: an envelope its publisher addressed is meant for those
+            // projects only, so "everyone reachable" narrows to them and the
+            // others are not owed a copy.
+            let sender_paths = WorkspacePaths::new(&sender.root);
+            let addressed: Vec<String> =
+                exchange::get_delivery(&sender_paths, exchange::DeliveryBox::Outbox, &args.delivery_id)
+                    .map(|e| e.addressed_to.into_iter().map(|d| d.workspace_id).collect())
+                    .unwrap_or_default();
+            let intended: Vec<&str> = reachable
+                .iter()
+                .copied()
+                .filter(|id| addressed.is_empty() || addressed.iter().any(|a| a == id))
+                .collect();
             let wanted: Vec<&str> = if args.to.is_empty() {
-                reachable.clone()
+                intended.clone()
             } else {
                 args.to.iter().map(String::as_str).collect()
             };
@@ -1796,16 +1743,17 @@ impl Hub {
             }
 
             exchange::route_delivery(
-                &WorkspacePaths::new(&sender.root),
+                &sender_paths,
                 APP_VERSION,
                 &args.delivery_id,
                 &destinations,
                 exchange::RouteOptions {
                     auto: false,
                     // Only the edges asked for are covered, so the original
-                    // stays pending unless this fan-out was the whole set
-                    // (D71 partial-coverage rule).
-                    keep_pending: wanted.len() < reachable.len(),
+                    // stays pending unless this fan-out was the whole set it
+                    // was meant for (D71 partial-coverage rule; D176 — an
+                    // addressed envelope's set is the projects it names).
+                    keep_pending: intended.iter().any(|id| !wanted.contains(id)),
                     actor,
                 },
             )
@@ -2341,43 +2289,28 @@ mod tests {
         server.abort();
     }
 
-    /// D170 over the wire: a question goes into the queue, the person's answer
-    /// comes back through list_questions exactly once, and a provisional
-    /// decision is marked as such.
+    /// D175 withdrew the To decide queue: the two question tools are gone from
+    /// the surface, and a 1.1.0 agent still passing `provisional` to
+    /// record_decision gets an ordinary decision rather than an error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ask_user_round_trips_and_provisional_decisions_are_marked() {
+    async fn the_question_tools_are_gone_and_provisional_is_ignored() {
         let (_guard, paths) = workspace();
-        for tool in ["ask_user", "record_decision"] {
-            agent::set_tool_allowed(&paths, tool, true).unwrap();
-        }
+        agent::set_tool_allowed(&paths, "record_decision", true).unwrap();
         let client = serve_as(&paths, Some("agent-a")).await;
-        let asked = call(
-            &client,
-            "ask_user",
-            json!({ "question": "Which rounding?", "recommendation": "once at the end", "ask": "legal" }),
-        )
-        .await;
-        assert_ne!(asked.is_error, Some(true), "got: {}", text_of(&asked));
-        let body: serde_json::Value = serde_json::from_str(&text_of(&asked)).unwrap();
-        assert_eq!(body["id"], "Q-0001");
-        assert_eq!(body["askedBy"], "agent-a");
+        let tools = client.peer().list_all_tools().await.unwrap();
+        for gone in ["ask_user", "list_questions"] {
+            assert!(!tools.iter().any(|t| t.name == gone), "{gone} is still listed");
+        }
 
-        ops::answer_question(&paths, "0.1.0", "Q-0001", "once at the end").unwrap();
-        let first = call(&client, "list_questions", json!({})).await;
-        let body: serde_json::Value = serde_json::from_str(&text_of(&first)).unwrap();
-        assert_eq!(body[0]["answer"], "once at the end");
-        let again = call(&client, "list_questions", json!({})).await;
-        let body: serde_json::Value = serde_json::from_str(&text_of(&again)).unwrap();
-        assert_eq!(body.as_array().unwrap().len(), 0, "an answer is picked up once");
-
-        let provisional = call(
+        let decided = call(
             &client,
             "record_decision",
             json!({ "message": "Assumed 1.0's rounding", "provisional": true }),
         )
         .await;
-        let body: serde_json::Value = serde_json::from_str(&text_of(&provisional)).unwrap();
-        assert_eq!(body["provisional"], true, "got: {body}");
+        assert_ne!(decided.is_error, Some(true), "got: {}", text_of(&decided));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&decided)).unwrap();
+        assert!(body.get("provisional").is_none(), "got: {body}");
     }
 
     /// D170 over the wire: steps arrive with create_task, change with
@@ -3479,6 +3412,84 @@ mod tests {
             1,
             "nothing more arrived"
         );
+
+        client.cancel().await.unwrap();
+    }
+
+    /// D176 over the wire: research is wired to two projects on automatic
+    /// flows and names one of them — only that one receives it. A name that is
+    /// not downstream refuses the publish before anything is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publishing_to_a_named_project_skips_the_other_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let teams_path = app.join("teams.json");
+        let make = |name: &str| {
+            let root = dir.path().join(name);
+            let ctx = initialize_project(
+                &InitProjectParams {
+                    root: root.to_string_lossy().into_owned(),
+                    name: name.into(),
+                    domain: "coding".into(),
+                    modules: vec![MODULE_TEAM.into()],
+                    create_root: true,
+                    ..Default::default()
+                },
+                &StaticKeyProvider([7u8; 32]),
+                "0.0.0-test",
+            )
+            .unwrap();
+            let row = teams::TeamMember {
+                workspace_id: ctx.workspace_id.clone().unwrap(),
+                root: root.to_string_lossy().into_owned(),
+                name: ctx.name,
+            };
+            (WorkspacePaths::new(&root), row)
+        };
+        let (up, up_row) = make("research");
+        let (flow, flow_row) = make("flow");
+        let (lab, lab_row) = make("lab");
+        let team = teams::create_team(&teams_path, "game").unwrap();
+        for row in [&up_row, &flow_row, &lab_row] {
+            teams::add_member(&teams_path, &team.id, row.clone()).unwrap();
+        }
+        for row in [&flow_row, &lab_row] {
+            teams::add_edge(&teams_path, &team.id, &up_row.workspace_id, &row.workspace_id).unwrap();
+            teams::set_edge_auto_route(&teams_path, &team.id, &up_row.workspace_id, &row.workspace_id, true).unwrap();
+        }
+
+        agent::set_tool_allowed(&up, "publish_delivery", true).unwrap();
+        let hub = Hub::with_app_dir(up.root().to_path_buf(), Some("research-agent".into()), Some(app.clone()));
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = hub.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ().serve(client_io).await.expect("client handshake");
+        let inbox = |p: &WorkspacePaths| {
+            exchange::list_deliveries(p, exchange::DeliveryBox::Inbox, exchange::NoteDetail::Brief).unwrap().len()
+        };
+
+        let sent = call(&client, "publish_delivery", json!({ "note": "findings for the lab", "to": ["lab"] })).await;
+        assert_ne!(sent.is_error, Some(true), "got: {}", text_of(&sent));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&sent)).unwrap();
+        assert_eq!(body["sentTo"], json!(["lab"]));
+        assert_eq!(body["pendingRouting"], false, "flow was never owed a copy");
+        assert_eq!((inbox(&lab), inbox(&flow)), (1, 0));
+
+        let refused = call(&client, "publish_delivery", json!({ "note": "x", "to": ["research"] })).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(text_of(&refused).contains("can send to: flow, lab"), "got: {}", text_of(&refused));
+        assert!(
+            exchange::list_deliveries(&up, exchange::DeliveryBox::Outbox, exchange::NoteDetail::Brief).unwrap().is_empty(),
+            "a refused name writes nothing"
+        );
+
+        // No `to`: every downstream project, as before.
+        call(&client, "publish_delivery", json!({ "note": "for everyone" })).await;
+        assert_eq!((inbox(&lab), inbox(&flow)), (2, 1));
 
         client.cancel().await.unwrap();
     }

@@ -64,7 +64,6 @@ pub fn sync_after_mutation(paths: &WorkspacePaths, app_version: &str) -> Result<
         teams: &teams,
         progress: &progress,
         workflow: workflow.as_ref(),
-        asks: &crate::workspace::questions::ask_summary(paths)?,
         app_version,
         generated_at: now_rfc3339(),
     });

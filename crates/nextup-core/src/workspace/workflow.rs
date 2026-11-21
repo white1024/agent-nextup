@@ -405,9 +405,7 @@ const DECISION_SCAN_LIMIT: usize = 500;
 
 fn count_decisions_since(paths: &WorkspacePaths, since: &str) -> Result<usize> {
     let decisions = ledger_for(paths).recent_of_kind(LedgerKind::Decision, DECISION_SCAN_LIMIT)?;
-    // A provisional decision is an agent's assumption, not the decision the
-    // gate asks for (D170).
-    Ok(decisions.iter().filter(|e| e.at.as_str() >= since && !e.provisional).count())
+    Ok(decisions.iter().filter(|e| e.at.as_str() >= since).count())
 }
 
 fn eval_gate(
@@ -1220,16 +1218,6 @@ mod tests {
         let all_done = status.gates.iter().find(|g| matches!(g.gate, Gate::AllTasksDone)).unwrap();
         assert!(all_done.passed, "cancelled counts as closed: {}", all_done.observed);
         assert!(status.current_phase_entered_on().is_some_and(|d| d.len() == 10));
-    }
-
-    #[test]
-    fn a_provisional_decision_does_not_pass_a_decision_gate() {
-        let (_g, paths) = workspace();
-        crate::workspace::ops::add_decision_with(&paths, "0.1.0", "assumed", None, true).unwrap();
-        let entered = entered_at(&load_workflow(&paths.workflow_file()).unwrap(), "plan");
-        assert_eq!(count_decisions_since(&paths, &entered).unwrap(), 0);
-        crate::workspace::ops::add_decision(&paths, "0.1.0", "settled", None).unwrap();
-        assert_eq!(count_decisions_since(&paths, &entered).unwrap(), 1);
     }
 
     // ── D171: ongoing, switching modes, rolling back ──────────────────────

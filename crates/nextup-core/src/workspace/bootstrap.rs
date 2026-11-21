@@ -115,7 +115,7 @@ pub fn scaffold(paths: &WorkspacePaths, ctx: &ProjectContext) -> Result<Vec<Stri
 /// The section appended to an `AGENTS.md` the engine did not author (D170):
 /// the protocol pointer, the hub line and the state block markers, nothing
 /// else. The person's own text above it is never touched.
-const AGENTS_SECTION: &str = "\n\n## Agent NextUp\n\n> 📐 **Follow [nextup_docs/00-protocol.md](nextup_docs/00-protocol.md) on every takeover** — it is short and it is the procedure. The file contract and formats are in [nextup_docs/01-nextup-guide.md](nextup_docs/01-nextup-guide.md).\n> 🔌 When the **nextup hub tools** are available (MCP, through `.mcp.json` at the root), route tasks, decisions, questions for the user and phase advances through them.\n> Everything above this section is this project's own; the engine maintains only the block below.\n\n<!-- NEXTUP:STATE:BEGIN -->\n(initialising; this block is maintained by the Agent NextUp engine)\n<!-- NEXTUP:STATE:END -->\n";
+const AGENTS_SECTION: &str = "\n\n## Agent NextUp\n\n> 📐 **Follow [nextup_docs/00-protocol.md](nextup_docs/00-protocol.md) on every takeover** — it is short and it is the procedure. The file contract and formats are in [nextup_docs/01-nextup-guide.md](nextup_docs/01-nextup-guide.md).\n> 🔌 When the **nextup hub tools** are available (MCP, through `.mcp.json` at the root), route tasks, decisions and phase advances through them.\n> Everything above this section is this project's own; the engine maintains only the block below.\n\n<!-- NEXTUP:STATE:BEGIN -->\n(initialising; this block is maintained by the Agent NextUp engine)\n<!-- NEXTUP:STATE:END -->\n";
 
 /// Append [`AGENTS_SECTION`] to an existing `AGENTS.md` that has no state
 /// block. No-op when the file is absent (scaffold just wrote its own) or
@@ -479,11 +479,7 @@ fn refresh_agents_state(
         .map(|(id, _)| *id)
         .filter(|id| modules.is_enabled(id))
         .collect();
-    // Questions and provisional decisions (D170): read here like the spec
-    // line above — a directory listing and one ledger pass.
-    let asks = crate::workspace::questions::ask_summary(paths)?;
-    let block =
-        render_state_block(ctx, tasks, workflow, decisions, progress, specs_caps, &guided, &asks);
+    let block = render_state_block(ctx, tasks, workflow, decisions, progress, specs_caps, &guided);
     let updated = format!(
         "{}{}\n{}\n{}{}",
         &content[..begin],
@@ -506,7 +502,6 @@ fn render_state_block(
     progress: &[LedgerEvent],
     specs_caps: Option<usize>,
     guided_modules: &[&str],
-    asks: &crate::workspace::questions::AskSummary,
 ) -> String {
     let counts = compute_counts(tasks);
     let mut md = String::with_capacity(1024);
@@ -687,15 +682,13 @@ fn render_state_block(
         }
     }
 
-    md.push_str(&asks.render(state_line));
 
     // Recent decisions (each clamped by the D78 lens — the state block is an index,
     // not an archive)
     if !decisions.is_empty() {
         md.push_str("\n**Recent decisions**:\n");
         for event in decisions {
-            let mark = if event.provisional { "(provisional) " } else { "" };
-            md.push_str(&format!("- `{}` {mark}{}\n", event.at, state_line(&event.message)));
+            md.push_str(&format!("- `{}` {}\n", event.at, state_line(&event.message)));
         }
     }
 

@@ -120,11 +120,7 @@ export function waitingTotal(
 ): number | null {
   if (activity === null) return null;
   const tasks = overview.reduce(
-    (n, w) =>
-      n +
-      (w.taskCounts ? w.taskCounts.blocked + w.taskCounts.doneUnverified : 0) +
-      // D170: the To decide queue is on each card's amber line, so here too.
-      (w.youCounts ? w.youCounts.questions + w.youCounts.decisions : 0),
+    (n, w) => n + (w.taskCounts ? w.taskCounts.blocked + w.taskCounts.doneUnverified : 0),
     0,
   );
   return tasks + activity.reduce((n, a) => n + a.waiting.length, 0);

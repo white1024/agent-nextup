@@ -40,8 +40,6 @@ pub struct HandoffInput<'a> {
     pub progress: &'a [LedgerEvent],
     /// Live harness status; `None` for legacy workspaces without workflow.json.
     pub workflow: Option<&'a WorkflowStatus>,
-    /// Questions and provisional decisions waiting on the person (D170).
-    pub asks: &'a crate::workspace::questions::AskSummary,
     pub app_version: &'a str,
     pub generated_at: String,
 }
@@ -319,8 +317,6 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
         }
     }
 
-    md.push_str(&input.asks.render(|t| lens_line(t).to_string()));
-
     // ── 4. Current blockers / technical decisions ──────────────────────────
     let _ = writeln!(md, "\n## 4. Current Blockers / Technical Decisions\n");
     let blocked = crate::workspace::tasks::blocked(input.tasks);
@@ -397,14 +393,6 @@ pub fn render_handoff(input: &HandoffInput<'_>) -> String {
                         by.join(", ")
                     );
                 }
-                None if decision.provisional => {
-                    let _ = writeln!(
-                        md,
-                        "- `{}` (provisional — awaiting the user's review) {}",
-                        tag,
-                        lens_line(&decision.message)
-                    );
-                }
                 None => {
                     let _ = writeln!(md, "- `{}` {}", tag, lens_line(&decision.message));
                 }
@@ -449,7 +437,6 @@ mod tests {
             teams,
             progress: &[],
             workflow: None,
-            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-09-16T00:00:00Z".into(),
         })
@@ -504,7 +491,6 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: None,
-            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         })
@@ -526,7 +512,6 @@ mod tests {
             teams: &[],
             progress: &[progress],
             workflow: None,
-            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         });
@@ -674,7 +659,6 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: None,
-            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-07T00:00:00Z".into(),
         });
@@ -765,7 +749,6 @@ mod tests {
             teams: &[],
             progress: &[],
             workflow: Some(&status),
-            asks: &crate::workspace::questions::AskSummary::default(),
             app_version: "0.1.0",
             generated_at: "2026-07-06T00:00:00Z".into(),
         });

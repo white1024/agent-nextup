@@ -295,7 +295,6 @@ export default function ProjectsHome({
       templateName: ws.templateName,
       exists: ws.exists,
       taskCounts: ws.taskCounts,
-      youCounts: ws.youCounts,
       phaseIndex: ws.currentPhaseIndex,
       phaseCount: ws.phaseCount,
       phaseTitle: ws.currentPhaseTitle ?? ws.currentPhase,

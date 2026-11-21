@@ -175,12 +175,8 @@ pub const TOOLS: &[ToolMeta] = &[
     // A task's own checklist (D170). Granted like edit_task: a step describes
     // the work and asserts nothing about status or verification.
     granted("set_task_step", None, "tasks"),
-    // Questions for the user (D170). Asking is granted like record_decision:
-    // it hands the person a choice, it takes none away from them. Reading
-    // answers stamps them seen — a read with a bookkeeping side effect, the
-    // get_delivery precedent (D160).
-    granted("ask_user", None, "knowledge"),
-    read("list_questions", None),
+    // 1.1.0 appended `ask_user` and `list_questions` here (D170); both were
+    // withdrawn with the To decide queue (D175). Rows below this line append.
 ];
 
 /// Display order of the write-tier semantic groups (D39). Presentation
@@ -810,7 +806,7 @@ mod tests {
             "workspace_status list_tasks get_task workflow_status search_workspace build_index \
              workspace_doctor post_mortem_candidates list_deliveries get_delivery list_teammates \
              team_overview team_member_status team_list_deliveries list_specs get_spec \
-             validate_task_specs list_questions"
+             validate_task_specs"
         );
         assert_eq!(
             WRITE_TOOLS.join(" "),
@@ -821,14 +817,14 @@ mod tests {
              upgrade_workspace_assets publish_delivery team_set_edge team_set_edge_auto_route \
              team_route team_add_member team_create_member team_remove_member \
              team_member_tasks team_member_ledger team_member_specs team_archive_task \
-             edit_task write_task_file set_task_step ask_user"
+             edit_task write_task_file set_task_step"
         );
         assert_eq!(
             DEFAULT_GRANTED_TOOLS.join(" "),
             "create_task update_task_status claim_task assign_task record_decision record_note \
              record_progress record_rejected add_milestone set_milestone_done record_lesson \
              record_lesson_fired archive_stale_lessons generate_handoff edit_task write_task_file \
-             set_task_step ask_user"
+             set_task_step"
         );
         // Reason-ordered, not table-ordered — see GUARD_REASONS.
         assert_eq!(
@@ -1163,12 +1159,12 @@ mod tests {
     fn an_upgrade_grants_only_the_day_one_tools_added_since_the_grants_were_set() {
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
         let pending = pending_default_grants(&paths).unwrap();
-        assert_eq!(pending, vec!["set_task_step", "ask_user"]);
+        assert_eq!(pending, vec!["set_task_step"]);
 
         let granted = grant_new_default_tools(&paths).unwrap();
-        assert_eq!(granted, vec!["set_task_step", "ask_user"]);
+        assert_eq!(granted, vec!["set_task_step"]);
         let access = get_access(&paths).unwrap();
-        assert!(access.tool_allowed("set_task_step") && access.tool_allowed("ask_user"));
+        assert!(access.tool_allowed("set_task_step"));
         assert_eq!(access.known_tools.as_deref(), Some(&all_write_tools()[..]));
         // Never a guarded one, even though none of them is granted here.
         for t in GUARDED_TOOLS.iter() {
@@ -1177,7 +1173,7 @@ mod tests {
         // Said out loud in the ledger, once.
         let lines = crate::workspace::ledger::ledger_for(&paths).all().unwrap();
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].message.contains("set_task_step, ask_user"));
+        assert!(lines[0].message.contains("set_task_step"));
 
         // A second press grants nothing and writes nothing more.
         assert!(grant_new_default_tools(&paths).unwrap().is_empty());
@@ -1189,27 +1185,27 @@ mod tests {
     fn a_tool_turned_off_after_it_was_offered_stays_off() {
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
         grant_new_default_tools(&paths).unwrap();
-        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        set_tool_allowed(&paths, "set_task_step", false).unwrap();
         assert!(pending_default_grants(&paths).unwrap().is_empty());
         assert!(grant_new_default_tools(&paths).unwrap().is_empty());
-        assert!(!get_access(&paths).unwrap().tool_allowed("ask_user"));
+        assert!(!get_access(&paths).unwrap().tool_allowed("set_task_step"));
     }
 
     #[test]
     fn a_new_tool_switched_on_and_off_before_the_upgrade_stays_off() {
         // A 1.0.0 file has no knownTools, and the frozen baseline does not
-        // name ask_user — the switch itself has to record that it was seen.
+        // name set_task_step — the switch itself has to record that it was seen.
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
-        set_tool_allowed(&paths, "ask_user", true).unwrap();
-        set_tool_allowed(&paths, "ask_user", false).unwrap();
-        assert_eq!(pending_default_grants(&paths).unwrap(), vec!["set_task_step"]);
-        assert_eq!(grant_new_default_tools(&paths).unwrap(), vec!["set_task_step"]);
-        assert!(!get_access(&paths).unwrap().tool_allowed("ask_user"));
+        set_tool_allowed(&paths, "set_task_step", true).unwrap();
+        set_tool_allowed(&paths, "set_task_step", false).unwrap();
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
+        assert!(grant_new_default_tools(&paths).unwrap().is_empty());
+        assert!(!get_access(&paths).unwrap().tool_allowed("set_task_step"));
 
         // The group switch and select-all record the same way.
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
         set_tools_allowed(&paths, &["set_task_step".into()], false).unwrap();
-        assert_eq!(pending_default_grants(&paths).unwrap(), vec!["ask_user"]);
+        assert!(pending_default_grants(&paths).unwrap().is_empty());
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
         set_all_tools_allowed(&paths, false).unwrap();
         assert!(pending_default_grants(&paths).unwrap().is_empty());
@@ -1219,19 +1215,21 @@ mod tests {
 
     #[test]
     fn restored_offers_merge_with_switches_made_before_accepting() {
+        // The source never offered set_task_step, but it was switched off
+        // here before the restored grants were accepted: the local switch
+        // survives the merge (the source's own offers are the next test).
         let (_dir, paths) = pre_record_workspace(&day_one_at_1_0_0());
-        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        set_tool_allowed(&paths, "set_task_step", false).unwrap();
         save_restored_access(
             &paths,
             &RestoredAccess {
                 allowed_tools: vec![],
                 exported_at: "2026-11-21T00:00:00Z".into(),
-                known_tools: Some(vec!["set_task_step".into()]),
+                known_tools: Some(KNOWN_BEFORE_RECORD.iter().map(|t| t.to_string()).collect()),
             },
         )
         .unwrap();
         resolve_restored_access(&paths, true).unwrap();
-        // Both the local switch and the source's offer count.
         assert!(pending_default_grants(&paths).unwrap().is_empty());
     }
 
@@ -1269,7 +1267,7 @@ mod tests {
         assert_eq!(get_access(&paths).unwrap().known_tools.as_deref(), Some(&all_write_tools()[..]));
         assert!(pending_default_grants(&paths).unwrap().is_empty());
         // Turning a day-one tool off in a new workspace is final too.
-        set_tool_allowed(&paths, "ask_user", false).unwrap();
+        set_tool_allowed(&paths, "set_task_step", false).unwrap();
         assert!(grant_new_default_tools(&paths).unwrap().is_empty());
     }
 
@@ -1281,7 +1279,7 @@ mod tests {
         let access = get_access(&paths).unwrap();
         assert!(!access.enabled);
         assert_eq!(
-            authorize(&access, "ask_user").unwrap_err().kind(),
+            authorize(&access, "set_task_step").unwrap_err().kind(),
             "unauthorized",
             "a grant behind a closed switch opens nothing"
         );
@@ -1289,7 +1287,7 @@ mod tests {
 
     #[test]
     fn restored_grants_carry_what_was_offered() {
-        // The source had turned ask_user off after it was offered: accepting
+        // The source had turned set_task_step off after it was offered: accepting
         // the restored grants must not leave it looking never offered.
         let (_dir, paths) = pre_record_workspace(&[]);
         std::fs::remove_file(paths.agent_access_file()).unwrap();

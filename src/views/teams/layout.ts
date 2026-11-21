@@ -100,15 +100,69 @@ export function layersOf(team: Team): Map<string, number> {
 }
 
 /**
- * May `from → to` be added? Rejects self-edges and duplicates; a flow back
- * upstream is fine (D161). Shared by the canvas drag path
- * (`isValidConnection`, which pre-blocks an invalid drop) and the inspector's
- * keyboard-reachable form (which only offers valid targets) so the two cannot
- * drift — core stays the enforcer either way.
+ * May a line from `from` to `to` be drawn? Since D176 a line connects both
+ * ways, so it can be drawn while either direction is missing — over a one-way
+ * line it adds the other way. Rejects self-lines and a pair already connected
+ * both ways. Shared by the canvas drag path (`isValidConnection`, which
+ * pre-blocks an invalid drop) and the inspector's keyboard-reachable form
+ * (which only offers valid targets) so the two cannot drift — core stays the
+ * enforcer either way.
  */
 export function canConnect(from: string, to: string, edges: TeamEdge[]): boolean {
   if (from === "" || to === "" || from === to) return false;
-  return !edges.some((e) => e.from === from && e.to === to);
+  const has = (a: string, b: string) => edges.some((e) => e.from === a && e.to === b);
+  return !(has(from, to) && has(to, from));
+}
+
+/**
+ * One line on the canvas (D176): a pair of members drawn once. `ab` is the
+ * direction the line is drawn along; `ba` is the way back when the pair sends
+ * both ways, null on a one-way line.
+ */
+export interface Line {
+  ab: TeamEdge;
+  ba: TeamEdge | null;
+}
+
+/**
+ * The team's edges as lines: two members that send to each other are one
+ * line, drawn along the direction that is not the flow back upstream (so it
+ * keeps the forward geometry it always had). Lines come in the order their
+ * first edge was drawn.
+ */
+export function linesOf(edges: TeamEdge[]): Line[] {
+  const back = returnEdges(edges);
+  const done = new Set<string>();
+  const out: Line[] = [];
+  for (const e of edges) {
+    if (done.has(edgeKey(e))) continue;
+    const r = edges.find((x) => x.from === e.to && x.to === e.from) ?? null;
+    const flip = r !== null && back.has(edgeKey(e)) && !back.has(edgeKey(r));
+    const line: Line = flip ? { ab: r, ba: e } : { ab: e, ba: r };
+    done.add(edgeKey(line.ab));
+    if (line.ba) done.add(edgeKey(line.ba));
+    out.push(line);
+  }
+  return out;
+}
+
+/**
+ * The team as the canvas draws it: one edge per line. A two-way line counts
+ * as automatic when either direction is, so its bolt is placed with the other
+ * automatic ones.
+ */
+export function drawnTeam(team: Team): Team {
+  return {
+    ...team,
+    edges: linesOf(team.edges).map(({ ab, ba }) =>
+      ba === null ? ab : { ...ab, autoRoute: ab.autoRoute || ba.autoRoute },
+    ),
+  };
+}
+
+/** A star-map curve run the other way, for a light travelling back along a two-way line. */
+export function reversedPath(n: EdgeGeo["n"]): string {
+  return `M${n[6]},${n[7]} C${n[4]},${n[5]} ${n[2]},${n[3]} ${n[0]},${n[1]}`;
 }
 
 /**

@@ -294,120 +294,6 @@ fn edit_task_with(
     .map(|(task, handoff)| TaskUpdate { task, handoff: Some(handoff), spec_fold: None })
 }
 
-// ── Questions for the user (D170) ───────────────────────────────────────────
-
-/// Ask the person something (hub `ask_user`). Ledgered as a note naming the
-/// question, so the snapshot's recent window shows it was asked.
-pub fn ask_user(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    input: crate::workspace::questions::NewQuestion,
-    asked_by: Option<String>,
-) -> Result<crate::workspace::questions::Question> {
-    mutate(paths, app_version, || {
-        let store = crate::workspace::questions::QuestionStore::new(paths);
-        let q = store.create(input, asked_by.clone(), &TaskStore::new(paths.tasks_dir()))?;
-        let whom = q.ask.as_deref().map(|a| format!(" (for {a})")).unwrap_or_default();
-        let event = LedgerEvent::new(
-            LedgerKind::Note,
-            format!("asked {}{whom}: {}", q.id, first_line(&q.question)),
-            q.blocks.first().cloned(),
-        )
-        .with_actor(asked_by);
-        Ok((q, event))
-    })
-    .map(|(q, _)| q)
-}
-
-/// The person answers (the app). The answer is ledgered as a decision — it is
-/// one, and the person made it — with the question in its first line, so the
-/// decisions view and a phase's decision gate both see it.
-pub fn answer_question(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    id: &str,
-    answer: &str,
-) -> Result<crate::workspace::questions::Question> {
-    mutate(paths, app_version, || {
-        let store = crate::workspace::questions::QuestionStore::new(paths);
-        let q = store.get(id)?;
-        if q.status != crate::workspace::questions::QuestionStatus::Open {
-            return Err(NextUpError::InvalidInput(format!("{id} is not open")));
-        }
-        let decision_id = ledger_for(paths).next_decision_id()?;
-        let answered = store.answer(id, answer.to_string(), decision_id.clone())?;
-        let event = LedgerEvent::new(
-            LedgerKind::Decision,
-            format!(
-                "{id} {} → {}",
-                first_line(&answered.question),
-                answered.answer.as_deref().unwrap_or_default()
-            ),
-            answered.blocks.first().cloned(),
-        )
-        .with_id(decision_id);
-        Ok((answered, event))
-    })
-    .map(|(q, _)| q)
-}
-
-/// The question no longer needs an answer (the app).
-pub fn withdraw_question(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    id: &str,
-) -> Result<crate::workspace::questions::Question> {
-    mutate(paths, app_version, || {
-        let q = crate::workspace::questions::QuestionStore::new(paths).withdraw(id)?;
-        let event = LedgerEvent::new(
-            LedgerKind::Note,
-            format!("withdrew {}: {}", q.id, first_line(&q.question)),
-            None,
-        );
-        Ok((q, event))
-    })
-    .map(|(q, _)| q)
-}
-
-/// Questions as an agent reads them (hub `list_questions`): answered ones
-/// returned here are stamped seen, so the takeover surfaces stop listing them
-/// as answers nobody picked up — the delivery precedent (D160). The stamp is
-/// not ledgered (it is a read), but the surfaces are regenerated.
-pub fn read_questions_as_agent(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    include_closed: bool,
-) -> Result<Vec<crate::workspace::questions::Question>> {
-    use crate::workspace::questions::{QuestionStatus, QuestionStore};
-    with_mutation_lock(paths, || {
-        let store = QuestionStore::new(paths);
-        let shown: Vec<_> = store
-            .list()?
-            .into_iter()
-            .filter(|q| {
-                include_closed
-                    || q.status == QuestionStatus::Open
-                    || (q.status == QuestionStatus::Answered && q.seen_at.is_none())
-            })
-            .collect();
-        let answered: Vec<String> = shown
-            .iter()
-            .filter(|q| q.status == QuestionStatus::Answered)
-            .map(|q| q.id.clone())
-            .collect();
-        if store.mark_seen(&answered)? {
-            crate::workspace::sync::sync_after_mutation(paths, app_version)?;
-        }
-        // Return what the caller asked about, now carrying the stamp.
-        let ids: Vec<String> = shown.iter().map(|q| q.id.clone()).collect();
-        ids.iter().map(|id| store.get(id)).collect()
-    })
-}
-
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("").trim()
-}
-
 /// Tick or untick one step of a task's checklist (D170). Ledgered as an edit
 /// — it describes the work, it claims nothing about it — and the handoff
 /// regenerates because next steps print each task's step count.
@@ -1170,7 +1056,7 @@ pub fn add_ledger_note(
     channel: NoteChannel,
     message: &str,
 ) -> Result<LedgerEvent> {
-    add_ledger_entry(paths, app_version, channel, message, None, false)
+    add_ledger_entry(paths, app_version, channel, message, None)
 }
 
 /// Record a decision, optionally naming an earlier decision it overturns.
@@ -1192,44 +1078,7 @@ pub fn add_decision(
     message: &str,
     supersedes: Option<&str>,
 ) -> Result<LedgerEvent> {
-    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes, false)
-}
-
-/// [`add_decision`] that may mark the decision provisional (D170): taken on a
-/// default, waiting in the "to decide" queue for the person to confirm or
-/// revise, and not counted toward a phase's decision gate.
-pub fn add_decision_with(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    message: &str,
-    supersedes: Option<&str>,
-    provisional: bool,
-) -> Result<LedgerEvent> {
-    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes, provisional)
-}
-
-/// The person's review of a provisional decision (D170): confirm it as it
-/// stands (`revised` = None) or replace it. Either way a new, settled
-/// decision supersedes the provisional one, so the queue drops it and the
-/// handoff marks it overturned — the record keeps both.
-pub fn review_decision(
-    paths: &WorkspacePaths,
-    app_version: &str,
-    id: &str,
-    revised: Option<&str>,
-) -> Result<LedgerEvent> {
-    let ledger = ledger_for(paths);
-    let pending = crate::workspace::questions::pending_provisional(&ledger)?;
-    let Some(original) = pending.iter().find(|e| e.id.as_deref() == Some(id)) else {
-        return Err(NextUpError::InvalidInput(format!(
-            "{id} is not a provisional decision waiting for review"
-        )));
-    };
-    let message = match revised.map(str::trim).filter(|r| !r.is_empty()) {
-        Some(text) => text.to_string(),
-        None => format!("{}\n\n(Confirmed by the user — was provisional {id}.)", original.message),
-    };
-    add_ledger_entry(paths, app_version, NoteChannel::Decision, &message, Some(id), false)
+    add_ledger_entry(paths, app_version, NoteChannel::Decision, message, supersedes)
 }
 
 fn add_ledger_entry(
@@ -1238,7 +1087,6 @@ fn add_ledger_entry(
     channel: NoteChannel,
     message: &str,
     supersedes: Option<&str>,
-    provisional: bool,
 ) -> Result<LedgerEvent> {
     let message = message.trim();
     if message.is_empty() {
@@ -1261,10 +1109,7 @@ fn add_ledger_entry(
                     )));
                 }
             }
-            event = event
-                .with_id(ledger.next_decision_id()?)
-                .superseding(supersedes.clone())
-                .provisionally(provisional);
+            event = event.with_id(ledger.next_decision_id()?).superseding(supersedes.clone());
         }
         // The line the caller gets back is the one that was appended.
         Ok((event.clone(), event))

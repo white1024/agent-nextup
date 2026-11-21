@@ -19,7 +19,6 @@ import type {
   LayoutSkin,
   LedgerChannel,
   LedgerEvent,
-  Question,
   LedgerKind,
   LedgerPage,
   LedgerTail,
@@ -167,15 +166,6 @@ export const api = {
       status,
       reason: reason ?? null,
     }),
-  // To decide (D170).
-  listQuestions: () => invoke<Question[]>("list_questions"),
-  answerQuestion: (id: string, answer: string) =>
-    invoke<Question>("answer_question", { id, answer }),
-  withdrawQuestion: (id: string) => invoke<Question>("withdraw_question", { id }),
-  listProvisionalDecisions: () => invoke<LedgerEvent[]>("list_provisional_decisions"),
-  /** Confirm a provisional decision (`revised` omitted) or replace its text. */
-  reviewDecision: (id: string, revised?: string) =>
-    invoke<LedgerEvent>("review_decision", { id, revised: revised ?? null }),
   /** Tick or untick one step of a task's checklist (D170; `step` counts from 1). */
   setTaskStep: (id: string, step: number, done: boolean) =>
     invoke<TaskUpdate>("set_task_step", { id, step, done }),
@@ -357,6 +347,10 @@ export const api = {
   ) => invoke<Team[]>("team_set_layout", { teamId, positions, skin }),
   teamAddEdge: (teamId: string, from: string, to: string) =>
     invoke<Team[]>("team_add_edge", { teamId, from, to }),
+  /** One line, both ways (D176): adds whichever direction is missing. */
+  teamLink: (teamId: string, a: string, b: string) => invoke<Team[]>("team_link", { teamId, a, b }),
+  /** Remove the line between two members, both directions. */
+  teamUnlink: (teamId: string, a: string, b: string) => invoke<Team[]>("team_unlink", { teamId, a, b }),
   teamRemoveEdge: (teamId: string, from: string, to: string) =>
     invoke<Team[]>("team_remove_edge", { teamId, from, to }),
   teamSetEdgeAutoRoute: (teamId: string, from: string, to: string, autoRoute: boolean) =>
